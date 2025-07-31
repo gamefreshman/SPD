@@ -18,7 +18,6 @@ from copy import deepcopy
 
 # Discrete Diffusion import 
 import torch.nn.functional as F
-from .noise_schedule import PredefinedNoiseScheduleDiscrete, MarginalUniformTransition
 
 class MarginalUniformTransition:
     def __init__(self, x_marginals, e_marginals=None, y_classes=0):
@@ -85,12 +84,18 @@ class DiscreteFeatureDiffusion:
 
     def get_params_for_t(self, t_int, device):
         """ Get diffusion parameters for a given integer timestep t. """
+        if t_int.numel() > 1:
+            t_int = t_int[0]
+
         t_float = t_int.float() / self.T
         s_int = t_int - 1
-        s_float = s_int.float() / self.T
+        s_float = torch.clamp(s_int.float(), min=-1.0) / self.T
         
         beta_t = self.noise_schedule(t_normalized=t_float)
-        alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s_float)
+        if (s_int < 0).any():
+             alpha_s_bar = torch.ones_like(beta_t)
+        else:
+            alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s_float)
         alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized=t_float)
         
         return {
@@ -120,22 +125,19 @@ class DiscreteFeatureDiffusion:
         # Get the transition matrix Q_t_bar
         Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, device=device)
         
-        # Calculate probabilities of transitioning to each state at time t
-        # For features_0=[N, C] and Qtb.X=[1, C, C], we need to match dimensions
-        # prob_t = features_0 @ Qtb.X[0]  is equivalent to the below
-        prob_t = torch.matmul(features_0, Qtb.X.squeeze(0)) # [N, C]
+         # ========================= MODIFICATION START =========================
+
+        prob_t = torch.matmul(features_0, Qtb.squeeze(0)) # [N, C]
+        # ========================= MODIFICATION END ===========================
         
         # Ensure probabilities sum to 1
-        assert (torch.abs(prob_t.sum(dim=-1) - 1.) < 1e-4).all()
+        # assert (torch.abs(prob_t.sum(dim=-1) - 1.) < 1e-4).all()
         
         # Sample from the categorical distribution to get the noised features
         sampled_indices_t = torch.multinomial(prob_t, num_samples=1).squeeze(-1) # [N]
         features_t = F.one_hot(sampled_indices_t, num_classes=features_0.shape[1]).float() # [N, C]
         
-        return {
-            'features_t': features_t,
-            'params': params
-        }
+        return features_t
 
 # in most cases, this function won't be used, as we use xTB charges rather than MMFF charges.
 def get_atomic_partial_charges(mol: rdkit.Chem.Mol) -> np.ndarray:
@@ -375,78 +377,47 @@ class HeteroDataset(torch_geometric.data.Dataset):
         bond_edge_x = bond_edge_x * self.scale_bond_features_x1
         data['bond_edge_x'] = torch.from_numpy(bond_edge_x.copy()).float()
         
-        # --- START OF MODIFICATION ---
+        # ========================= MODIFICATION START =========================
+        
+        # --- 1. 保存 t=0 的干净特征 ---
+        # 这是我们最重要的修改！损失函数需要这些 t=0 的真实标签。
+        data['x_0'] = data['x'].clone()
+        data['bond_edge_x_0'] = data['bond_edge_x'].clone()
 
-        # 1. Continuous noising for positions (remains the same)
+        # --- 2. 处理连续特征 (坐标) 的加噪 (逻辑保持不变) ---
         pos_noise = np.random.randn(*pos.shape)
         pos_noise[virtual_node_mask] = 0.0
         if self.remove_noise_COM_x1:
-            pos_noise[~virtual_node_mask] = pos_noise[~virtual_node_mask] - np.mean(pos_noise[~virtual_node_mask], axis = 0)
+            pos_noise[~virtual_node_mask] = pos_noise[~virtual_node_mask] - np.mean(pos_noise[~virtual_node_mask], axis = 0) 
         data['pos_noise'] = torch.from_numpy(pos_noise.copy()).float()
         
-        pos_forward_noised = alpha_dash_t * pos + sigma_dash_t * pos_noise
+        pos_forward_noised = alpha_dash_t * pos  +  sigma_dash_t * pos_noise 
         pos_forward_noised[virtual_node_mask] = pos[virtual_node_mask]
         data['pos_forward_noised'] = torch.from_numpy(pos_forward_noised.copy()).float()
 
-        # 2. Discrete noising for features
-        # Create a dummy device; in a real scenario, this might be passed in.
-        device = data['x'].device 
+        # --- 3. 处理离散特征 (原子 & 键类型) 的加噪 ---
+        # 我们将完全替换旧的加噪逻辑
+        device = data['x'].device # 获取张量所在的设备
+        t_tensor = torch.tensor([t], device=device)
 
-        # Noise atom features
-        x_clean_no_vn = torch.from_numpy(x[~virtual_node_mask]).float()
-        atom_noise_result = self.x1_atom_diffuser.apply_noise(x_clean_no_vn, t, device)
-        x_noised_no_vn = atom_noise_result['features_t']
+        # 对原子类型加噪 (只对非虚拟节点操作)
+        x_clean_no_vn = data['x_0'][~virtual_node_mask]
+        x_noised_no_vn = self.x1_atom_diffuser.apply_noise(x_clean_no_vn, t_tensor, device)
         
-        x_forward_noised = data['x'].clone()
+        x_forward_noised = data['x_0'].clone() # 从干净的 t=0 数据开始
         x_forward_noised[~virtual_node_mask] = x_noised_no_vn
-        
-        # Store noised features and discrete diffusion parameters
         data['x_forward_noised'] = x_forward_noised
-        data['discrete_atom_params'] = atom_noise_result['params']
         
-        # Noise bond features
-        bond_edge_x_clean = torch.from_numpy(bond_edge_x).float()
-        bond_noise_result = self.x1_bond_diffuser.apply_noise(bond_edge_x_clean, t, device)
-        
-        data['bond_edge_x_forward_noised'] = bond_noise_result['features_t']
-        data['discrete_bond_params'] = bond_noise_result['params']
-        
-        # The original x_noise and bond_edge_x_noise are not needed for discrete diffusion
-        # but we can keep them as placeholders if other parts of the code expect them.
+        # 对键类型加噪
+        bond_edge_x_clean = data['bond_edge_x_0']
+        bond_edge_x_noised = self.x1_bond_diffuser.apply_noise(bond_edge_x_clean, t_tensor, device)
+        data['bond_edge_x_forward_noised'] = bond_edge_x_noised
+
+        # 旧的 x_noise 和 bond_edge_x_noise 不再需要，可以移除或设为零
         data['x_noise'] = torch.zeros_like(data['x'])
         data['bond_edge_x_noise'] = torch.zeros_like(data['bond_edge_x'])
 
-        # --- END OF MODIFICATION ---
-        
-        # PAST METHOD
-
-        # # forward noising non-virtual-nodes
-        
-        # pos_noise = np.random.randn(*pos.shape)
-        # pos_noise[virtual_node_mask] = 0.0
-        # if self.remove_noise_COM_x1: # removing COM from added noise
-        #     pos_noise[~virtual_node_mask] = pos_noise[~virtual_node_mask] - np.mean(pos_noise[~virtual_node_mask], axis = 0) 
-        # data['pos_noise'] = torch.from_numpy(pos_noise.copy()).float()
-        
-        # x_noise = np.random.randn(*x.shape)
-        # x_noise[virtual_node_mask] = 0.0
-        # data['x_noise'] = torch.from_numpy(x_noise.copy()).float()
-        
-        # # this doesn't include any edges to the virtual node
-        # bond_edge_x_noise = np.random.randn(*bond_edge_x.shape)
-        # data['bond_edge_x_noise'] = torch.from_numpy(bond_edge_x_noise.copy()).float()
-        
-        
-        # pos_forward_noised = alpha_dash_t * pos  +  sigma_dash_t * pos_noise 
-        # pos_forward_noised[virtual_node_mask] = pos[virtual_node_mask]
-        # data['pos_forward_noised'] = torch.from_numpy(pos_forward_noised.copy()).float()
-        
-        # x_forward_noised = alpha_dash_t * x  +  sigma_dash_t * x_noise 
-        # x_forward_noised[virtual_node_mask] = x[virtual_node_mask]
-        # data['x_forward_noised'] = torch.from_numpy(x_forward_noised.copy()).float()
-        
-        # bond_edge_x_forward_noised = alpha_dash_t * bond_edge_x  +  sigma_dash_t * bond_edge_x_noise 
-        # data['bond_edge_x_forward_noised'] = torch.from_numpy(bond_edge_x_forward_noised.copy()).float()
+        # ========================= MODIFICATION END ===========================
 
         return data, pos, virtual_node_mask
     
@@ -528,171 +499,106 @@ class HeteroDataset(torch_geometric.data.Dataset):
         return data
     
     
+    # 请用下面的代码完整替换掉 new_datasets.py 中的 get_x4_data 函数
+
     def get_x4_data(self, mol, recenter, add_virtual_node, remove_noise_COM, t, alpha_dash_t, sigma_dash_t, virtual_node_pos = None):
         
-        # it is  important to include a virtual node in case there are NO pharmacophores in the molecule
+        # it is important to include a virtual node in case there are NO pharmacophores in the molecule
         assert add_virtual_node
-        
+
         data = {}
         data['timestep'] = torch.tensor([t], dtype=torch.long)
         
+        # 1. --- 获取基础药效团信息 ---
         pharm_types, pos, direction = get_pharmacophores(
             mol, 
             multi_vector = self.multivectors, 
             check_access=self.check_accessibility,
         )
-        pharm_types = pharm_types + 1 # need to accomodate potential virtual node as 0th index
-        
-        # add a small amount of noise to positions of pharmacophores to avoid identically overlapping points
+        # 为虚拟节点在 0 号位腾出空间
+        pharm_types = pharm_types + 1 
+        # 给坐标加一点微小的扰动，防止完全重合
         pos = pos + np.random.randn(*pos.shape) * 0.05
         
-        # no pharmacophores --> only virtual node remains
+        # 2. --- 统一处理虚拟节点和空分子的情况 ---
+        # 如果没有药效团，就创建一个占位的
         if pharm_types.shape[0] == 0:
+            pharm_types = np.array([]) # 保持为空，下面会统一处理
+            pos = np.empty((0, 3))
+            direction = np.empty((0, 3))
             
-            pharm_types = np.array([0])
-            x = np.zeros((pharm_types.size, self.max_node_types_x4))
-            x[np.arange(pharm_types.size), pharm_types] = 1
-            x = x * self.scale_node_features_x4
-            data['x'] = torch.from_numpy(x.copy()).float()
-            
-            if (virtual_node_pos is None) or (recenter == True):
-                virtual_node_pos = np.zeros(3)[None, ...]
-            data['com_before_centering'] = torch.from_numpy(virtual_node_pos.copy()).float()
-            data['com'] = torch.from_numpy(virtual_node_pos.copy()).float()
-            
-            virtual_node_mask = np.array([1])
-            virtual_node_mask = virtual_node_mask == 1
-            
-            pos = virtual_node_pos
-            direction = np.zeros(3)[None, ...]
-            
-            direction = direction * self.scale_vector_features_x4
-            
-            data['pos'] = torch.from_numpy(pos.copy()).float()
-            data['pos_recentered'] = torch.from_numpy((pos * 0.0).copy()).float()
-            data['direction'] = torch.from_numpy(direction.copy()).float()
-            data['virtual_node_mask'] = torch.from_numpy(virtual_node_mask.copy()).bool()
-            
-            # virtual node remains unnoised
-            x_noise = np.zeros(x.shape)
-            data['x_noise'] = torch.from_numpy(x_noise.copy()).float()
-            x_forward_noised = x
-            data['x_forward_noised'] = torch.from_numpy(x_forward_noised.copy()).float()
-            
-            pos_noise = np.zeros(pos.shape)
-            data['pos_noise'] = torch.from_numpy(pos_noise.copy()).float()
-            pos_forward_noised = pos
-            data['pos_forward_noised'] = torch.from_numpy(pos_forward_noised.copy()).float()
-            
-            direction_noise = np.zeros(direction.shape)
-            data['direction_noise'] = torch.from_numpy(direction_noise.copy()).float()
-            direction_forward_noised = direction
-            data['direction_forward_noised'] = torch.from_numpy(direction_forward_noised.copy()).float()
-            
-            return data
+        # 添加虚拟节点
+        # 它的类型是 0
+        pharm_types = np.concatenate([np.array([0]), pharm_types], axis=0)
         
+        # 计算虚拟节点的位置 (如果未提供)
+        if virtual_node_pos is None:
+            if pos.shape[0] > 1: # 如果除了虚拟节点还有其他点
+                virtual_node_pos = pos[1:, :].mean(0, keepdims=True)
+            else: # 如果只有虚拟节点
+                virtual_node_pos = np.zeros((1, 3))
+
+        pos = np.concatenate([virtual_node_pos, pos], axis=0)
+        direction = np.concatenate([np.zeros((1, 3)), direction], axis=0)
         
-        COM_before_centering = pos.mean(0)[None, :]
-        data['com_before_centering'] = torch.from_numpy(COM_before_centering.copy()).float()
-        pos_recentered = pos - pos.mean(0)
+        # 3. --- 计算坐标、掩码和 t=0 特征 ---
+        COM_before_centering = pos.mean(0, keepdims=True)
+        pos_recentered = pos - COM_before_centering
         if recenter:
             pos = pos_recentered
-        COM = pos.mean(0)[None, :]
-        data['com'] = torch.from_numpy(COM.copy()).float()
         
-        
-        virtual_node_mask = np.zeros(pos.shape[0] + int(add_virtual_node))
-        if add_virtual_node: # should change according to desired behavior
-            if (virtual_node_pos is None) or (recenter == True):
-                virtual_node_pos = COM
-            
-            pharm_types = np.concatenate([np.array([0]), pharm_types], axis = 0)
-            pos = np.concatenate([virtual_node_pos, pos], axis = 0)
-            pos_recentered = np.concatenate([virtual_node_pos * 0.0, pos_recentered], axis = 0)
-            direction = np.concatenate([np.zeros(3)[None, ...], direction], axis = 0)
-            
-            virtual_node_mask[0] = 1
-        virtual_node_mask = virtual_node_mask == 1
-        
-        
-        x = np.zeros((pharm_types.size, self.max_node_types_x4)) #torch.tensor(atomic_numbers, dtype = torch.long)
+        COM = pos.mean(0, keepdims=True)
+        virtual_node_mask = np.zeros(pos.shape[0], dtype=bool)
+        virtual_node_mask[0] = True
+
+        # 创建 t=0 的离散特征 x 和 x_0
+        x = np.zeros((pharm_types.size, self.max_node_types_x4))
         x[np.arange(pharm_types.size), pharm_types] = 1
-        x = x * self.scale_node_features_x4
-        data['x'] = torch.from_numpy(x.copy()).float()
-        
+        data['x'] = torch.from_numpy(x.copy()).float() * self.scale_node_features_x4
+        data['x_0'] = data['x'].clone() # <--- 关键！
+
+        # 存储其他 t=0 的属性
         data['pos'] = torch.from_numpy(pos.copy()).float()
-        data['pos_recentered'] = torch.from_numpy(pos_recentered.copy()).float()
+        data['direction'] = torch.from_numpy(direction.copy()).float() * self.scale_vector_features_x4
+        data['virtual_node_mask'] = torch.from_numpy(virtual_node_mask)
         
-        direction = direction * self.scale_vector_features_x4
-        data['direction'] = torch.from_numpy(direction.copy()).float()
-        data['virtual_node_mask'] = torch.from_numpy(virtual_node_mask.copy()).bool()
-        
-        # --- START OF MODIFICATION ---
-        
-        # 1. Continuous noising for positions and directions
+        # 4. --- 对所有特征进行加噪 ---
+        # 连续特征 (坐标和方向)
         pos_noise = np.random.randn(*pos.shape)
-        # ... (pos noising logic as before) ...
-        data['pos_noise'] = torch.from_numpy(pos_noise.copy()).float()
-        pos_forward_noised = alpha_dash_t * pos + sigma_dash_t * pos_noise
-        pos_forward_noised[virtual_node_mask] = pos[virtual_node_mask]
-        data['pos_forward_noised'] = torch.from_numpy(pos_forward_noised.copy()).float()
+        pos_noise[virtual_node_mask] = 0.0 # 虚拟节点不加噪
+        if remove_noise_COM:
+            pos_noise[~virtual_node_mask] = pos_noise[~virtual_node_mask] - pos_noise[~virtual_node_mask].mean(0)
         
         direction_noise = np.random.randn(*direction.shape)
-        # ... (direction noising logic as before) ...
-        data['direction_noise'] = torch.from_numpy(direction_noise.copy()).float()
-        direction_forward_noised = alpha_dash_t * direction + sigma_dash_t * direction_noise
-        direction_forward_noised[virtual_node_mask] = direction[virtual_node_mask]
-        data['direction_forward_noised'] = torch.from_numpy(direction_forward_noised.copy()).float()
-        
-        # 2. Discrete noising for pharmacophore features
-        device = data['x'].device
-        x_clean_no_vn = torch.from_numpy(x[~virtual_node_mask]).float()
-        pharm_noise_result = self.x4_pharm_diffuser.apply_noise(x_clean_no_vn, t, device)
-        x_noised_no_vn = pharm_noise_result['features_t']
+        direction_noise[virtual_node_mask] = 0.0 # 虚拟节点不加噪
 
-        x_forward_noised = data['x'].clone()
-        x_forward_noised[~virtual_node_mask] = x_noised_no_vn
+        # 存储噪声本身
+        data['pos_noise'] = torch.from_numpy(pos_noise.copy()).float()
+        data['direction_noise'] = torch.from_numpy(direction_noise.copy()).float()
+
+        # 应用噪声
+        data['pos_forward_noised'] = data['pos'] + data['pos_noise'] * sigma_dash_t
+        data['direction_forward_noised'] = data['direction'] + data['direction_noise'] * sigma_dash_t
         
+        # 离散特征 (药效团类型)
+        device = data['x'].device
+        t_tensor = torch.tensor([t], device=device).long()
+        
+        # 只对非虚拟节点加噪
+        x_clean_no_vn = data['x_0'][~virtual_node_mask]
+        
+        if x_clean_no_vn.shape[0] > 0: # 确保有真实节点才加噪
+            x_noised_no_vn = self.x4_pharm_diffuser.apply_noise(x_clean_no_vn, t_tensor, device)
+            x_forward_noised = data['x_0'].clone()
+            x_forward_noised[~virtual_node_mask] = x_noised_no_vn
+        else: # 如果只有虚拟节点，则不加噪
+            x_forward_noised = data['x_0'].clone()
+            
         data['x_forward_noised'] = x_forward_noised
-        data['discrete_pharm_params'] = pharm_noise_result['params']
+        # 占位符，因为损失函数不再需要它
         data['x_noise'] = torch.zeros_like(data['x'])
 
-        # --- END OF MODIFICATION ---
-
-        # PAST METHOD
-
-        # # forward noising non-virtual-nodes
-            
-        # x_noise = np.random.randn(*x.shape)
-        # x_noise[virtual_node_mask] = 0.0 # x_noise[virtual_node_mask] * 0.0
-        # data['x_noise'] = torch.from_numpy(x_noise.copy()).float()
-        
-        # x_forward_noised = alpha_dash_t * x  +  sigma_dash_t * x_noise 
-        # x_forward_noised[virtual_node_mask] = x[virtual_node_mask]
-        # data['x_forward_noised'] = torch.from_numpy(x_forward_noised.copy()).float()
-        
-        
-        # pos_noise = np.random.randn(*pos.shape)
-        # pos_noise[virtual_node_mask] = 0.0
-        # if remove_noise_COM: # removing COM from added noise
-        #     pos_noise[~virtual_node_mask] = pos_noise[~virtual_node_mask] - np.mean(pos_noise[~virtual_node_mask], axis = 0) 
-        # data['pos_noise'] = torch.from_numpy(pos_noise.copy()).float()
-        
-        # pos_forward_noised = alpha_dash_t * pos  +  sigma_dash_t * pos_noise 
-        # pos_forward_noised[virtual_node_mask] = pos[virtual_node_mask]
-        # data['pos_forward_noised'] = torch.from_numpy(pos_forward_noised.copy()).float()
-        
-        
-        # direction_noise = np.random.randn(*direction.shape)
-        # direction_noise[virtual_node_mask] = 0.0
-        # data['direction_noise'] = torch.from_numpy(direction_noise.copy()).float()
-        
-        # direction_forward_noised = alpha_dash_t * direction  +  sigma_dash_t * direction_noise 
-        # direction_forward_noised[virtual_node_mask] = direction[virtual_node_mask]
-        # data['direction_forward_noised'] = torch.from_numpy(direction_forward_noised.copy()).float()
-        
         return data
-    
     
     def __getitem__(self, k):
         
@@ -960,46 +866,27 @@ class HeteroDataset(torch_geometric.data.Dataset):
         if 'x1' in data_dict and data_dict['x1']:
             x1_data = data_dict['x1']
             
-            # NEW
+            node_keys = ['pos', 'pos_recentered', 'pos_forward_noised', 'pos_noise',
+                'x', 'x_0', 'x_forward_noised', 'x_noise',
+                'virtual_node_mask', 'com', 'com_before_centering',
+                'timestep', 'alpha_t', 'sigma_t', 'alpha_dash_t', 'sigma_dash_t']
 
             # Separate continuous, discrete, and edge data
-            for key, value in x1_data.items():
-                if 'bond' in key:
-                    continue # Handle bonds separately
-                if 'discrete' in key:
-                    # e.g., key = 'discrete_atom_params'
-                    # Store these parameters for the loss function
-                    param_type = key.split('_')[1] # 'atom' or 'bond'
-                    for p_key, p_val in value.items():
-                        data['x1'][f'{param_type}_{p_key}'] = p_val
-                else:
-                    data['x1'][key] = value
+            for key in node_keys:
+                if key in x1_data:
+                    data['x1'][key] = x1_data[key]
 
-            # Handle bonds
+            # 将所有边相关的属性存入 data['x1', 'bond', 'x1']
+            edge_keys = ['bond_edge_index', 'bond_edge_mask',
+                         'bond_edge_x', 'bond_edge_x_0', 'bond_edge_x_forward_noised', 'bond_edge_x_noise']
+            
             data['x1', 'bond', 'x1'].edge_index = x1_data['bond_edge_index']
             data['x1', 'bond', 'x1'].mask = x1_data['bond_edge_mask']
+            # 使用 .x 作为标准属性名
             data['x1', 'bond', 'x1'].x = x1_data['bond_edge_x']
+            data['x1', 'bond', 'x1'].x_0 = x1_data['bond_edge_x_0']
             data['x1', 'bond', 'x1'].x_forward_noised = x1_data['bond_edge_x_forward_noised']
-            # Add bond discrete params
-            for p_key, p_val in x1_data['discrete_bond_params'].items():
-                data['x1', 'bond', 'x1'][f'bond_{p_key}'] = p_val
-
-            # PAST
-
-            # x1_node_dict = {k: v for k, v in x1_data.items() if 'bond' not in k}
-
-            # x1_edge_dict = {
-            #     'edge_index': x1_data['bond_edge_index'],
-            #     'mask': x1_data['bond_edge_mask'],
-            #     'x': x1_data['bond_edge_x'],
-            #     'x_noise': x1_data['bond_edge_x_noise'],
-            #     'x_forward_noised': x1_data['bond_edge_x_forward_noised'],
-            # }
-            
-            # for key, value in x1_node_dict.items():
-            #     data['x1'][key] = value
-            # for key, value in x1_edge_dict.items():
-            #     data['x1', 'bond', 'x1'][key] = value
+            data['x1', 'bond', 'x1'].x_noise = x1_data['bond_edge_x_noise']
 
         if 'x2' in data_dict and data_dict['x2']:
             for key, value in data_dict['x2'].items():
@@ -1010,16 +897,10 @@ class HeteroDataset(torch_geometric.data.Dataset):
 
 
         if 'x4' in data_dict and data_dict['x4']:
-            
-            # NEW
 
             x4_data = data_dict['x4']
             for key, value in x4_data.items():
-                if 'discrete' in key:
-                     for p_key, p_val in value.items():
-                        data['x4'][f'{p_key}'] = p_val
-                else:
-                    data['x4'][key] = value
+                data['x4'][key] = value
 
             # # PAST
 

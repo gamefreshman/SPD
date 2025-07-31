@@ -268,8 +268,11 @@ class Model(torch.nn.Module):
         if 'x1' in self.explicit_diffusion_variables:
             
             #params['x1']['decoder']['encoder']
+            input_channels = len(self.params['dataset']['x1']['atom_types'])
             self.x1_decoder_encoder_embedding = torch.nn.Linear(
-                params['x1']['decoder']['input_node_channels'], # (noised) one hot atomic code embedding
+                # params['x1']['decoder']['input_node_channels'], # (noised) one hot atomic code embedding
+                # 因为没有扩散电荷
+                input_channels,
                 params['x1']['decoder']['node_channels'], # linear embedding
             )
             
@@ -340,26 +343,56 @@ class Model(torch.nn.Module):
             
             assert params['x1']['decoder']['node_channels'] == params['x1']['decoder']['encoder']['sphere_channels']
             
+            # self.x1_decoder_denoiser_MLP = MultiLayerPerceptron(
+            #     input_dim = params['x1']['decoder']['node_channels'],
+            #     hidden_dim = params['x1']['decoder']['denoiser']['MLP_hidden_dim'], 
+            #     output_dim = params['x1']['decoder']['denoiser']['output_node_channels'],
+            #     num_hidden_layers = params['x1']['decoder']['denoiser']['num_MLP_hidden_layers'], 
+            #     activation=torch.nn.LeakyReLU(0.2),
+            #     include_final_activation = False,
+            # )
+
+            # ========================= MODIFICATION START: x1 atom type denoiser =========================
+            # 获取原子类型的数量，用于分类输出
+            num_atom_types = len(self.params['dataset']['x1']['atom_types'])
+
             self.x1_decoder_denoiser_MLP = MultiLayerPerceptron(
                 input_dim = params['x1']['decoder']['node_channels'],
                 hidden_dim = params['x1']['decoder']['denoiser']['MLP_hidden_dim'], 
-                output_dim = params['x1']['decoder']['denoiser']['output_node_channels'],
+                # 修改输出维度以匹配原子类型的数量
+                output_dim = num_atom_types,
                 num_hidden_layers = params['x1']['decoder']['denoiser']['num_MLP_hidden_layers'], 
                 activation=torch.nn.LeakyReLU(0.2),
-                include_final_activation = False,
+                include_final_activation = False, # 正确，交叉熵损失函数需要原始 logits
             )
+            # ========================= MODIFICATION END ================================================
             
             self.x1_decoder_denoiser_bond_MLP = None
             if self.x1_bond_diffusion:
+                # bond_distance_expansion_dim = 32
+                # self.x1_decoder_denoiser_bond_MLP =  MultiLayerPerceptron(
+                #     input_dim = 2 * params['x1']['decoder']['node_channels'] + params['x1']['decoder']['encoder']['input_bond_channels'] + bond_distance_expansion_dim,
+                #     hidden_dim = params['x1']['decoder']['denoiser']['MLP_hidden_dim'], 
+                #     output_dim = params['x1']['decoder']['denoiser']['output_bond_channels'],
+                #     num_hidden_layers = params['x1']['decoder']['denoiser']['num_MLP_hidden_layers'], 
+                #     activation=torch.nn.LeakyReLU(0.2),
+                #     include_final_activation = False,
+                # )
+
+                # ========================= MODIFICATION START: x1 bond type denoiser =========================
+                # 获取键类型的数量
+                num_bond_types = len(self.params['dataset']['x1']['bond_types'])
                 bond_distance_expansion_dim = 32
                 self.x1_decoder_denoiser_bond_MLP =  MultiLayerPerceptron(
                     input_dim = 2 * params['x1']['decoder']['node_channels'] + params['x1']['decoder']['encoder']['input_bond_channels'] + bond_distance_expansion_dim,
                     hidden_dim = params['x1']['decoder']['denoiser']['MLP_hidden_dim'], 
-                    output_dim = params['x1']['decoder']['denoiser']['output_bond_channels'],
+                    # 修改输出维度以匹配键类型的数量
+                    output_dim = num_bond_types,
                     num_hidden_layers = params['x1']['decoder']['denoiser']['num_MLP_hidden_layers'], 
                     activation=torch.nn.LeakyReLU(0.2),
-                    include_final_activation = False,
+                    include_final_activation = False, # 正确
                 )
+                # ========================= MODIFICATION END ================================================
                 self.x1_decoder_denoiser_bond_distance_scalar_expansion = GaussianSmearing(
                     start = 0.0,
                     stop = 5.0,
@@ -711,14 +744,29 @@ class Model(torch.nn.Module):
             
             assert params['x4']['decoder']['node_channels'] == params['x4']['decoder']['encoder']['sphere_channels']
             
+            # self.x4_decoder_denoiser_MLP = MultiLayerPerceptron(
+            #     input_dim = params['x4']['decoder']['node_channels'],
+            #     hidden_dim = params['x4']['decoder']['denoiser']['MLP_hidden_dim'], 
+            #     output_dim = params['x4']['decoder']['denoiser']['output_node_channels'],
+            #     num_hidden_layers = params['x4']['decoder']['denoiser']['num_MLP_hidden_layers'], 
+            #     activation=torch.nn.LeakyReLU(0.2),
+            #     include_final_activation = False,
+            # )
+
+            # ========================= MODIFICATION START: x4 pharmacophore type denoiser ==============
+            # 获取药效团类型的数量
+            num_pharm_types = self.params['dataset']['x4']['max_node_types']
+
             self.x4_decoder_denoiser_MLP = MultiLayerPerceptron(
                 input_dim = params['x4']['decoder']['node_channels'],
                 hidden_dim = params['x4']['decoder']['denoiser']['MLP_hidden_dim'], 
-                output_dim = params['x4']['decoder']['denoiser']['output_node_channels'],
+                # 修改输出维度以匹配药效团类型的数量
+                output_dim = num_pharm_types,
                 num_hidden_layers = params['x4']['decoder']['denoiser']['num_MLP_hidden_layers'], 
                 activation=torch.nn.LeakyReLU(0.2),
-                include_final_activation = False,
+                include_final_activation = False, # 正确
             )
+            # ========================= MODIFICATION END ================================================
             
             if params['x4']['decoder']['denoiser']['use_e3nn']:
                 #self.SO3_grid = self.x1_decoder_encoder.SO3_grid

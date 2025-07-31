@@ -1,0 +1,356 @@
+import resource
+rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
+
+import rdkit
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torch
+import torch_geometric
+from torch_geometric.nn import radius_graph
+import torch_scatter
+
+import pickle
+from copy import deepcopy
+import os
+import shutil
+import datetime
+import multiprocessing
+from tqdm import tqdm
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger, WandBLogger
+
+from torch_geometric.data import HeteroData
+
+from shepherd.model.model import Model
+from shepherd.lightning_module import LightningModule
+
+# from shepherd.datasets import HeteroDataset  # OLD
+from shepherd.new_datasets import HeteroDataset # NEW (adjust path as needed)
+
+from lightning_fabric.utilities.seed import seed_everything
+
+import importlib
+
+sharing_strategy = "file_system"
+torch.multiprocessing.set_sharing_strategy(sharing_strategy)
+def set_worker_sharing_strategy(worker_id: int) -> None:
+    torch.multiprocessing.set_sharing_strategy(sharing_strategy)
+
+if __name__ == '__main__':
+    """
+    This repository includes only a small subset of the training data so that the repository is self-contained.
+    After downloading the full training datasets (see README), change the corresponding lines of code below.
+    """
+    
+    import argparse
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("model_name", type=str)
+    parser.add_argument("seed", type=int)
+
+    args = parser.parse_args()
+    
+    seed_everything(seed = args.seed, workers = True)
+    
+    params = importlib.import_module(f'parameters.{args.model_name}').params
+    
+    # CHANGE ME ONCE FULL DATASETS ARE DOWNLOADED
+    if params['data'] == 'GDB17':
+        # sample data
+        molblocks_and_charges = []
+        with open(f'../data/conformers/gdb/example_molblock_charges.pkl', 'rb') as f:
+            molblocks_and_charges = pickle.load(f) 
+        """
+        # full dataset
+        molblocks_and_charges = []
+        for i in [0,1,2]:
+            with open(f'conformers/gdb/molblock_charges_{i}.pkl', 'rb') as f:
+                molblocks_and_charges_ = pickle.load(f) 
+            molblocks_and_charges += molblocks_and_charges_
+        
+        # removing randomly-chosen test-set molecules prior to training
+        test_indices = np.load('conformers/gdb/random_split_test_indices.npy')
+        for index in tqdm(sorted(test_indices)[::-1]): # removing from end of list
+            if index < len(molblocks_and_charges):
+                molblocks_and_charges.pop(index)
+        """
+    
+    # CHANGE ME ONCE FULL DATASETS ARE DOWNLOADED
+    if params['data'] == 'MOSES_aq':
+        # sample data
+        molblocks_and_charges = []
+        with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
+            molblocks_and_charges = pickle.load(f)    
+        """
+        # full dataset
+        molblocks_and_charges = []
+        for i in [0,1,2,3,4]:
+            with open(f'conformers/moses_aq/molblock_charges_{i}.pkl', 'rb') as f:
+                molblocks_and_charges_ = pickle.load(f) 
+            molblocks_and_charges += molblocks_and_charges_
+        """
+
+    # ==============================================================================
+    # START OF NEW CODE BLOCK
+    # ==============================================================================
+
+    from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
+
+    print("Calculating marginal distributions for discrete features...")
+
+    # Get feature type definitions from your parameters file
+    atom_types_x1 = params['dataset']['x1']['atom_types']
+    bond_types_x1 = params['dataset']['x1']['bond_types']
+    max_node_types_x4 = params['dataset']['x4']['max_node_types']
+
+    # Initialize counters for each feature type
+    # We use torch.zeros as the final output should be a tensor
+    atom_counts = torch.zeros(len(atom_types_x1), dtype=torch.float)
+    bond_counts = torch.zeros(len(bond_types_x1), dtype=torch.float)
+    pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
+
+    # Helper to map RDKit bond type object to the string representation used in params
+    def get_bond_type_str(bond):
+        return str(bond.GetBondType())
+
+    # Iterate over the entire dataset to count occurrences
+    for mol_block, _ in tqdm(molblocks_and_charges, desc="Counting feature occurrences"):
+        # Create an RDKit molecule object from the MolBlock string
+        mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
+        if not mol:
+            print("Warning: Failed to create molecule from MolBlock. Skipping.")
+            continue
+        
+        # --- 1. Count Atom and Bond types (for x1) ---
+        if params['dataset']['compute_x1']:
+            # Account for the virtual node, which has type `None` at index 0
+            if params['dataset']['x1']['add_virtual_node']:
+                atom_counts[atom_types_x1.index(None)] += 1
+            
+            # Count each atom
+            for atom in mol.GetAtoms():
+                symbol = atom.GetSymbol()
+                if symbol in atom_types_x1:
+                    atom_counts[atom_types_x1.index(symbol)] += 1
+
+            # Count each bond
+            for bond in mol.GetBonds():
+                bond_str = get_bond_type_str(bond)
+                if bond_str in bond_types_x1:
+                    bond_counts[bond_types_x1.index(bond_str)] += 1
+
+        # --- 2. Count Pharmacophore types (for x4) ---
+        if params['dataset']['compute_x4']:
+            # Account for the virtual node at index 0
+            if params['dataset']['x4']['add_virtual_node']:
+                pharm_counts[0] += 1
+            
+            try:
+                # Generate pharmacophores for the molecule
+                pharm_types, _, _ = get_pharmacophores(
+                    mol, 
+                    multi_vector=params['dataset']['x4']['multivectors'], 
+                    check_access=params['dataset']['x4']['check_accessibility']
+                )
+                # The dataset code adds 1 to each pharmacophore type to make space for the virtual node at index 0.
+                # We must replicate this logic here for accurate counting.
+                for p_type in (pharm_types + 1):
+                    if p_type < max_node_types_x4:
+                        pharm_counts[p_type] += 1
+            except Exception as e:
+                # This can happen for molecules that don't have RDKit's feature definitions
+                print(f"Warning: Could not get pharmacophores for a molecule. Skipping. Error: {e}")
+
+    # --- 3. Normalize counts to get probabilities (marginals) ---
+
+    # Handle the case where a feature type might have zero counts to avoid division by zero
+    atom_marginals_x1 = (atom_counts / atom_counts.sum()) if atom_counts.sum() > 0 else torch.ones_like(atom_counts) / len(atom_counts)
+    bond_marginals_x1 = (bond_counts / bond_counts.sum()) if bond_counts.sum() > 0 else torch.ones_like(bond_counts) / len(bond_counts)
+    pharm_marginals_x4 = (pharm_counts / pharm_counts.sum()) if pharm_counts.sum() > 0 else torch.ones_like(pharm_counts) / len(pharm_counts)
+
+    print("\n--- Calculated Marginal Distributions ---")
+    print(f"Atom Marginals (x1): {atom_marginals_x1}")
+    print(f"Bond Marginals (x1): {bond_marginals_x1}")
+    print(f"Pharmacophore Marginals (x4): {pharm_marginals_x4}")
+    print("---------------------------------------\n")
+
+    # ==============================================================================
+    # END OF NEW CODE BLOCK
+    # ==============================================================================
+
+    dataset = HeteroDataset(
+        molblocks_and_charges = molblocks_and_charges, 
+        
+        noise_schedule_dict = params['noise_schedules'],
+
+        # These are the NEW required arguments
+        atom_marginals_x1=atom_marginals_x1,
+        bond_marginals_x1=bond_marginals_x1,
+        pharm_marginals_x4=pharm_marginals_x4,
+        
+        explicit_hydrogens = params['dataset']['explicit_hydrogens'],
+        use_MMFF94_charges = params['dataset']['use_MMFF94_charges'],
+        
+        # formal_charge_diffusion = params['x1_formal_charge_diffusion'], # 不进行形式电荷的扩散
+        formal_charge_diffusion = False ,
+
+        x1 = params['dataset']['compute_x1'],
+        x2 = params['dataset']['compute_x2'],
+        x3 = params['dataset']['compute_x3'],
+        x4 = params['dataset']['compute_x4'],
+        
+        recenter_x1 = params['dataset']['x1']['recenter'], 
+        add_virtual_node_x1 = params['dataset']['x1']['add_virtual_node'],
+        remove_noise_COM_x1 = params['dataset']['x1']['remove_noise_COM'],
+        atom_types_x1 = params['dataset']['x1']['atom_types'],
+        charge_types_x1 = params['dataset']['x1']['charge_types'],
+        bond_types_x1 = params['dataset']['x1']['bond_types'],
+        scale_atom_features_x1 = params['dataset']['x1']['scale_atom_features'],
+        scale_bond_features_x1 = params['dataset']['x1']['scale_bond_features'],
+
+        independent_timesteps_x2 = params['dataset']['x2']['independent_timesteps'],
+        recenter_x2 = params['dataset']['x2']['recenter'],
+        add_virtual_node_x2 = params['dataset']['x2']['add_virtual_node'],
+        remove_noise_COM_x2 = params['dataset']['x2']['remove_noise_COM'],
+        num_points_x2 = params['dataset']['x2']['num_points'],
+        
+        independent_timesteps_x3 = params['dataset']['x3']['independent_timesteps'],
+        recenter_x3 = params['dataset']['x3']['recenter'],
+        add_virtual_node_x3 = params['dataset']['x3']['add_virtual_node'],
+        remove_noise_COM_x3 = params['dataset']['x3']['remove_noise_COM'],
+        num_points_x3 = params['dataset']['x3']['num_points'],
+        scale_node_features_x3 = params['dataset']['x3']['scale_node_features'],        
+        
+        independent_timesteps_x4 = params['dataset']['x4']['independent_timesteps'],
+        recenter_x4 = params['dataset']['x4']['recenter'],
+        add_virtual_node_x4 = params['dataset']['x4']['add_virtual_node'],
+        remove_noise_COM_x4 = params['dataset']['x4']['remove_noise_COM'],
+        max_node_types_x4 = params['dataset']['x4']['max_node_types'],
+        scale_node_features_x4 = params['dataset']['x4']['scale_node_features'],
+        scale_vector_features_x4 = params['dataset']['x4']['scale_vector_features'],
+        multivectors = params['dataset']['x4']['multivectors'],
+        check_accessibility = params['dataset']['x4']['check_accessibility'],
+        
+        probe_radius = params['dataset']['probe_radius'], # for x2 and x3
+        
+    )
+
+    # 打印现在的训练批次
+    print(f"数据指定训练的批大小{params['training']['batch_size']}")
+
+    fixed_batch_size = 2
+    print(f"数据指定训练的批大小{fixed_batch_size}")
+    
+    if params['training']['multiprocessing_spawn']:
+        train_loader = torch_geometric.loader.DataLoader(
+            dataset = dataset,
+            num_workers = params['training']['num_workers'],
+            # batch_size = params['training']['batch_size'],
+            batch_size = fixed_batch_size,
+            shuffle = True,
+            multiprocessing_context = multiprocessing.get_context("spawn"),
+            worker_init_fn=set_worker_sharing_strategy,
+        )
+    else:
+        train_loader = torch_geometric.loader.DataLoader(
+            dataset = dataset,
+            num_workers = params['training']['num_workers'],
+            # batch_size = params['training']['batch_size'],
+            batch_size = fixed_batch_size,
+            shuffle = True,
+            worker_init_fn=set_worker_sharing_strategy,
+        )
+    
+    
+    output_dir = f"jobs/{params['training']['output_dir']}"
+    try: os.mkdir(f"jobs/")
+    except: pass
+    try: os.mkdir(output_dir)
+    except: pass
+    
+    checkpoint_callback = ModelCheckpoint(
+        save_top_k = 0,
+        save_last = True,
+        monitor="train_loss",
+        mode="min",
+        dirpath = output_dir,
+        filename="best-{step:09d}",
+        every_n_train_steps = params['training']['log_every_n_steps'],
+    )
+    csv_logger = CSVLogger(
+        save_dir = output_dir,
+        name = 'csv_logger',
+    )
+
+    # ========================= W&B MODIFICATION START =========================
+    
+    # 2. 创建 WandbLogger 的实例
+    # 你可以自定义 project, name, 和 id
+    # - project: 将所有相关的实验分组
+    # - name: 为这次特定的运行起一个名字 (例如，可以包含 batch_size, lr 等信息)
+    # - save_dir: 指定 W&B 在本地存储文件的位置
+    wandb_logger = WandbLogger(
+        name=f"{args.model_name}-seed_{args.seed}-bs_{params['training']['batch_size']}",
+        project="SPD_Molecule_Generation",  # <--- 修改为你想要的项目名称
+        save_dir=output_dir,
+        log_model="all",  # 可以设置为 "all" (保存所有 checkpoint) 或 True (只保存最好的)
+    )
+
+    # 可选: 让 W&B 监控模型的梯度和参数 (会稍微增加一些开销)
+    wandb_logger.watch(model_pl, log="all", log_freq=500)
+
+    # ========================= W&B MODIFICATION END ===========================
+    
+    gradient_clip_val = params['training']['gradient_clip_val']
+    accumulate_grad_batches = params['training']['accumulate_grad_batches']
+    
+    cuda_available = torch.cuda.is_available()
+    from pytorch_lightning.strategies.ddp import DDPStrategy
+    
+    num_gpus_to_use = torch.cuda.device_count()
+    
+    trainer = pl.Trainer(
+        callbacks = [checkpoint_callback],
+        logger = [csv_logger, wandb_logger],
+        
+        default_root_dir = output_dir,
+        accelerator = "gpu" if (params['training']['num_gpus'] >= 1 and cuda_available) else 'cpu', 
+        
+        max_epochs = 10000,
+        
+        gradient_clip_val = gradient_clip_val,
+        accumulate_grad_batches = accumulate_grad_batches,
+        
+        # log_every_n_steps = params['training']['log_every_n_steps'], # 临时调整
+        log_every_n_steps = 50,
+        
+        reload_dataloaders_every_n_epochs = 1, # re-shuffle training data after each epoch
+        
+        devices = num_gpus_to_use  if cuda_available else "auto",
+        
+        strategy = DDPStrategy(find_unused_parameters=True) if (params['training']['num_gpus'] > 1 and cuda_available) else 'auto',
+        precision = 32,
+        
+        detect_anomaly = True,
+    )
+    
+    model_pl = LightningModule(params)
+    print(sum(p.numel() for p in model_pl.parameters() if p.requires_grad))
+    
+    resume_from_checkpoint = True
+    ckpt_path = f"{output_dir}/last.ckpt"
+    ckpt_path = ckpt_path if (os.path.exists(ckpt_path) & resume_from_checkpoint) else None
+    
+    # avoid overwriting previous "last.ckpt"
+    if (ckpt_path is not None) and (trainer.global_rank == 0):
+        date = datetime.datetime.now()
+        timestamp = str(date.year) + '_' + str(date.month).zfill(2) + '_' + str(date.day).zfill(2) + '_' + str(date.hour).zfill(2) + '_' + str(date.minute).zfill(2)
+        shutil.copyfile(ckpt_path, f"{output_dir}/last_{timestamp}.ckpt")
+    
+    
+    print('beginning to train...')
+    trainer.fit(model_pl, train_loader, ckpt_path = ckpt_path)

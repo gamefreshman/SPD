@@ -10,7 +10,7 @@ authors = [
     {name = "Keir Adams"},
     {name = "Kento Abeywardane", email = "kento@mit.edu"}
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "torch",
     "torch-geometric",
