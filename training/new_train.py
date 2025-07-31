@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger, WandBLogger
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
 
 from torch_geometric.data import HeteroData
 
@@ -300,9 +300,6 @@ if __name__ == '__main__':
         log_model="all",  # 可以设置为 "all" (保存所有 checkpoint) 或 True (只保存最好的)
     )
 
-    # 可选: 让 W&B 监控模型的梯度和参数 (会稍微增加一些开销)
-    wandb_logger.watch(model_pl, log="all", log_freq=500)
-
     # ========================= W&B MODIFICATION END ===========================
     
     gradient_clip_val = params['training']['gradient_clip_val']
@@ -339,6 +336,10 @@ if __name__ == '__main__':
     )
     
     model_pl = LightningModule(params)
+
+    wandb_logger.watch(model_pl, log="all", log_freq=500)
+
+
     print(sum(p.numel() for p in model_pl.parameters() if p.requires_grad))
     
     resume_from_checkpoint = True
