@@ -245,10 +245,13 @@ if __name__ == '__main__':
     fixed_batch_size = 2
     print(f"数据指定训练的批大小{fixed_batch_size}")
     
+    # debug : 非并行
     if params['training']['multiprocessing_spawn']:
         train_loader = torch_geometric.loader.DataLoader(
             dataset = dataset,
-            num_workers = params['training']['num_workers'],
+            num_workers = params['training']['num_workers'], 
+            # num_workers = 0,            
+           
             # batch_size = params['training']['batch_size'],
             batch_size = fixed_batch_size,
             shuffle = True,
@@ -285,22 +288,16 @@ if __name__ == '__main__':
         save_dir = output_dir,
         name = 'csv_logger',
     )
-
-    # ========================= W&B MODIFICATION START =========================
     
     # 2. 创建 WandbLogger 的实例
-    # 你可以自定义 project, name, 和 id
-    # - project: 将所有相关的实验分组
-    # - name: 为这次特定的运行起一个名字 (例如，可以包含 batch_size, lr 等信息)
     # - save_dir: 指定 W&B 在本地存储文件的位置
     wandb_logger = WandbLogger(
         name=f"{args.model_name}-seed_{args.seed}-bs_{params['training']['batch_size']}",
-        project="SPD_Molecule_Generation",  # <--- 修改为你想要的项目名称
+        entity="SPD_PaperParty",
+        project="SPD_Molecule_Generation",
         save_dir=output_dir,
-        log_model="all",  # 可以设置为 "all" (保存所有 checkpoint) 或 True (只保存最好的)
+        log_model="all", 
     )
-
-    # ========================= W&B MODIFICATION END ===========================
     
     gradient_clip_val = params['training']['gradient_clip_val']
     accumulate_grad_batches = params['training']['accumulate_grad_batches']

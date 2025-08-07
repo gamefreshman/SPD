@@ -125,13 +125,23 @@ class DiscreteFeatureDiffusion:
         # Get the transition matrix Q_t_bar
         Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, device=device)
         
-         # ========================= MODIFICATION START =========================
-
         prob_t = torch.matmul(features_0, Qtb.squeeze(0)) # [N, C]
-        # ========================= MODIFICATION END ===========================
         
-        # Ensure probabilities sum to 1
-        # assert (torch.abs(prob_t.sum(dim=-1) - 1.) < 1e-4).all()
+        # ========================= ROBUSTNESS MODIFICATION START =========================
+        # 对概率进行防御性处理，防止 torch.multinomial 崩溃
+
+        # 1. 确保概率值非负 (防止浮点数精度问题)
+        prob_t = torch.clamp(prob_t, min=0)
+        
+        # 2. 处理行和为零的情况
+        row_sums = prob_t.sum(dim=-1, keepdim=True)
+        
+        # 3. 对于行和接近于零的行，替换为一个均匀分布，避免除以零
+        #    对于行和大于零的行，进行归一化，确保和为 1
+        uniform_fallback = torch.ones_like(prob_t) / prob_t.shape[-1]
+        prob_t = torch.where(row_sums > 1e-6, prob_t / row_sums, uniform_fallback)
+        
+        # ========================= ROBUSTNESS MODIFICATION END ===========================
         
         # Sample from the categorical distribution to get the noised features
         sampled_indices_t = torch.multinomial(prob_t, num_samples=1).squeeze(-1) # [N]
