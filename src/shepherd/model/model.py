@@ -50,6 +50,7 @@ def display_dict(d, indent=''):
 
 class Model(torch.nn.Module):
     
+    # 模型初始化
     def __init__(self, params):
         super(Model, self).__init__()
         
@@ -60,6 +61,12 @@ class Model(torch.nn.Module):
         
         lmax_list = params['lmax_list']
         grid_resolution = params['grid_resolution']
+
+        # 创建一个 SO(3) 傅里叶网格
+        # 这是模型中最关键的跨模态信息交互模块。
+        # 它是一个完整的 EquiformerV2 网络。
+        # 在每个模态的独立编码器运行之后，所有模态的节点和它们的表示会被汇集到一个大的异构图中。
+        # 这个编码器在这个大图上运行，允许不同类型的节点（如原子、表面点、药效团）相互传递信息。
         self.joint_SO3_grid = ModuleListInfo('({}, {})'.format(max(lmax_list), max(lmax_list)))
         for l in range(max(lmax_list) + 1):
             SO3_m_grid = nn.ModuleList()
@@ -84,6 +91,11 @@ class Model(torch.nn.Module):
         
         
         # heterogeneous graph encoding (in decoder, before joint global code processing)
+        # 初始化异构图编码器
+        # 这是模型中最关键的跨模态信息交互模块。
+        # 它是一个完整的 EquiformerV2 网络。
+        # 在每个模态的独立编码器运行之后，所有模态的节点和它们的表示会被汇集到一个大的异构图中。
+        # 这个编码器在这个大图上运行，允许不同类型的节点（如原子、表面点、药效团）相互传递信息。
         self.decoder_joint_heterogeneous_graph_encoder = None
         if 'decoder_heterogeneous_graph_encoder' in params:
             if params['decoder_heterogeneous_graph_encoder']['use']:
@@ -140,6 +152,9 @@ class Model(torch.nn.Module):
         
         # these COULD share parameters, but for now, they are initialized separately for each explicit diffusion variable
         if 'x1' in self.explicit_diffusion_variables:
+            # 这是一个简单的线性层。
+            # 它接收所有模态的时间步嵌入拼接成的长向量，然后将其投影到当前模态所需的通道数。
+            # 这使得每个模态都能感知到其他所有模态所处的噪声水平。
             self.x1_decoder_global_timestep_embedding = torch.nn.Linear(
                 sum([params[x_]['decoder']['time_embedding_size'] for x_ in self.explicit_diffusion_variables]), # in ['x1', 'x2', ...]
                 params['x1']['decoder']['node_channels'],
@@ -162,6 +177,10 @@ class Model(torch.nn.Module):
         
         # these could also all share parameters, but for now, they are initialized separately for each explicit diffusion variable
         if 'x1' in self.explicit_diffusion_variables:
+            # 创建一个使用 e3nn 实现的、可学习的张量积模块。
+            # 这个模块用于将 l=0（标量，如时间步信息）和 l=1（向量，如全局几何信息）的联合嵌入进行非线性混合。
+            # 通过张量积，标量信息可以调节向量信息的大小和方向，
+            # 反之亦然，从而产生更具表达力的联合表示，然后这个表示会被加到每个节点的特征上。
             self.x1_decoder_global_l1_embedding = FeedForwardNetwork(
                 sphere_channels = sum([params[x_]['decoder']['node_channels'] for x_ in self.explicit_diffusion_variables]),
                 hidden_channels = params['ffn_hidden_channels'], 
@@ -217,7 +236,7 @@ class Model(torch.nn.Module):
                 use_sep_s2_act = True,
             )
         
-        
+        # ？？？
         # for mixing l=0 and l=1 channels of the joint embeddings prior to denoising
                 # these could also all share parameters, but for now, they are initialized separately for each explicit diffusion variable
         if 'x1' in self.explicit_diffusion_variables:
@@ -261,10 +280,7 @@ class Model(torch.nn.Module):
                 proj_drop=0.0,
             )
         
-        
-        
         # Denoising Modules
-        
         if 'x1' in self.explicit_diffusion_variables:
             
             #params['x1']['decoder']['encoder']
@@ -343,16 +359,7 @@ class Model(torch.nn.Module):
             
             assert params['x1']['decoder']['node_channels'] == params['x1']['decoder']['encoder']['sphere_channels']
             
-            # self.x1_decoder_denoiser_MLP = MultiLayerPerceptron(
-            #     input_dim = params['x1']['decoder']['node_channels'],
-            #     hidden_dim = params['x1']['decoder']['denoiser']['MLP_hidden_dim'], 
-            #     output_dim = params['x1']['decoder']['denoiser']['output_node_channels'],
-            #     num_hidden_layers = params['x1']['decoder']['denoiser']['num_MLP_hidden_layers'], 
-            #     activation=torch.nn.LeakyReLU(0.2),
-            #     include_final_activation = False,
-            # )
-
-            # ========================= MODIFICATION START: x1 atom type denoiser =========================
+            # x1 atom type denoiser 
             # 获取原子类型的数量，用于分类输出
             num_atom_types = len(self.params['dataset']['x1']['atom_types'])
 
@@ -365,21 +372,11 @@ class Model(torch.nn.Module):
                 activation=torch.nn.LeakyReLU(0.2),
                 include_final_activation = False, # 正确，交叉熵损失函数需要原始 logits
             )
-            # ========================= MODIFICATION END ================================================
             
             self.x1_decoder_denoiser_bond_MLP = None
             if self.x1_bond_diffusion:
-                # bond_distance_expansion_dim = 32
-                # self.x1_decoder_denoiser_bond_MLP =  MultiLayerPerceptron(
-                #     input_dim = 2 * params['x1']['decoder']['node_channels'] + params['x1']['decoder']['encoder']['input_bond_channels'] + bond_distance_expansion_dim,
-                #     hidden_dim = params['x1']['decoder']['denoiser']['MLP_hidden_dim'], 
-                #     output_dim = params['x1']['decoder']['denoiser']['output_bond_channels'],
-                #     num_hidden_layers = params['x1']['decoder']['denoiser']['num_MLP_hidden_layers'], 
-                #     activation=torch.nn.LeakyReLU(0.2),
-                #     include_final_activation = False,
-                # )
 
-                # ========================= MODIFICATION START: x1 bond type denoiser =========================
+                # x1 bond type denoiser 
                 # 获取键类型的数量
                 num_bond_types = len(self.params['dataset']['x1']['bond_types'])
                 bond_distance_expansion_dim = 32
@@ -392,7 +389,6 @@ class Model(torch.nn.Module):
                     activation=torch.nn.LeakyReLU(0.2),
                     include_final_activation = False, # 正确
                 )
-                # ========================= MODIFICATION END ================================================
                 self.x1_decoder_denoiser_bond_distance_scalar_expansion = GaussianSmearing(
                     start = 0.0,
                     stop = 5.0,
@@ -442,9 +438,6 @@ class Model(torch.nn.Module):
                     num_MLP_hidden_layers = params['x1']['decoder']['denoiser']['egnn']['num_MLP_hidden_layers'],
                     MLP_hidden_dim = params['x1']['decoder']['denoiser']['egnn']['MLP_hidden_dim'],
                 )        
-        
-
-        
         
         if 'x2' in self.explicit_diffusion_variables:
         
@@ -502,56 +495,10 @@ class Model(torch.nn.Module):
                     proj_drop=0.0, 
                     weight_init='normal',
             )
-            
-            
-            assert params['x2']['decoder']['node_channels'] == params['x2']['decoder']['encoder']['sphere_channels']
-            
-            if params['x2']['decoder']['denoiser']['use_e3nn']:
-                
-                #self.SO3_grid = self.x2_decoder_encoder.SO3_grid
-                lmax_list = params['x2']['decoder']['denoiser']['e3nn']['lmax_list']
-                grid_resolution = params['x2']['decoder']['denoiser']['e3nn']['grid_resolution']
-                self.x2_denoiser_SO3_grid = ModuleListInfo('({}, {})'.format(max(lmax_list), max(lmax_list)))
-                for l in range(max(lmax_list) + 1):
-                    SO3_m_grid = nn.ModuleList()
-                    for m in range(max(lmax_list) + 1):
-                        SO3_m_grid.append(
-                            SO3_Grid(
-                                l, 
-                                m, 
-                                resolution=grid_resolution, 
-                                normalization='component'
-                            )
-                        )
-                    self.x2_denoiser_SO3_grid.append(SO3_m_grid)
-                
-                self.x2_decoder_denoiser_E3NN = FeedForwardNetwork(
-                    sphere_channels = params['x2']['decoder']['node_channels'],
-                    hidden_channels = params['x2']['decoder']['denoiser']['e3nn']['ffn_hidden_channels'],
-                    output_channels = 1,
-                    lmax_list = params['x2']['decoder']['denoiser']['e3nn']['lmax_list'],
-                    mmax_list = params['x2']['decoder']['denoiser']['e3nn']['mmax_list'],
-                    SO3_grid = self.x2_denoiser_SO3_grid,  
-                    activation = 'silu',
-                    use_gate_act = False,
-                    use_grid_mlp = True,
-                    use_sep_s2_act = True,
-                )
-            
-            if self.params['x2']['decoder']['denoiser']['use_egnn_positions_update']:
-                self.x2_decoder_denoiser_EGNN = EGNN(
-                    node_embedding_dim = params['x2']['decoder']['node_channels'], 
-                    node_output_embedding_dim = params['x2']['decoder']['denoiser']['output_node_channels'], # node output embeddings are ignored
-                    edge_attr_dim = 0, 
-                    distance_expansion_dim = params['x2']['decoder']['denoiser']['egnn']['distance_expansion_dim'], 
-                    normalize_distance_vectors = params['x2']['decoder']['denoiser']['egnn']['normalize_egnn_vectors'], 
-                    num_MLP_hidden_layers = params['x2']['decoder']['denoiser']['egnn']['num_MLP_hidden_layers'],
-                    MLP_hidden_dim = params['x2']['decoder']['denoiser']['egnn']['MLP_hidden_dim'],
-                )
-        
-        
 
-        
+            # 以上是x2模块的编码器部分
+            # 以下去噪器的部分去除
+              
         if 'x3' in self.explicit_diffusion_variables:
             
             self.x3_decoder_scalar_expansion = GaussianSmearing(
@@ -613,63 +560,6 @@ class Model(torch.nn.Module):
                     proj_drop=0.0, 
                     weight_init='normal',
             )
-            
-            
-            assert params['x3']['decoder']['node_channels'] == params['x3']['decoder']['encoder']['sphere_channels']
-            self.x3_decoder_denoiser_MLP = MultiLayerPerceptron(
-                input_dim = params['x3']['decoder']['node_channels'], # see above assertion
-                hidden_dim = params['x3']['decoder']['denoiser']['MLP_hidden_dim'], 
-                output_dim = params['x3']['decoder']['denoiser']['output_node_channels'], # should be 1 for a scalar potential
-                num_hidden_layers = params['x3']['decoder']['denoiser']['num_MLP_hidden_layers'], 
-                activation=torch.nn.LeakyReLU(0.2),
-                include_final_activation = False,
-            )
-            
-                
-            if params['x3']['decoder']['denoiser']['use_e3nn']:
-                #self.SO3_grid = self.x3_decoder_encoder.SO3_grid
-                lmax_list = params['x3']['decoder']['denoiser']['e3nn']['lmax_list']
-                grid_resolution = params['x3']['decoder']['denoiser']['e3nn']['grid_resolution']
-                self.x3_denoiser_SO3_grid = ModuleListInfo('({}, {})'.format(max(lmax_list), max(lmax_list)))
-                for l in range(max(lmax_list) + 1):
-                    SO3_m_grid = nn.ModuleList()
-                    for m in range(max(lmax_list) + 1):
-                        SO3_m_grid.append(
-                            SO3_Grid(
-                                l, 
-                                m, 
-                                resolution=grid_resolution, 
-                                normalization='component'
-                            )
-                        )
-                    self.x3_denoiser_SO3_grid.append(SO3_m_grid)
-                
-                self.x3_decoder_denoiser_E3NN = FeedForwardNetwork(
-                    sphere_channels = params['x3']['decoder']['node_channels'],
-                    hidden_channels = params['x3']['decoder']['denoiser']['e3nn']['ffn_hidden_channels'],
-                    output_channels = 1,
-                    lmax_list = params['x3']['decoder']['denoiser']['e3nn']['lmax_list'],
-                    mmax_list = params['x3']['decoder']['denoiser']['e3nn']['mmax_list'],
-                    SO3_grid = self.x3_denoiser_SO3_grid,  
-                    activation = 'silu',
-                    use_gate_act = False,
-                    use_grid_mlp = True,
-                    use_sep_s2_act = True,
-                )
-            
-            if params['x3']['decoder']['denoiser']['use_egnn_positions_update']:
-                self.x3_decoder_denoiser_EGNN = EGNN(
-                    node_embedding_dim = params['x3']['decoder']['node_channels'], 
-                    node_output_embedding_dim = params['x3']['decoder']['denoiser']['output_node_channels'], # ignored; x3_decoder_denoiser_MLP is used for feature denoising
-                    edge_attr_dim = 0, 
-                    distance_expansion_dim = params['x3']['decoder']['denoiser']['egnn']['distance_expansion_dim'], 
-                    normalize_distance_vectors = params['x3']['decoder']['denoiser']['egnn']['normalize_egnn_vectors'], 
-                    num_MLP_hidden_layers = params['x3']['decoder']['denoiser']['egnn']['num_MLP_hidden_layers'],
-                    MLP_hidden_dim = params['x3']['decoder']['denoiser']['egnn']['MLP_hidden_dim'],
-                )
-    
-    
-
     
         if 'x4' in self.explicit_diffusion_variables:
             self.x4_decoder_encoder_embedding = torch.nn.Linear(
@@ -743,17 +633,8 @@ class Model(torch.nn.Module):
             )
             
             assert params['x4']['decoder']['node_channels'] == params['x4']['decoder']['encoder']['sphere_channels']
-            
-            # self.x4_decoder_denoiser_MLP = MultiLayerPerceptron(
-            #     input_dim = params['x4']['decoder']['node_channels'],
-            #     hidden_dim = params['x4']['decoder']['denoiser']['MLP_hidden_dim'], 
-            #     output_dim = params['x4']['decoder']['denoiser']['output_node_channels'],
-            #     num_hidden_layers = params['x4']['decoder']['denoiser']['num_MLP_hidden_layers'], 
-            #     activation=torch.nn.LeakyReLU(0.2),
-            #     include_final_activation = False,
-            # )
 
-            # ========================= MODIFICATION START: x4 pharmacophore type denoiser ==============
+            # x4 pharmacophore type denoiser 
             # 获取药效团类型的数量
             num_pharm_types = self.params['dataset']['x4']['max_node_types']
 
@@ -766,7 +647,6 @@ class Model(torch.nn.Module):
                 activation=torch.nn.LeakyReLU(0.2),
                 include_final_activation = False, # 正确
             )
-            # ========================= MODIFICATION END ================================================
             
             if params['x4']['decoder']['denoiser']['use_e3nn']:
                 #self.SO3_grid = self.x1_decoder_encoder.SO3_grid
@@ -823,10 +703,7 @@ class Model(torch.nn.Module):
                 use_sep_s2_act = True,
             )
     
-    
-
-    ######## Forward Pass ########
-    
+    # 向前传播
     
     def forward_x1_decoder_encoder(self, input_dict, output_dict):
         
@@ -926,8 +803,7 @@ class Model(torch.nn.Module):
         output_dict['x1']['decoder']['encoder']['global_embedding'] = x1_decoder_encoder_global
         
         return output_dict
-    
-    
+
     
     
     def forward_x2_decoder_encoder(self, input_dict, output_dict):
@@ -1010,9 +886,6 @@ class Model(torch.nn.Module):
         output_dict['x2']['decoder']['encoder']['global_embedding'] = x2_decoder_encoder_global
 
         return output_dict
-    
-    
-    
     
     def forward_x3_decoder_encoder(self, input_dict, output_dict):
         
@@ -1636,10 +1509,6 @@ class Model(torch.nn.Module):
                 
         return output_dict
     
-    
-    
-
-    
     # forward function for training
         # this training function could also be split into separate diffusion processes
             # nothing REQUIRES us to train on all diffusion branches in the same batch ...
@@ -1762,11 +1631,7 @@ class Model(torch.nn.Module):
         # Denoising Modules
         if 'x1' in self.explicit_diffusion_variables:
             output_dict = self.forward_x1_decoder_denoiser(input_dict, output_dict)
-        if 'x2' in self.explicit_diffusion_variables:
-            output_dict = self.forward_x2_decoder_denoiser(input_dict, output_dict)
-        if 'x3' in self.explicit_diffusion_variables:
-            output_dict = self.forward_x3_decoder_denoiser(input_dict, output_dict)
-        if 'x4' in self.explicit_diffusion_variables:
+        if 'x4' in self.explicit_diffusion_variables:aa
             output_dict = self.forward_x4_decoder_denoiser(input_dict, output_dict)
         
         return input_dict, output_dict

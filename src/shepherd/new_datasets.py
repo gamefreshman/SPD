@@ -21,8 +21,8 @@ import torch.nn.functional as F
 
 class MarginalUniformTransition:
     def __init__(self, x_marginals, e_marginals=None, y_classes=0):
-        self.x_marginals = x_marginals
-    def get_Qt_bar(self, alpha_t_bar, device):
+        self.x_marginals = x_marginals 
+    def get_Qt_bar(self, alpha_t_bar, device):                
         # Simplified transition for demonstration
         K = self.x_marginals.shape[0]
         return PredefinedNoiseScheduleDiscrete.get_Qt_bar_from_marginals(self.x_marginals, alpha_t_bar, device)
@@ -432,7 +432,8 @@ class HeteroDataset(torch_geometric.data.Dataset):
         return data, pos, virtual_node_mask
     
     
-    
+    # 根据原子半径 (radii) 和中心坐标 (atom_centers) 生成一个分子表面点云，然后构造条件输入数据结构 data，包含坐标、中心信息、是否有虚拟节点等。
+
     def get_x2_data(self, radii, atom_centers, num_points, recenter, add_virtual_node, remove_noise_COM, t, alpha_dash_t, sigma_dash_t, virtual_node_pos = None):
         
         data = {}
@@ -442,74 +443,53 @@ class HeteroDataset(torch_geometric.data.Dataset):
             atom_centers,
             radii,
             num_points=num_points,
-            probe_radius = self.probe_radius,
+            probe_radius = self.probe_radius, # 探针半径
             num_samples_per_atom = 20,
         )
         
         COM_before_centering = pos.mean(0)[None, :]
         data['com_before_centering'] = torch.from_numpy(COM_before_centering.copy()).float()
+
+        # 中心化处理
         pos_recentered = pos - pos.mean(0)
         if recenter:
             pos = pos_recentered
+
         COM = pos.mean(0)[None, :]
         data['com'] = torch.from_numpy(COM.copy()).float()
         
-        virtual_node_mask = np.zeros(pos.shape[0] + int(add_virtual_node))
-        if add_virtual_node: # should change according to desired behavior
-            if (virtual_node_pos is None) or (recenter == True):
-                virtual_node_pos = COM
-            pos = np.concatenate([virtual_node_pos, pos], axis = 0)
-            pos_recentered = np.concatenate([virtual_node_pos * 0.0, pos_recentered], axis = 0)
-            virtual_node_mask[0] = 1
-        virtual_node_mask = virtual_node_mask == 1
-        
         data['pos'] = torch.from_numpy(pos.copy()).float()
-        data['pos_recentered'] = torch.from_numpy(pos_recentered.copy()).float()
-        data['virtual_node_mask'] = torch.from_numpy(virtual_node_mask.copy()).bool()
-        
+        data['pos_recentered'] = torch.from_numpy(pos_recentered.copy()).float()        
         
         # one-hot embedding indicating real vs virtual nodes
         x = np.zeros((pos.shape[0], 2))
-        x[~virtual_node_mask,0] = 1
-        x[virtual_node_mask,1] = 1
         data['x'] = torch.from_numpy(x.copy()).float()
-        data['x_forward_noised'] = data['x'] # there are no features to be noised in x2
+
+        # 作为条件不加噪
+
+        data['x_forward_noised'] = data['x'].clone() 
+    
+        data['pos_noise'] = torch.zeros_like(data['pos'])
         
-        # forward noising non-virtual-nodes
-        pos_noise = np.random.randn(*pos.shape)
-        pos_noise[virtual_node_mask] = 0.0
-        if remove_noise_COM:
-            pos_noise[~virtual_node_mask] = pos_noise[~virtual_node_mask] - np.mean(pos_noise[~virtual_node_mask], axis = 0) # removing COM from added noise
-        data['pos_noise'] = torch.from_numpy(pos_noise.copy()).float()
-        
-        pos_forward_noised = alpha_dash_t * pos  +  sigma_dash_t * pos_noise 
-        pos_forward_noised[virtual_node_mask] = pos[virtual_node_mask]
-        data['pos_forward_noised'] = torch.from_numpy(pos_forward_noised.copy()).float()
+        data['pos_forward_noised'] = data['pos'].clone()
         
         return data, pos, virtual_node_mask
     
     
-    
+    # 不加噪音，条件化
     def get_x3_data_electrostatics_only(self, charges, charge_centers, data, pos, virtual_node_mask, t, alpha_dash_t, sigma_dash_t):
         
         x = get_electrostatics_given_point_charges(charges, charge_centers, pos) # compute ESP at each point in pos
-        x[virtual_node_mask] = 0.0
         x = x * self.scale_node_features_x3
-        
+                
         data['x'] = torch.from_numpy(x.copy()).float()
         
-        x_noise = np.random.randn(*x.shape)
-        x_noise[virtual_node_mask] = 0.0
-        data['x_noise'] = torch.from_numpy(x_noise.copy()).float()
+        data['x_noise'] = torch.zeros_like(data['x'])
         
-        x_forward_noised = alpha_dash_t * x  +  sigma_dash_t * x_noise 
-        x_forward_noised[virtual_node_mask] = x[virtual_node_mask]
-        data['x_forward_noised'] = torch.from_numpy(x_forward_noised.copy()).float()
+        data['x_forward_noised'] = data['x'].clone()
         
         return data
     
-    
-    # 请用下面的代码完整替换掉 new_datasets.py 中的 get_x4_data 函数
 
     def get_x4_data(self, mol, recenter, add_virtual_node, remove_noise_COM, t, alpha_dash_t, sigma_dash_t, virtual_node_pos = None):
         
@@ -615,18 +595,23 @@ class HeteroDataset(torch_geometric.data.Dataset):
         mol_block = self.molblocks_and_charges[k][0]
         charges = np.array(self.molblocks_and_charges[k][1]) # precomputed charges (e.g., from xTB)
         
-        mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs = False)
-        atomic_numbers = np.array([int(a.GetAtomicNum()) for a in mol.GetAtoms()])
+        mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs = False) # 表示不移除氢原子
+        atomic_numbers = np.array([int(a.GetAtomicNum()) for a in mol.GetAtoms()]) # 获取分子中每个原子的原子序数
         
+        # 表示在分子结构中明确地包含氢原子
         assert self.explicit_hydrogens # if we want to treat hydrogens implicitly, then we need to adjust how x2,x3,x4 are computed
         
         # centering molecule coordinates
         mol_coordinates = np.array(mol.GetConformer().GetPositions())
         mol_coordinates = mol_coordinates - np.mean(mol_coordinates, axis = 0)
-        #mol = update_mol_coordinates(mol, mol_coordinates, copy = False)
+
+        # mol = update_mol_coordinates(mol, mol_coordinates, copy = False)
         mol = update_mol_coordinates(mol, mol_coordinates)
 
+        # 获取每个原子的范德华半径
         radii = get_atomic_vdw_radii(mol)
+
+        # MMFF94 方法计算部分电荷
         if self.use_MMFF94_charges:
             charges = get_atomic_partial_charges(mol) #MMFF94 charges
         
@@ -642,12 +627,16 @@ class HeteroDataset(torch_geometric.data.Dataset):
         if self.x1:
             ts = self.noise_schedule_dict['x1']['ts']
             
-            #t = np.random.choice(ts)  # random time step sampled uniformly from time sequence
+            # t = np.random.choice(ts)  
+            # random time step sampled uniformly from time sequence
             T = ts.shape[0]
+
             ts_end = ts[0:int(T*0.125)] # 0 to 50 for T=400
             ts_middle = ts[int(T*0.125):int(T*0.625)] # 50 to 250 for T=400
             ts_start = ts[int(T*0.625):] # 250 to 400 for T=400
+            
             ts_prob = np.random.uniform(0,1)
+
             if ts_prob < 0.075:
                 t = np.random.choice(ts_end) # 7.5% chance to sample from last time steps
             elif ts_prob < (0.075 + 0.75):
@@ -658,6 +647,7 @@ class HeteroDataset(torch_geometric.data.Dataset):
             ts_x1 = ts
             t_x1 = t
             t_idx = np.where(ts == t)[0][0]
+
             alpha_t = self.noise_schedule_dict['x1']['alpha_ts'][t_idx]
             sigma_t = self.noise_schedule_dict['x1']['sigma_ts'][t_idx]
             alpha_dash_t = self.noise_schedule_dict['x1']['alpha_dash_ts'][t_idx]

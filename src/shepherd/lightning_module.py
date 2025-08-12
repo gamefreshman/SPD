@@ -58,14 +58,11 @@ class LightningModule(pl.LightningModule):
         input_dict = {}
         
         if self.params['dataset']['compute_x1']:
-            # ========================= MODIFICATION START =========================
             
             # 1. 获取节点存储
             x1_data = data['x1']
             
             # 2. 获取边存储
-            # 新版本的 PyG 使用 data[('x1', 'bond', 'x1')]
-            # 为了兼容性，我们可以用 try-except
             try:
                 edge_store = data['x1', 'bond', 'x1']
             except KeyError:
@@ -257,7 +254,6 @@ class LightningModule(pl.LightningModule):
                 (input_dict['x1']['decoder']['pos_noise'] - output_dict['x1']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
         )
         
-        # ========================= MODIFICATION START: Discrete Feature Loss =========================
         # --- 原子类型损失 (离散，使用交叉熵) ---
         # 模型的输出是 logits: [num_atoms, num_atom_types]
         pred_atom_logits = output_dict['x1']['decoder']['denoiser']['x_out']
@@ -278,7 +274,6 @@ class LightningModule(pl.LightningModule):
             # 这里不需要像之前那样对 real/non-bond 分开加权了，
             # 交叉熵本身就可以处理多分类问题。
             bond_loss = F.cross_entropy(pred_bond_logits, true_bond_labels)
-        # ========================= MODIFICATION END ================================================
             
         loss = pos_loss + feature_loss + bond_loss
         

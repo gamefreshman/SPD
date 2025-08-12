@@ -1,6 +1,11 @@
 import resource
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
+#  **功能**: 提高系统允许打开的文件数量上限。
+#  **讲解**: 
+# 在数据加载时，尤其是使用多个工作进程 (`num_workers > 0`) 时，每个进程都可能打开数据文件。
+# 操作系统对单个进程能打开的文件描述符数量有限制。
+# 这几行代码获取当前的限制 (`getrlimit`)，然后将其下限提高到 2048 (`setrlimit`)，以防止因打开文件过多而导致程序崩溃。
 
 import rdkit
 import numpy as np
@@ -28,12 +33,17 @@ from torch_geometric.data import HeteroData
 from shepherd.model.model import Model
 from shepherd.lightning_module import LightningModule
 
+# 数据集类，负责加载和预处理分子数据。
 # from shepherd.datasets import HeteroDataset  # OLD
 from shepherd.new_datasets import HeteroDataset # NEW (adjust path as needed)
 
-from lightning_fabric.utilities.seed import seed_everything
+from lightning_fabric.utilities.seed import seed_everything # 这么酷的名字
 
 import importlib
+
+# PyTorch 的 DataLoader 在使用多进程时，需要在主进程和工作进程之间共享数据。
+# 默认的共享策略是 "file_descriptor"，它有时会因为文件描述符耗尽而出错（与上面的 resource 设置相关）。
+# "file_system" 是一种更稳定、更通用的策略，它通过在共享内存中创建文件来实现数据共享。
 
 sharing_strategy = "file_system"
 torch.multiprocessing.set_sharing_strategy(sharing_strategy)
@@ -48,14 +58,14 @@ if __name__ == '__main__':
     
     import argparse
     parser = argparse.ArgumentParser()
-
     parser.add_argument("model_name", type=str)
     parser.add_argument("seed", type=int)
-
     args = parser.parse_args()
     
+    # workers=True 确保 DataLoader 的工作进程也是可复现的。
     seed_everything(seed = args.seed, workers = True)
-    
+
+    # 它根据命令行传入的 model_name 动态地导入位于 parameters/ 目录下的对应 Python 文件（例如 parameters/my_model_config.py），并从中获取名为 params 的字典。
     params = importlib.import_module(f'parameters.{args.model_name}').params
     
     # CHANGE ME ONCE FULL DATASETS ARE DOWNLOADED
@@ -94,15 +104,11 @@ if __name__ == '__main__':
             molblocks_and_charges += molblocks_and_charges_
         """
 
-    # ==============================================================================
-    # START OF NEW CODE BLOCK
-    # ==============================================================================
-
     from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
 
-    print("Calculating marginal distributions for discrete features...")
+    print("初始化用于统计各类特征出现次数的计数器")
 
-    # Get feature type definitions from your parameters file
+    # Get feature type definitions from parameters file
     atom_types_x1 = params['dataset']['x1']['atom_types']
     bond_types_x1 = params['dataset']['x1']['bond_types']
     max_node_types_x4 = params['dataset']['x4']['max_node_types']
@@ -127,6 +133,7 @@ if __name__ == '__main__':
         
         # --- 1. Count Atom and Bond types (for x1) ---
         if params['dataset']['compute_x1']:
+            # 虚拟节点
             # Account for the virtual node, which has type `None` at index 0
             if params['dataset']['x1']['add_virtual_node']:
                 atom_counts[atom_types_x1.index(None)] += 1
@@ -172,22 +179,17 @@ if __name__ == '__main__':
     bond_marginals_x1 = (bond_counts / bond_counts.sum()) if bond_counts.sum() > 0 else torch.ones_like(bond_counts) / len(bond_counts)
     pharm_marginals_x4 = (pharm_counts / pharm_counts.sum()) if pharm_counts.sum() > 0 else torch.ones_like(pharm_counts) / len(pharm_counts)
 
-    print("\n--- Calculated Marginal Distributions ---")
+    print("\n--- 边际分布 计算完毕 ---")
     print(f"Atom Marginals (x1): {atom_marginals_x1}")
     print(f"Bond Marginals (x1): {bond_marginals_x1}")
     print(f"Pharmacophore Marginals (x4): {pharm_marginals_x4}")
     print("---------------------------------------\n")
-
-    # ==============================================================================
-    # END OF NEW CODE BLOCK
-    # ==============================================================================
 
     dataset = HeteroDataset(
         molblocks_and_charges = molblocks_and_charges, 
         
         noise_schedule_dict = params['noise_schedules'],
 
-        # These are the NEW required arguments
         atom_marginals_x1=atom_marginals_x1,
         bond_marginals_x1=bond_marginals_x1,
         pharm_marginals_x4=pharm_marginals_x4,
@@ -238,22 +240,14 @@ if __name__ == '__main__':
         probe_radius = params['dataset']['probe_radius'], # for x2 and x3
         
     )
-
-    # 打印现在的训练批次
-    print(f"数据指定训练的批大小{params['training']['batch_size']}")
-
-    fixed_batch_size = 2
-    print(f"数据指定训练的批大小{fixed_batch_size}")
     
     # debug : 非并行
     if params['training']['multiprocessing_spawn']:
         train_loader = torch_geometric.loader.DataLoader(
             dataset = dataset,
-            num_workers = params['training']['num_workers'], 
-            # num_workers = 0,            
-           
-            # batch_size = params['training']['batch_size'],
-            batch_size = fixed_batch_size,
+            num_workers = params['training']['num_workers'],            
+            batch_size = params['training']['batch_size'],
+            # 在每个 epoch 开始时打乱数据集
             shuffle = True,
             multiprocessing_context = multiprocessing.get_context("spawn"),
             worker_init_fn=set_worker_sharing_strategy,
@@ -262,8 +256,7 @@ if __name__ == '__main__':
         train_loader = torch_geometric.loader.DataLoader(
             dataset = dataset,
             num_workers = params['training']['num_workers'],
-            # batch_size = params['training']['batch_size'],
-            batch_size = fixed_batch_size,
+            batch_size = params['training']['batch_size'],
             shuffle = True,
             worker_init_fn=set_worker_sharing_strategy,
         )
@@ -288,9 +281,6 @@ if __name__ == '__main__':
         save_dir = output_dir,
         name = 'csv_logger',
     )
-    
-    # 2. 创建 WandbLogger 的实例
-    # - save_dir: 指定 W&B 在本地存储文件的位置
     wandb_logger = WandbLogger(
         name=f"{args.model_name}-seed_{args.seed}-bs_{params['training']['batch_size']}",
         entity="SPD_PaperParty",
@@ -302,9 +292,9 @@ if __name__ == '__main__':
     gradient_clip_val = params['training']['gradient_clip_val']
     accumulate_grad_batches = params['training']['accumulate_grad_batches']
     
-    cuda_available = torch.cuda.is_available()
     from pytorch_lightning.strategies.ddp import DDPStrategy
     
+    cuda_available = torch.cuda.is_available()
     num_gpus_to_use = torch.cuda.device_count()
     
     trainer = pl.Trainer(

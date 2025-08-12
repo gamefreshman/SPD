@@ -37,14 +37,13 @@ params = {
     
     'training': {
         
-        # maybe the name of the params should called training/parameters/params_x1x4_diffusion_mosesaq_20240824.py
         'train_x1_denoising': True,
         'train_x2_denoising': False,
         'train_x3_denoising': False,
         'train_x4_denoising': True,
         
         # effective batch size of 48 (reduced to 42) after OOM issues
-        'batch_size': 2, # 7 to 2
+        'batch_size': 7,
         'accumulate_grad_batches': 3,
         'num_gpus': 2,
         
@@ -58,7 +57,7 @@ params = {
         
         'output_dir': 'x1x3x4_diffusion_mosesaq_20240824/',
         
-        'log_every_n_steps': 50, # 1000 to 50
+        'log_every_n_steps': 1000,
         
         'multiprocessing_spawn': True,
     },
@@ -68,8 +67,6 @@ params = {
     
         'explicit_hydrogens': True,
         'use_MMFF94_charges': False,
-
-        # 算分子表面（SAS）时使用的探针半径
         'probe_radius': 0.6, # for x2 and x3
     
         'compute_x1': True,
