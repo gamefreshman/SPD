@@ -73,7 +73,28 @@ if __name__ == '__main__':
         # sample data
         molblocks_and_charges = []
         with open(f'../data/conformers/gdb/example_molblock_charges.pkl', 'rb') as f:
-            molblocks_and_charges = pickle.load(f) 
+            molblocks_and_charges = pickle.load(f)
+
+        output_file = "GDB17"
+
+        try:
+            with open(output_file, 'w',  encoding='utf-8') as output:
+                if isinstance(molblocks_and_charges, (list, tuple)):
+                    for item in molblocks_and_charges:
+                        molblock_string = item[0]
+                        charges_list = item[1]
+                        output.write(str(molblock_string) + '\n')
+                        output.write('\n\n--- Charges ---\n')
+                        output.write(str(charges_list) + '\n')
+
+                else:
+                    print(f"finish date : {params['data']} save")
+
+            print("finish date file 1 save")
+
+        except IOError as e:
+            print("error happens in file writing")
+
         """
         # full dataset
         molblocks_and_charges = []
@@ -94,7 +115,26 @@ if __name__ == '__main__':
         # sample data
         molblocks_and_charges = []
         with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
-            molblocks_and_charges = pickle.load(f)    
+            molblocks_and_charges = pickle.load(f)
+
+        output_file = "MOSES_aq"
+
+        try:
+            with open(output_file, 'w',  encoding='utf-8') as output:
+                if isinstance(molblocks_and_charges,  (list, tuple)):
+                    for item in molblocks_and_charges:
+                        molblock_string = item[0]
+                        charges_list = item[1]
+                        output.write(str(molblock_string) + '\n')
+                        output.write('\n\n--- Charges ---\n')
+                        output.write(str(charges_list) + '\n')
+                else:
+                    out.write(str(molblocks_and_charges))
+
+            print(f"finish date : {params['data']} save")
+
+        except IOError as e:
+            print("error happens in file writing")
         """
         # full dataset
         molblocks_and_charges = []
@@ -247,10 +287,10 @@ if __name__ == '__main__':
             dataset = dataset,
             num_workers = params['training']['num_workers'],            
             batch_size = params['training']['batch_size'],
-            # 在每个 epoch 开始时打乱数据集
             shuffle = True,
             multiprocessing_context = multiprocessing.get_context("spawn"),
             worker_init_fn=set_worker_sharing_strategy,
+            persistent_workers=True,  # 添加这一行
         )
     else:
         train_loader = torch_geometric.loader.DataLoader(
@@ -259,6 +299,7 @@ if __name__ == '__main__':
             batch_size = params['training']['batch_size'],
             shuffle = True,
             worker_init_fn=set_worker_sharing_strategy,
+            persistent_workers=True,  # 添加这一行
         )
     
     

@@ -36,10 +36,14 @@ class PredefinedNoiseScheduleDiscrete:
 
     def __call__(self, t_normalized):
         t_int = (t_normalized * self.T).long()
+        # 添加边界检查，防止索引超出范围
+        t_int = torch.clamp(t_int, 0, self.T - 1)
         return self.betas[t_int]
-
+    
     def get_alpha_bar(self, t_normalized):
         t_int = (t_normalized * self.T).long()
+        # 添加边界检查，防止索引超出范围
+        t_int = torch.clamp(t_int, 0, self.T - 1)
         return self.alpha_bars[t_int]
         
     @staticmethod
@@ -613,7 +617,7 @@ class HeteroDataset(torch_geometric.data.Dataset):
 
         # MMFF94 方法计算部分电荷
         if self.use_MMFF94_charges:
-            charges = get_atomic_partial_charges(mol) #MMFF94 charges
+            charges = get_atomic_partial_charges(mol) #MMFF charges
         
         data_dict = {
             'molecule_id': torch.tensor([k], dtype=torch.long),

@@ -54,7 +54,7 @@ params = {
         
         'gradient_clip_val': 5.0,
         
-        'num_workers': 10,
+        'num_workers': 2,  # 从 10 改为 2
         
         'output_dir': 'x1x3x4_diffusion_mosesaq_20240824/',
         
