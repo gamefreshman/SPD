@@ -284,10 +284,11 @@ class Model(torch.nn.Module):
         if 'x1' in self.explicit_diffusion_variables:
             
             #params['x1']['decoder']['encoder']
+            # 根据训练时的实际配置，只使用原子类型，不包含电荷类型
             input_channels = len(self.params['dataset']['x1']['atom_types'])
             self.x1_decoder_encoder_embedding = torch.nn.Linear(
                 # params['x1']['decoder']['input_node_channels'], # (noised) one hot atomic code embedding
-                # 因为没有扩散电荷
+                # 只包含原子类型的特征维度，与训练时的检查点保持一致
                 input_channels,
                 params['x1']['decoder']['node_channels'], # linear embedding
             )
@@ -716,6 +717,9 @@ class Model(torch.nn.Module):
             self.device,
             self.dtype,
         )
+        # input_x = input_dict['x1']['decoder']['x']
+        # input_x_float = input_x.float() 
+        # x.embedding[:, 0, :] = self.x1_decoder_encoder_embedding(input_x_float)
         x.embedding[:, 0, :] = self.x1_decoder_encoder_embedding(input_dict['x1']['decoder']['x'])
         
         
@@ -842,17 +846,6 @@ class Model(torch.nn.Module):
             max_num_neighbors = self.params['x2']['decoder']['encoder']['max_neighbors'] if 'max_neighbors' in self.params['x2']['decoder']['encoder'] else 1000000,
         )
         
-        # True if VN, False otherwise
-        virtual_node_mask = input_dict['x2']['decoder']['virtual_node_mask'] 
-        
-        if virtual_node_mask is not None:
-            force_edges_to_virtual_nodes = self.params['x2']['decoder']['force_edges_to_virtual_nodes']
-            if force_edges_to_virtual_nodes and (virtual_node_mask.any()):
-                # if a graph instance has multiple VNs, this will introduce edges between those VNs
-                    # this will remove self-loops on individual VNs
-                edge_index = add_virtual_edges_to_edge_index(edge_index, virtual_node_mask, input_dict['x2']['decoder']['batch'])
-        
-        
         j, i = edge_index
         edge_distance_vec = input_dict['x2']['decoder']['pos'][j] - input_dict['x2']['decoder']['pos'][i]
         edge_distance = edge_distance_vec.norm(dim=-1)
@@ -900,12 +893,6 @@ class Model(torch.nn.Module):
         )
         x3_embedding = self.x3_decoder_scalar_expansion(input_dict['x3']['decoder']['x'])
         x3_embedding = self.x3_decoder_encoder_embedding(x3_embedding)
-        virtual_node_mask = input_dict['x3']['decoder']['virtual_node_mask'] 
-        if virtual_node_mask is not None:
-            # zeroing-out x3_embedding for virtual nodes (which have no electrostatic potential)
-            mask = torch.ones(x3_embedding.shape[0], device = self.device)
-            mask[virtual_node_mask] = 0.0
-            x3_embedding = x3_embedding * mask[:, None]
         x.embedding[:, 0, :] = x3_embedding
         
         
@@ -927,16 +914,6 @@ class Model(torch.nn.Module):
             batch = input_dict['x3']['decoder']['batch'],
             max_num_neighbors = self.params['x3']['decoder']['encoder']['max_neighbors'] if 'max_neighbors' in self.params['x3']['decoder']['encoder'] else 1000000,
         )
-        
-        # True if VN, False otherwise
-        virtual_node_mask = input_dict['x3']['decoder']['virtual_node_mask']
-        
-        if virtual_node_mask is not None:
-            force_edges_to_virtual_nodes = self.params['x3']['decoder']['force_edges_to_virtual_nodes']
-            if force_edges_to_virtual_nodes and (virtual_node_mask.any()):
-                # if a graph instance has multiple VNs, this will introduce edges between those VNs
-                    # this will remove self-loops on individual VNs
-                edge_index = add_virtual_edges_to_edge_index(edge_index, virtual_node_mask, input_dict['x3']['decoder']['batch'])
         
         
         j, i = edge_index
@@ -1603,7 +1580,11 @@ class Model(torch.nn.Module):
             
         }
         
-        # Embedding Modules
+        # 嵌入模块 - 对每个变量进行独立编码
+        # 分别处理x1-x4这四种不同类型的输入数据
+        # 每个编码器将原始输入转换为高维特征表示
+        # 检查 变量 是否在需要进行扩散的变量列表中
+        # explicit_diffusion_variables 存储了所有需要进行扩散的变量类型
         if 'x1' in self.explicit_diffusion_variables:
             output_dict = self.forward_x1_decoder_encoder(input_dict, output_dict)
         if 'x2' in self.explicit_diffusion_variables:
@@ -1613,12 +1594,15 @@ class Model(torch.nn.Module):
         if 'x4' in self.explicit_diffusion_variables:
             output_dict = self.forward_x4_decoder_encoder(input_dict, output_dict)
         
-        # Joint Module
-            # - pass local messages within the heterogeneous graph of the explicit diffusion (decoder) variables
-            # - jointly process global codes
+        # 联合模块
+        # - 在异构图中传递局部信息
+        # - 联合处理全局编码
+        # 使用异构图编码器处理不同类型节点之间的交互
         if self.decoder_joint_heterogeneous_graph_encoder is not None:
             output_dict = self.forward_decoder_joint_heterogeneous_graph_encoder(input_dict, output_dict)
         
+        # 对每个变量进行联合处理
+        # 将不同模态的信息融合在一起
         if 'x1' in self.explicit_diffusion_variables:
             output_dict = self.forward_decoder_joint_processing('x1', input_dict, output_dict)
         if 'x2' in self.explicit_diffusion_variables:
@@ -1628,10 +1612,12 @@ class Model(torch.nn.Module):
         if 'x4' in self.explicit_diffusion_variables:
             output_dict = self.forward_decoder_joint_processing('x4', input_dict, output_dict)
         
-        # Denoising Modules
+        # 去噪模块
+        # 将处理后的特征转换回原始数据空间
+        # 目前只对x1(原子)和x4进行去噪处理
         if 'x1' in self.explicit_diffusion_variables:
             output_dict = self.forward_x1_decoder_denoiser(input_dict, output_dict)
-        if 'x4' in self.explicit_diffusion_variables:aa
+        if 'x4' in self.explicit_diffusion_variables:
             output_dict = self.forward_x4_decoder_denoiser(input_dict, output_dict)
         
         return input_dict, output_dict

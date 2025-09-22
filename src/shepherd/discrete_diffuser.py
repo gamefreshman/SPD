@@ -82,62 +82,81 @@ class DiscreteDiffusion:
                             node_mask):
         """Samples from zs ~ p(zs | zt). Only used during sampling.
            if last_step, return the graph prediction as well"""
+        # 获取输入张量的形状
         bs, n, dxs = X_t.shape
+        # 计算噪声调度相关参数
+        # beta_t: 在时间点t的噪声调度系数,用于控制每一步加入噪声的大小
         beta_t = self.noise_schedule(t_normalized=t)  # (bs, 1)
+        # alpha_s_bar: 从开始到时间点s的累积噪声系数的乘积
         alpha_s_bar = self.noise_schedule.get_alpha_bar(t_normalized=s)
+        # alpha_t_bar: 从开始到时间点t的累积噪声系数的乘积
         alpha_t_bar = self.noise_schedule.get_alpha_bar(t_normalized=t)
-
+        
         # Retrieve transitions matrix
+        # 获取转移矩阵
         Qtb = self.transition_model.get_Qt_bar(alpha_t_bar, self.device)
         Qsb = self.transition_model.get_Qt_bar(alpha_s_bar, self.device)
         Qt = self.transition_model.get_Qt(beta_t, self.device)
 
         # Neural net predictions
+        # 创建空的标签张量
         y_t = torch.zeros(bs, 0).float().to(X_t.device)
         noisy_data = {'X_t': X_t, 'E_t': E_t, 'y_t': y_t, 't': t, 'node_mask': node_mask}
 
         # Normalize predictions
+        # 对预测结果进行softmax归一化
         pred_X = F.softmax(pred_X, dim=-1)               # bs, n, d0
         pred_E = F.softmax(pred_E, dim=-1)               # bs, n, n, d0
 
+        # 计算节点的后验分布
         p_s_and_t_given_0_X = compute_batched_over0_posterior_distribution(X_t=X_t,
                                                                             Qt=Qt.X,
                                                                             Qsb=Qsb.X,
                                                                             Qtb=Qtb.X)
 
+        # 计算边的后验分布
         p_s_and_t_given_0_E = compute_batched_over0_posterior_distribution(X_t=E_t,
                                                                             Qt=Qt.E,
                                                                             Qsb=Qsb.E,
                                                                             Qtb=Qtb.E)
         # Dim of these two tensors: bs, N, d0, d_t-1
+        # 计算节点的加权概率
         weighted_X = pred_X.unsqueeze(-1) * p_s_and_t_given_0_X         # bs, n, d0, d_t-1
         unnormalized_prob_X = weighted_X.sum(dim=2)                     # bs, n, d_t-1
+        # 处理零概率情况
         unnormalized_prob_X[torch.sum(unnormalized_prob_X, dim=-1) == 0] = 1e-5
         prob_X = unnormalized_prob_X / torch.sum(unnormalized_prob_X, dim=-1, keepdim=True)  # bs, n, d_t-1
 
+        # 计算边的加权概率
+        # 将边的预测张量从(bs,n,n,d)展平为(bs,n*n,d)以便后续计算
         pred_E = pred_E.reshape((bs, -1, pred_E.shape[-1]))
         weighted_E = pred_E.unsqueeze(-1) * p_s_and_t_given_0_E        # bs, N, d0, d_t-1
         unnormalized_prob_E = weighted_E.sum(dim=-2)
+        # 处理零概率情况
         unnormalized_prob_E[torch.sum(unnormalized_prob_E, dim=-1) == 0] = 1e-5
         prob_E = unnormalized_prob_E / torch.sum(unnormalized_prob_E, dim=-1, keepdim=True)
         prob_E = prob_E.reshape(bs, n, n, pred_E.shape[-1])
 
+        # 验证概率和为1
         assert ((prob_X.sum(dim=-1) - 1).abs() < 1e-4).all()
         assert ((prob_E.sum(dim=-1) - 1).abs() < 1e-4).all()
 
+        # 采样离散特征
         sampled_s = sample_discrete_features(prob_X, prob_E, node_mask=node_mask)
 
+        # 转换为one-hot编码
         X_s = F.one_hot(sampled_s.X, num_classes=self.Xdim_output).float()
         E_s = F.one_hot(sampled_s.E, num_classes=self.Edim_output).float()
 
+        # 验证边矩阵的对称性和形状一致性
         assert (E_s == torch.transpose(E_s, 1, 2)).all()
         assert (X_t.shape == X_s.shape) and (E_t.shape == E_s.shape)
 
-        
-
+        # 创建输出占位符
         out_one_hot = PlaceHolder(X=X_s, E=E_s, y=y_t)
         out_discrete = PlaceHolder(X=X_s, E=E_s, y=y_t)
 
+        # 应用节点掩码并转换数据类型
         sampled_s = out_one_hot.mask(node_mask).type_as(y_t)
         X_s, E_s = sampled_s.X, sampled_s.E
         

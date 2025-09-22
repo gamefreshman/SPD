@@ -71,19 +71,67 @@ def create_rdkit_molecule(sample):
         # extract atoms and their positions from x1
         atoms = sample['x1']['atoms']
         positions = sample['x1']['positions']
+        
+        # 检查数据完整性
+        if len(atoms) == 0 or len(positions) == 0:
+            logging.warning("Empty atoms or positions data")
+            return None
+            
+        if len(atoms) != len(positions):
+            logging.warning(f"Mismatch between atoms ({len(atoms)}) and positions ({len(positions)}) count")
+            return None
 
-        # create XYZ format string
-        xyz = f'{len(atoms)}\n\n'
+        # 过滤有效的原子和位置数据
+        valid_atoms = []
+        valid_positions = []
+        
         for a in range(len(atoms)):
-            atomic_number = int(atoms[a])
-            position = positions[a]
-            symbol = Chem.Atom(atomic_number).GetSymbol()
-            xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
+            try:
+                atomic_number = int(atoms[a])
+                position = positions[a]
+                
+                # 检查原子序数是否有效
+                if atomic_number <= 0 or atomic_number > 118:
+                    logging.warning(f"Invalid atomic number: {atomic_number}")
+                    continue
+                
+                # 检查位置是否包含NaN或无穷值
+                import numpy as np
+                if np.any(np.isnan(position)) or np.any(np.isinf(position)):
+                    logging.warning(f"Atom {a} has invalid position (NaN/Inf): {position}")
+                    continue
+                
+                # 检查位置坐标是否合理（不能过大）
+                if np.any(np.abs(position) > 1000):
+                    logging.warning(f"Atom {a} has unreasonable position: {position}")
+                    continue
+                
+                valid_atoms.append(atomic_number)
+                valid_positions.append(position)
+                
+            except (ValueError, TypeError, IndexError) as e:
+                logging.warning(f"Error processing atom {a}: {e}")
+                continue
+        
+        if len(valid_atoms) == 0:
+            logging.warning("No valid atoms found after filtering")
+            return None
+
+        # create XYZ format string with valid data only
+        xyz = f'{len(valid_atoms)}\n\n'
+        for i, (atomic_number, position) in enumerate(zip(valid_atoms, valid_positions)):
+            try:
+                symbol = Chem.Atom(atomic_number).GetSymbol()
+                xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
+            except Exception as e:
+                logging.warning(f"Error creating XYZ line for atom {i}: {e}")
+                continue
 
         # create molecule from XYZ block
         mol = Chem.MolFromXYZBlock(xyz)
         if mol is None:
             logging.warning("Failed to create molecule from XYZ block")
+            logging.debug(f"XYZ content:\n{xyz}")
             return None
 
         # try different charge states for bond determination

@@ -47,6 +47,10 @@ import importlib
 
 sharing_strategy = "file_system"
 torch.multiprocessing.set_sharing_strategy(sharing_strategy)
+
+torch.set_float32_matmul_precision('medium')  # 利用Tensor Cores
+torch.backends.cudnn.benchmark = True  # 优化cudnn性能
+
 def set_worker_sharing_strategy(worker_id: int) -> None:
     torch.multiprocessing.set_sharing_strategy(sharing_strategy)
 
@@ -88,7 +92,7 @@ if __name__ == '__main__':
                         output.write(str(charges_list) + '\n')
 
                 else:
-                    print(f"finish date : {params['data']} save")
+                    output.write(str(molblocks_and_charges))
 
             print("finish date file 1 save")
 
@@ -129,7 +133,7 @@ if __name__ == '__main__':
                         output.write('\n\n--- Charges ---\n')
                         output.write(str(charges_list) + '\n')
                 else:
-                    out.write(str(molblocks_and_charges))
+                    output.write(str(molblocks_and_charges))
 
             print(f"finish date : {params['data']} save")
 
@@ -350,9 +354,8 @@ if __name__ == '__main__':
         gradient_clip_val = gradient_clip_val,
         accumulate_grad_batches = accumulate_grad_batches,
         
-        # log_every_n_steps = params['training']['log_every_n_steps'], # 临时调整
-        log_every_n_steps = 50,
-        
+        log_every_n_steps = params['training']['log_every_n_steps'], # 临时调整    
+            
         reload_dataloaders_every_n_epochs = 1, # re-shuffle training data after each epoch
         
         devices = num_gpus_to_use  if cuda_available else "auto",
@@ -371,6 +374,7 @@ if __name__ == '__main__':
     print(sum(p.numel() for p in model_pl.parameters() if p.requires_grad))
     
     resume_from_checkpoint = True
+
     ckpt_path = f"{output_dir}/last.ckpt"
     ckpt_path = ckpt_path if (os.path.exists(ckpt_path) & resume_from_checkpoint) else None
     

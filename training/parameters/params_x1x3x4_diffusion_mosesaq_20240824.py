@@ -2,10 +2,10 @@
 
 import numpy as np
 
-# 实际代码中，我注销了扩散形式电荷，所以这一部分没有生效
-diffuse_formal_charges = True # model will diffuse the formal charge on the atoms in addition to their element type
-charge_types = [0, 1, 2, -1, -2] # dataset must be limited to these formal charges
-num_charge_types = int(diffuse_formal_charges) * len(charge_types)
+# 禁用形式电荷扩散功能
+diffuse_formal_charges = False # 不再扩散形式电荷，仅处理原子类型
+charge_types = [0, 1, 2, -1, -2] # 保留定义但不使用
+num_charge_types = 0 # 强制设为0，不包含电荷类型
 
 diffuse_bonds = True
 bond_types = [None, 'SINGLE', 'DOUBLE', 'TRIPLE', 'AROMATIC']
@@ -26,7 +26,7 @@ params = {
     
     'use_ema': False,
     'x1_bond_diffusion': diffuse_bonds,
-    'x1_formal_charge_diffusion': diffuse_formal_charges,
+    'x1_formal_charge_diffusion': diffuse_formal_charges, # 明确禁用形式电荷扩散
     
     # 显式扩散变量
     'explicit_diffusion_variables': ['x1', 'x3', 'x4'],
@@ -44,7 +44,7 @@ params = {
         'train_x4_denoising': True,
         
         # effective batch size of 48 (reduced to 42) after OOM issues
-        'batch_size': 2, # 7 to 2
+        'batch_size': 4, # 7 to 2
         'accumulate_grad_batches': 3,
         'num_gpus': 2,
         
@@ -54,7 +54,7 @@ params = {
         
         'gradient_clip_val': 5.0,
         
-        'num_workers': 2,  # 从 10 改为 2
+        'num_workers': 6, 
         
         'output_dir': 'x1x3x4_diffusion_mosesaq_20240824/',
         
@@ -91,7 +91,7 @@ params = {
         
         'x2': {
             'recenter': False,
-            'add_virtual_node': True,
+            'add_virtual_node': False,
             'remove_noise_COM': False,
             'num_points': 75,
             'independent_timesteps': False,
@@ -102,7 +102,7 @@ params = {
             'independent_timesteps': False, # coupled to x1 timesteps
             
             'recenter': False, 
-            'add_virtual_node': True, 
+            'add_virtual_node': False, 
             'remove_noise_COM': False,
             'num_points': 75,
                         
@@ -165,7 +165,7 @@ params = {
     
     'x1': {
         'decoder': {
-            'input_node_channels': num_atom_types + num_charge_types,
+            'input_node_channels': num_atom_types, # 仅包含原子类型，不包含电荷类型
             'node_channels': num_channels,
             'time_embedding_size': 32,
             
@@ -200,7 +200,7 @@ params = {
             
             'denoiser': {
                 
-                'output_node_channels': num_atom_types + num_charge_types, # must equal params['x1']['decoder']['input_node_channels']
+                'output_node_channels': num_atom_types, # 仅输出原子类型，不包含电荷类型
                 'output_bond_channels': num_bond_types, # must equal params['x1']['decoder']['input_bond_channels']
                 
                 # this is for the feature update
@@ -237,7 +237,7 @@ params = {
             'node_channels': num_channels,
             'time_embedding_size': 32,
             
-            'force_edges_to_virtual_nodes': True, # for both encoder and denoiser
+            'force_edges_to_virtual_nodes': False, # for both encoder and denoiser
             
             'encoder': {
                 'num_layers': 2,
@@ -297,7 +297,7 @@ params = {
             'node_channels': num_channels,
             'time_embedding_size': 32,
             
-            'force_edges_to_virtual_nodes': True, # for both encoder and denoiser
+            'force_edges_to_virtual_nodes': False, # for both encoder and denoiser
             
             
             'encoder': {

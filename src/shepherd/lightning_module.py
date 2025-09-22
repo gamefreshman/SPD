@@ -124,10 +124,8 @@ class LightningModule(pl.LightningModule):
                     'alpha_dash_t': data['x2'].alpha_dash_t,
                     'sigma_dash_t': data['x2'].sigma_dash_t,
                     
-                    'virtual_node_mask': data['x2'].virtual_node_mask,
-                    
                     'pos_noise': data['x2'].pos_noise, # this is the added (gaussian) noise
-                    
+                    'virtual_node_mask': data['x2'].virtual_node_mask,  # 新增
                 },
             }
         
@@ -147,11 +145,9 @@ class LightningModule(pl.LightningModule):
                     'alpha_dash_t': data['x3'].alpha_dash_t,
                     'sigma_dash_t': data['x3'].sigma_dash_t,
                     
-                    'virtual_node_mask': data['x3'].virtual_node_mask,
-                    
                     'pos_noise': data['x3'].pos_noise, # this is the added (gaussian) noise
                     'x_noise': data['x3'].x_noise, # this is the added (gaussian) noise
-                    
+                    'virtual_node_mask': data['x3'].virtual_node_mask,  # 新增
                 },
             }
         
@@ -256,15 +252,23 @@ class LightningModule(pl.LightningModule):
         
         # --- 原子类型损失 (离散，使用交叉熵) ---
         # 模型的输出是 logits: [num_atoms, num_atom_types]
+        # pred_atom_logits 是模型预测的原子类型概率分布(logits形式)
+        # shape: [num_atoms, num_atom_types]
+        # 对每个原子,输出num_atom_types个数字,经过softmax后表示属于每种原子类型的概率
+        # 数值越大,表示模型越倾向于预测该位置是对应的原子类型
         pred_atom_logits = output_dict['x1']['decoder']['denoiser']['x_out']
-        
         # 真实的标签需要是类别索引 (LongTensor)
         # 我们假设 true_atom_types_t0 是 one-hot 编码，所以用 argmax 获取索引
+        # 将原子类型的one-hot编码转换为类别索引
+        # 例如: [0,1,0,0] -> 1, [0,0,1,0] -> 2
+        # dim=1表示在第二个维度上取最大值的索引
         true_atom_labels = torch.argmax(input_dict['x1']['decoder']['true_atom_types_t0'], dim=1)
-        
         # 计算损失时只考虑非虚拟节点
+        # 计算原子类型预测的交叉熵损失
+        # pred_atom_logits[mask]: 模型预测的原子类型logits, shape为[num_real_atoms, num_atom_types]
+        # true_atom_labels[mask]: 真实的原子类型标签(类别索引), shape为[num_real_atoms]
+        # 交叉熵将模型输出的logits(每个原子类型的得分)与真实的单一类别标签进行比较，计算预测错误的惩罚值
         feature_loss = F.cross_entropy(pred_atom_logits[mask], true_atom_labels[mask])
-
         # --- 键类型损失 (离散，使用交叉熵) ---
         bond_loss = torch.zeros_like(feature_loss)
         if self.model.x1_bond_diffusion:
@@ -302,97 +306,6 @@ class LightningModule(pl.LightningModule):
         pos_loss = torch.mean(
             (input_dict['x3']['decoder']['pos_noise'] - output_dict['x3']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
         )
-
-# In shepherd/lightning_module.py, within LightningModule
-
-    import torch.nn.functional as F
-
-    def x1_denoising_loss(self, input_dict, output_dict):
-        
-        mask = ~input_dict['x1']['decoder']['virtual_node_mask']
-        
-        # --- 坐标损失 (连续，保持不变) ---
-        pos_loss = torch.mean(
-                (input_dict['x1']['decoder']['pos_noise'] - output_dict['x1']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
-        )
-        
-        # ========================= MODIFICATION START: Discrete Feature Loss =========================
-        # --- 原子类型损失 (离散，使用交叉熵) ---
-        # 模型的输出是 logits: [num_atoms, num_atom_types]
-        pred_atom_logits = output_dict['x1']['decoder']['denoiser']['x_out']
-        
-        # 真实的标签需要是类别索引 (LongTensor)
-        # 我们假设 true_atom_types_t0 是 one-hot 编码，所以用 argmax 获取索引
-        true_atom_labels = torch.argmax(input_dict['x1']['decoder']['true_atom_types_t0'], dim=1)
-        
-        # 计算损失时只考虑非虚拟节点
-        feature_loss = F.cross_entropy(pred_atom_logits[mask], true_atom_labels[mask])
-
-        # --- 键类型损失 (离散，使用交叉熵) ---
-        bond_loss = torch.zeros_like(feature_loss)
-        if self.model.x1_bond_diffusion:
-            pred_bond_logits = output_dict['x1']['decoder']['denoiser']['bond_edge_x_out']
-            true_bond_labels = torch.argmax(input_dict['x1']['decoder']['true_bond_types_t0'], dim=1)
-            
-            # 这里不需要像之前那样对 real/non-bond 分开加权了，
-            # 交叉熵本身就可以处理多分类问题。
-            bond_loss = F.cross_entropy(pred_bond_logits, true_bond_labels)
-        # ========================= MODIFICATION END ================================================
-
-        loss = pos_loss + feature_loss + bond_loss
-        
-        return loss, feature_loss, pos_loss, bond_loss
-
-    
-    def x2_denoising_loss(self, input_dict, output_dict):
-        # 这个损失函数只处理坐标，所以保持不变
-        mask = ~input_dict['x2']['decoder']['virtual_node_mask']
-        pos_loss = torch.mean(
-                (input_dict['x2']['decoder']['pos_noise'] - output_dict['x2']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
-        )
-        loss = pos_loss
-        return loss
-    
-    
-    def x3_denoising_loss(self, input_dict, output_dict):
-        # 这个损失函数处理连续特征，所以保持不变
-        mask = ~input_dict['x3']['decoder']['virtual_node_mask']
-        feature_loss = torch.mean(
-            (input_dict['x3']['decoder']['x_noise'] - output_dict['x3']['decoder']['denoiser']['x_out'].squeeze())[mask] ** 2.0
-        )
-        pos_loss = torch.mean(
-            (input_dict['x3']['decoder']['pos_noise'] - output_dict['x3']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
-        )
-        loss = feature_loss + pos_loss
-        return loss, feature_loss, pos_loss
-    
-    
-    def x4_denoising_loss(self, input_dict, output_dict):
-        
-        mask = ~input_dict['x4']['decoder']['virtual_node_mask']
-        if sum(mask) == 0:
-            return torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device), torch.tensor(0.0, device=self.device)
-        
-        # --- 坐标和方向损失 (连续，保持不变) ---
-        pos_loss = torch.mean(
-                (input_dict['x4']['decoder']['pos_noise'] - output_dict['x4']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
-        )
-        direction_loss = torch.mean(
-                (input_dict['x4']['decoder']['direction_noise'] - output_dict['x4']['decoder']['denoiser']['direction_out'])[mask] ** 2.0
-        )
-        
-        # ========================= MODIFICATION START: Discrete Feature Loss =========================
-        # --- 药效团类型损失 (离散，使用交叉熵) ---
-        pred_pharm_logits = output_dict['x4']['decoder']['denoiser']['x_out']
-        true_pharm_labels = torch.argmax(input_dict['x4']['decoder']['true_pharm_types_t0'], dim=1)
-        
-        feature_loss = F.cross_entropy(pred_pharm_logits[mask], true_pharm_labels[mask])
-        # ========================= MODIFICATION END ================================================
-        
-        loss = feature_loss + pos_loss
-        
-        return loss, feature_loss, pos_loss
-    
     
     def x4_denoising_loss(self, input_dict, output_dict):
         
