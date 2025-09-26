@@ -775,6 +775,7 @@ class Model(torch.nn.Module):
             )[0] # (N,N,channels)
             
             edge_attr = dense_bond_edge_attr[edge_index[0], edge_index[1]] # (N_edges, channels)
+            edge_attr = edge_attr.float() 
             edge_attr = self.x1_decoder_encoder_bond_edge_embedding(edge_attr)
         
         

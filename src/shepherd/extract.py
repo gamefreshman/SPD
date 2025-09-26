@@ -67,116 +67,248 @@ def create_rdkit_molecule(sample):
         logging.warning("No atom data (x1) found in sample")
         return None
 
-    try:
-        # extract atoms and their positions from x1
-        atoms = sample['x1']['atoms']
-        positions = sample['x1']['positions']
-        
-        # 检查数据完整性
-        if len(atoms) == 0 or len(positions) == 0:
-            logging.warning("Empty atoms or positions data")
-            return None
-            
-        if len(atoms) != len(positions):
-            logging.warning(f"Mismatch between atoms ({len(atoms)}) and positions ({len(positions)}) count")
-            return None
-
-        # 过滤有效的原子和位置数据
-        valid_atoms = []
-        valid_positions = []
-        
-        for a in range(len(atoms)):
-            try:
-                atomic_number = int(atoms[a])
-                position = positions[a]
-                
-                # 检查原子序数是否有效
-                if atomic_number <= 0 or atomic_number > 118:
-                    logging.warning(f"Invalid atomic number: {atomic_number}")
-                    continue
-                
-                # 检查位置是否包含NaN或无穷值
-                import numpy as np
-                if np.any(np.isnan(position)) or np.any(np.isinf(position)):
-                    logging.warning(f"Atom {a} has invalid position (NaN/Inf): {position}")
-                    continue
-                
-                # 检查位置坐标是否合理（不能过大）
-                if np.any(np.abs(position) > 1000):
-                    logging.warning(f"Atom {a} has unreasonable position: {position}")
-                    continue
-                
-                valid_atoms.append(atomic_number)
-                valid_positions.append(position)
-                
-            except (ValueError, TypeError, IndexError) as e:
-                logging.warning(f"Error processing atom {a}: {e}")
-                continue
-        
-        if len(valid_atoms) == 0:
-            logging.warning("No valid atoms found after filtering")
-            return None
-
-        # create XYZ format string with valid data only
-        xyz = f'{len(valid_atoms)}\n\n'
-        for i, (atomic_number, position) in enumerate(zip(valid_atoms, valid_positions)):
-            try:
-                symbol = Chem.Atom(atomic_number).GetSymbol()
-                xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
-            except Exception as e:
-                logging.warning(f"Error creating XYZ line for atom {i}: {e}")
-                continue
-
-        # create molecule from XYZ block
-        mol = Chem.MolFromXYZBlock(xyz)
-        if mol is None:
-            logging.warning("Failed to create molecule from XYZ block")
-            logging.debug(f"XYZ content:\n{xyz}")
-            return None
-
-        # try different charge states for bond determination
-        mol_final = None
-        for charge in [0, 1, -1, 2, -2]:
-            mol_copy = deepcopy(mol)
-            try:
-                rdDetermineBonds.DetermineBonds(mol_copy, charge=charge, embedChiral=True)
-                logging.debug(f"Bond determination successful with charge {charge}")
-                mol_final = mol_copy
-                break
-            except Exception as e:
-                logging.debug(f"Bond determination failed with charge {charge}: {e}")
-                continue
-
-        if mol_final is None:
-            logging.warning("Bond determination failed for all charge states")
-            return None
-        
-        # validate molecule
-        try:
-            radical_electrons = sum([a.GetNumRadicalElectrons() for a in mol_final.GetAtoms()])
-            if radical_electrons > 0:
-                logging.warning(f"Molecule has {radical_electrons} radical electrons")
-            
-            mol_final.UpdatePropertyCache()
-            Chem.GetSymmSSSR(mol_final)
-            logging.debug("Molecule validation successful")
-        except Exception as e:
-            logging.warning(f"Molecule validation failed: {e}")
-            return None
-
-        # try to generate SMILES to verify molecule
-        try:
-            smiles = Chem.MolToSmiles(mol_final)
-            logging.debug(f"Generated SMILES: {smiles}")
-        except Exception as e:
-            logging.warning(f"SMILES generation failed: {e}")
-
-        if '.' in smiles:
-            logging.warning("Molecule is a fragment, failed to create molecule")
-            return None
-
-        return mol_final
-        
-    except Exception as e:
-        logging.warning(f"Error creating molecule: {e}")
+    # try:
+    # extract atoms and their positions from x1
+    atoms = sample['x1']['atoms']
+    positions = sample['x1']['positions']
+    
+    # 检查数据完整性
+    if len(atoms) == 0 or len(positions) == 0:
+        logging.warning("Empty atoms or positions data")
         return None
+        
+    if len(atoms) != len(positions):
+        logging.warning(f"Mismatch between atoms ({len(atoms)}) and positions ({len(positions)}) count")
+        return None
+
+    # 过滤有效的原子和位置数据
+    valid_atoms = []
+    valid_positions = []
+    
+    for a in range(len(atoms)):
+        try:
+            atomic_number = int(atoms[a])
+            position = positions[a]
+            
+            # 检查原子序数是否有效
+            if atomic_number <= 0 or atomic_number > 118:
+                logging.warning(f"Invalid atomic number: {atomic_number}")
+                continue
+            
+            # 检查位置是否包含NaN或无穷值
+            import numpy as np
+            if np.any(np.isnan(position)) or np.any(np.isinf(position)):
+                logging.warning(f"Atom {a} has invalid position (NaN/Inf): {position}")
+                continue
+            
+            # 检查位置坐标是否合理（不能过大）
+            if np.any(np.abs(position) > 1000):
+                logging.warning(f"Atom {a} has unreasonable position: {position}")
+                continue
+            
+            valid_atoms.append(atomic_number)
+            valid_positions.append(position)
+            
+        except (ValueError, TypeError, IndexError) as e:
+            logging.warning(f"Error processing atom {a}: {e}")
+            continue
+    
+    if len(valid_atoms) == 0:
+        logging.warning("No valid atoms found after filtering")
+        return None
+
+    # create XYZ format string with valid data only
+    xyz = f'{len(valid_atoms)}\n\n'
+    for i, (atomic_number, position) in enumerate(zip(valid_atoms, valid_positions)):
+        try:
+            symbol = Chem.Atom(atomic_number).GetSymbol()
+            xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
+        except Exception as e:
+            logging.warning(f"Error creating XYZ line for atom {i}: {e}")
+            continue
+
+    # create molecule from XYZ block
+    mol = Chem.MolFromXYZBlock(xyz)
+    if mol is None:
+        logging.warning("Failed to create molecule from XYZ block")
+        logging.debug(f"XYZ content:\n{xyz}")
+        return None
+
+    # mol 不合理
+
+    # try different charge states for bond determination
+    mol_final = None
+    for charge in [0, 1, -1, 2, -2]: # 这里出现问题了
+        mol_copy = deepcopy(mol)
+        try:
+            rdDetermineBonds.DetermineBonds(mol_copy, charge=charge, embedChiral=True)
+            logging.debug(f"Bond determination successful with charge {charge}")
+            mol_final = mol_copy
+            break
+        except Exception as e:
+            logging.debug(f"Bond determination failed with charge {charge}: {e}")
+            continue
+
+    if mol_final is None:
+        logging.warning("Bond determination failed for all charge states")
+        return None
+    
+    # validate molecule
+    try:
+        radical_electrons = sum([a.GetNumRadicalElectrons() for a in mol_final.GetAtoms()])
+        if radical_electrons > 0:
+            logging.warning(f"Molecule has {radical_electrons} radical electrons")
+        
+        mol_final.UpdatePropertyCache()
+        Chem.GetSymmSSSR(mol_final)
+        logging.debug("Molecule validation successful")
+    except Exception as e:
+        logging.warning(f"Molecule validation failed: {e}")
+        return None
+
+    # try to generate SMILES to verify molecule
+    try:
+        smiles = Chem.MolToSmiles(mol_final)
+        logging.debug(f"Generated SMILES: {smiles}")
+    except Exception as e:
+        logging.warning(f"SMILES generation failed: {e}")
+
+    if '.' in smiles:
+        logging.warning("Molecule is a fragment, failed to create molecule")
+        return None
+
+    return mol_final
+        
+    # except Exception as e:
+    #     logging.warning(f"Error creating molecule: {e}")
+    #     return None
+
+def create_rdkit_molecule_from_mol(atoms, positions):
+    """
+    Create an RDKit molecule from ShEPhERD output using XYZ block approach.
+    
+    Args:
+        sample (dict): ShEPhERD output dictionary with x1 containing atoms and positions.
+        
+    Returns:
+        rdkit.Chem.rdchem.Mol: RDKit molecule object or None if conversion fails.
+    """
+    # if 'x1' not in sample:
+    #     logging.warning("No atom data (x1) found in sample")
+    #     return None
+
+    # try:
+    # extract atoms and their positions from x1
+    # atoms = sample['x1']['atoms']
+    # positions = sample['x1']['positions']
+    
+    # 检查数据完整性
+    if len(atoms) == 0 or len(positions) == 0:
+        logging.warning("Empty atoms or positions data")
+        return None
+        
+    if len(atoms) != len(positions):
+        logging.warning(f"Mismatch between atoms ({len(atoms)}) and positions ({len(positions)}) count")
+        return None
+
+    # 过滤有效的原子和位置数据
+    valid_atoms = []
+    valid_positions = []
+    
+    for a in range(len(atoms)):
+        try:
+            atomic_number = int(atoms[a])
+            position = positions[a]
+            
+            # 检查原子序数是否有效
+            if atomic_number <= 0 or atomic_number > 118:
+                logging.warning(f"Invalid atomic number: {atomic_number}")
+                continue
+            
+            # 检查位置是否包含NaN或无穷值
+            import numpy as np
+            if np.any(np.isnan(position)) or np.any(np.isinf(position)):
+                logging.warning(f"Atom {a} has invalid position (NaN/Inf): {position}")
+                continue
+            
+            # 检查位置坐标是否合理（不能过大）
+            if np.any(np.abs(position) > 1000):
+                logging.warning(f"Atom {a} has unreasonable position: {position}")
+                continue
+            
+            valid_atoms.append(atomic_number)
+            valid_positions.append(position)
+            
+        except (ValueError, TypeError, IndexError) as e:
+            logging.warning(f"Error processing atom {a}: {e}")
+            continue
+    
+    if len(valid_atoms) == 0:
+        logging.warning("No valid atoms found after filtering")
+        return None
+
+    # create XYZ format string with valid data only
+    xyz = f'{len(valid_atoms)}\n\n'
+    for i, (atomic_number, position) in enumerate(zip(valid_atoms, valid_positions)):
+        try:
+            symbol = Chem.Atom(atomic_number).GetSymbol()
+            xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
+        except Exception as e:
+            logging.warning(f"Error creating XYZ line for atom {i}: {e}")
+            continue
+
+    # create molecule from XYZ block
+    mol = Chem.MolFromXYZBlock(xyz)
+    if mol is None:
+        logging.warning("Failed to create molecule from XYZ block")
+        logging.debug(f"XYZ content:\n{xyz}")
+        return None
+
+    # mol 不合理
+
+    # try different charge states for bond determination
+    mol_final = None
+    for charge in [0, 1, -1, 2, -2]: # 这里出现问题了
+        mol_copy = deepcopy(mol)
+        try:
+            rdDetermineBonds.DetermineBonds(mol_copy, charge=charge, embedChiral=True)
+            logging.debug(f"Bond determination successful with charge {charge}")
+            mol_final = mol_copy
+            break
+        except Exception as e:
+            logging.debug(f"Bond determination failed with charge {charge}: {e}")
+            continue
+
+    if mol_final is None:
+        logging.warning("Bond determination failed for all charge states")
+        return None
+    
+    # validate molecule
+    try:
+        radical_electrons = sum([a.GetNumRadicalElectrons() for a in mol_final.GetAtoms()])
+        if radical_electrons > 0:
+            logging.warning(f"Molecule has {radical_electrons} radical electrons")
+        
+        mol_final.UpdatePropertyCache()
+        Chem.GetSymmSSSR(mol_final)
+        logging.debug("Molecule validation successful")
+    except Exception as e:
+        logging.warning(f"Molecule validation failed: {e}")
+        return None
+
+    # try to generate SMILES to verify molecule
+    try:
+        smiles = Chem.MolToSmiles(mol_final)
+        logging.debug(f"Generated SMILES: {smiles}")
+    except Exception as e:
+        logging.warning(f"SMILES generation failed: {e}")
+
+    if '.' in smiles:
+        logging.warning("Molecule is a fragment, failed to create molecule")
+        return None
+
+    return mol_final
+        
+    # except Exception as e:
+    #     logging.warning(f"Error creating molecule: {e}")
+    #     return None

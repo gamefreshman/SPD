@@ -84,6 +84,47 @@ torch.set_printoptions(profile="full")
 # 协调化函数（Harmonization Functions）
 # ============================================================================
 
+def initial_sample_discrete_feature_noise(limit_dist_x, limit_dist_e, num_atoms, include_virtual_node):
+    """ 
+    从扩散过程的极限分布中采样初始噪声。
+    
+    此函数现在返回：
+    - U_X: 节点的one-hot特征噪声 [num_atoms, num_atom_classes]
+    - bond_edge_x: 边的one-hot特征噪声 [num_edges, num_bond_classes]
+    - bond_edge_index: 边的连接关系 [2, num_edges]
+    """
+    
+    # 扩展边际分布以匹配节点和边的数量
+    x_limit = limit_dist_x[None, :].expand(num_atoms, -1)
+    e_limit = limit_dist_e[None, None, :].expand(num_atoms, num_atoms, -1)
+    
+    # 从分布中采样类别索引
+    U_X_indices = x_limit.flatten(end_dim=-2).multinomial(1).reshape(num_atoms)
+    U_E_indices = e_limit.flatten(end_dim=-2).multinomial(1).reshape(num_atoms, num_atoms)
+
+    # --- 步骤 1: 生成边的连接关系 (bond_edge_index) ---
+    # 创建一个全连接图的上三角矩阵（不含对角线）作为基础连接关系
+    # 这就是您在主代码中使用的正确逻辑
+    bond_adj = np.triu(np.ones((num_atoms, num_atoms), dtype=int), k=1)
+    bond_edge_index = np.stack(bond_adj.nonzero(), axis=0)
+    
+    # 将 NumPy 数组转换为 PyTorch 张量
+    bond_edge_index = torch.from_numpy(bond_edge_index).long()
+
+    # --- 步骤 2: 根据连接关系提取边的特征 (bond_edge_x) ---
+    # 从我们采样出的完整的边类型索引矩阵 U_E_indices 中，
+    # 只挑选出实际存在连接的那些边的特征。
+    # bond_edge_index[0] 是起始节点列表
+    # bond_edge_index[1] 是结束节点列表
+    bond_edge_x_indices = U_E_indices[bond_edge_index[0], bond_edge_index[1]]
+
+    # --- 步骤 3: 对节点和边特征进行 One-Hot 编码 ---
+    U_X = F.one_hot(U_X_indices, num_classes=x_limit.shape[-1]).float()
+    bond_edge_x = F.one_hot(bond_edge_x_indices, num_classes=e_limit.shape[-1]).float()
+    
+    # 函数现在需要返回三个值
+    return U_X, bond_edge_x
+
 def forward_jump_parameters(t_start_idx, jump, sigma_ts):
     """
     计算前向跳跃的参数。
@@ -623,24 +664,26 @@ def inference_sample(
     # ============================================================================
     # X1模态（分子）的图结构配置
     # ============================================================================
-    
+
+    # pos
+    virtual_node_pos_x1 = torch.tensor([[0.,0.,0.]], dtype = torch.float).to(device)  # 虚拟节点位置（原点）
+
+    # 节点特征
+    virtual_node_x_x1 = torch.zeros(num_atom_types, dtype = torch.float).to(device)  # 虚拟节点特征
+    virtual_node_x_x1[0] = 1. * params['dataset']['x1']['scale_atom_features']  # 独热编码，保持不加噪
+    virtual_node_x_x1 = virtual_node_x_x1[None, ...]  # 增加批次维度
+
     # 构建键连接的邻接矩阵（上三角矩阵，避免重复边）
     bond_adj = np.triu(1-np.diag(np.ones(N_x1, dtype = int)))  # 有向图，每个键只包含一条边
     bond_edge_index = np.stack(bond_adj.nonzero(), axis = 0)  # 不包含到虚拟节点的边
-    bond_edge_index = bond_edge_index + int(include_virtual_node)  # 为虚拟节点调整索引
+    bond_edge_index = bond_edge_index + int(include_virtual_node)  # 为虚拟节点调整索
     bond_edge_index = torch.as_tensor(bond_edge_index, dtype = torch.long).to(device)
     
     # X1模态的批次索引（包含虚拟节点）
     x1_batch = torch.cat([
         torch.ones(N_x1 + int(include_virtual_node), dtype = torch.long) * i for i in range(batch_size)
     ]).to(device)
-    
-    # X1模态虚拟节点的位置和特征
-    virtual_node_pos_x1 = torch.tensor([[0.,0.,0.]], dtype = torch.float).to(device)  # 虚拟节点位置（原点）
-    virtual_node_x_x1 = torch.zeros(num_atom_types, dtype = torch.float).to(device)  # 虚拟节点特征
-    virtual_node_x_x1[0] = 1. * params['dataset']['x1']['scale_atom_features']  # 独热编码，保持不加噪
-    virtual_node_x_x1 = virtual_node_x_x1[None, ...]  # 增加批次维度
-    
+     
     # ============================================================================
     # X2模态（表面点）的批次配置
     # ============================================================================
@@ -723,10 +766,10 @@ def inference_sample(
         # ========================================================================
         
         # 原子特征的连续高斯噪声
-        x1_x_T = torch.randn(N_x1, num_atom_types).to(device)
-        
-        # 键特征的连续高斯噪声
-        x1_bond_edge_x_T = torch.randn(bond_edge_index.shape[1], len(params['dataset']['x1']['bond_types'])).to(device)
+        x1_x_T, x1_bond_edge_x_T = initial_sample_discrete_feature_noise(atom_marginals, bond_marginals, N_x1, include_virtual_node)
+
+        x1_bond_edge_x_T = torch.as_tensor(x1_bond_edge_x_T, dtype = torch.long).to(device)
+        x1_x_T = torch.as_tensor(x1_x_T, dtype = torch.long).to(device)
         
         # ========================================================================
         # 处理虚拟节点
@@ -734,6 +777,7 @@ def inference_sample(
         
         # 创建虚拟节点掩码
         x1_virtual_node_mask_ = torch.zeros(N_x1 + int(include_virtual_node), dtype = torch.long).to(device)
+        
         if include_virtual_node:
             x1_virtual_node_mask_[0] = 1  # 第一个节点为虚拟节点
             x1_virtual_node_mask_ = x1_virtual_node_mask_ == 1  # 转换为布尔掩码
@@ -1191,7 +1235,8 @@ def inference_sample(
                 
             },
         }
-        
+
+# =========================================================
 
         # ==================== 神经网络噪声预测 ====================
         # 使用训练好的扩散模型预测当前时间步的噪声
@@ -1205,15 +1250,12 @@ def inference_sample(
         # 从模型输出中获取原子特征噪声预测结果
 
         x1_x_out = output_dict['x1']['decoder']['denoiser']['x_out'].detach()  # 原子特征噪声预测
-        # print("原子特征噪声预测 x1_x_out:", x1_x_out.shape, "\n", x1_x_out)
 
         # 提取并打印键特征噪声预测
         x1_bond_edge_x_out = output_dict['x1']['decoder']['denoiser']['bond_edge_x_out'].detach()  # 键特征噪声预测
-        # print("键特征噪声预测 x1_bond_edge_x_out:", x1_bond_edge_x_out.shape, "\n", x1_bond_edge_x_out)
 
         # 提取并打印原子坐标噪声预测
         x1_pos_out = output_dict['x1']['decoder']['denoiser']['pos_out'].detach()  # 原子坐标噪声预测
-        # print("原子坐标噪声预测 x1_pos_out:", x1_pos_out.shape, "\n", x1_pos_out)
         
         # 检查并处理NaN值，防止数值不稳定导致的计算错误
         if torch.any(torch.isnan(x1_pos_out)):
@@ -1309,7 +1351,6 @@ def inference_sample(
         x4_c_t_injected = x4_c_t  # X4模态的注入噪声系数
         if len(inject_noise_at_ts) > 0:  # 检查是否有需要注入噪声的时间步
             if t == inject_noise_at_ts[0]:  # 如果当前时间步需要注入噪声
-                #print(f'injecting noise... at time {t}')  # 调试信息
                 inject_noise_at_ts.pop(0)  # 移除已处理的时间步
                 inject_noise_scale = inject_noise_scales.pop(0)  # 获取对应的噪声缩放因子
                 
@@ -1338,36 +1379,22 @@ def inference_sample(
         # ==================== 反向去噪步骤 - X1模态 ====================
 
         x1_pos_t_1 = ((1. / x1_alpha_t) * x1_pos_t)  - ((x1_var_dash_t/(x1_alpha_t * x1_sigma_dash_t)) * x1_pos_out)  +  (x1_c_t_injected * x1_pos_epsilon)  # 原子位置去噪 连续的不修改
-        # print(f"x1_pos_out shape: {x1_pos_out.shape}, device: {x1_pos_out.device}")
 
         # ==================== 离散特征去噪（原子类型和键类型）====================
         
         # 1. 对模型预测结果进行 softmax 归一化,将logits转换为概率分布
         # 转换网络的预测输出
-        # print(f"x1_x_out shape: {x1_x_out.shape}, device: {x1_x_out.device}")
-        # print(f"x1_bond_edge_x_out shape: {x1_bond_edge_x_out.shape}, device: {x1_bond_edge_x_out.device}")
 
         pred_x1_x = F.softmax(x1_x_out, dim=-1)  # 原子特征预测概率分布
         pred_x1_bond = F.softmax(x1_bond_edge_x_out, dim=-1)  # 键特征预测概率分布
 
-        # print(f"pred_x1_x shape: {pred_x1_x.shape}, device: {pred_x1_x.device}")
-
-        # print(f"pred_x1_bond shape: {pred_x1_bond.shape}, device: {pred_x1_bond.device}")
-
         # 2. 计算时间步相关参数
         s_int = t - 1  # 获取前一个时间步
-        # print(f"\n=== 时间步参数计算 ===")
-        # print(f"当前时间步 t: {t}")
-        # print(f"前一时间步 s_int: {s_int}")
-        # print(f"总时间步 T: {T}")
 
         # 将时间步归一化到[0,1]区间
         t_normalized = torch.tensor(t / T, dtype=torch.float32).to(device)  # 当前时间步归一化
         # 前一时间步归一化,如果是第一步则为0
         s_normalized = torch.tensor(max(0, s_int) / T, dtype=torch.float32).to(device) if s_int >= 0 else torch.tensor(0.0).to(device)
-
-        # print(f"t_normalized: {t_normalized}, device: {t_normalized.device}")
-        # print(f"s_normalized: {s_normalized}, device: {s_normalized.device}")
 
         # 3. 计算噪声调度系数
         # 获取当前时间步的累积信号保持系数
@@ -1375,32 +1402,15 @@ def inference_sample(
         # 获取前一时间步的累积信号保持系数,如果是第一步则为1
         alpha_s_bar = x1_atom_diffuser.noise_schedule.get_alpha_bar(s_normalized) if s_int >= 0 else torch.tensor(1.0).to(device)
 
-        # print(f"\n=== 噪声调度系数 ===")
-        # print(f"alpha_t_bar: {alpha_t_bar}, device: {alpha_t_bar.device}")
-        # print(f"alpha_s_bar: {alpha_s_bar}, device: {alpha_s_bar.device}")
         
         # 3. 计算节点转移矩阵
         Qtb_atom = x1_atom_diffuser.transition_model.get_Qt_bar(alpha_t_bar, device, True)
         Qsb_atom = x1_atom_diffuser.transition_model.get_Qt_bar(alpha_s_bar, device, True)
 
-        # print(f"\n=== 原子转移矩阵 ===")
-        # print(f"Qtb_atom shape: {Qtb_atom.shape}, device: {Qtb_atom.device}")
-        # print(f"Qsb_atom shape: {Qsb_atom.shape}, device: {Qsb_atom.device}")
         
         # 3. 计算键转移矩阵
         Qtb_bond = x1_bond_diffuser.transition_model.get_Qt_bar(alpha_t_bar, device, False)
         Qsb_bond = x1_bond_diffuser.transition_model.get_Qt_bar(alpha_s_bar, device, False)
-
-        # print(f"\n=== 键转移矩阵 ===")
-        # print(f"Qtb_bond shape: {Qtb_bond.shape}, device: {Qtb_bond.device}")
-        # print(f"Qsb_bond shape: {Qsb_bond.shape}, device: {Qsb_bond.device}")
-
-        
-
-        # print(f"\n=== 转移模型 ===")
-
-        # print(f"atom_marginals: {atom_marginals.shape}, device: {atom_marginals.device}")
-        # print(f"bond_marginals: {bond_marginals.shape}, device: {bond_marginals.device}")
 
         beta_t_x = x1_atom_diffuser.noise_schedule(t_normalized)                                                    
         beta_t_x = beta_t_x.to(device)
@@ -1408,22 +1418,11 @@ def inference_sample(
         beta_t_e = x1_bond_diffuser.noise_schedule(t_normalized)
         beta_t_e = beta_t_e.to(device)
 
-        # print(f"beta_t_x: {beta_t_x.shape}, device: {beta_t_x.device}")
-        # print(f"beta_t_e: {beta_t_e.shape}, device: {beta_t_e.device}")
-
         Qt_x = x1_atom_diffuser.transition_model.get_Qt(beta_t_x, device, is_atom=True)
         Qt_e = x1_bond_diffuser.transition_model.get_Qt(beta_t_e, device, is_atom=False) # 形状有问题
 
-        # print(f"Qt_x shape: {Qt_x.shape}, device: {Qt_x.device}")
-        # print(f"Qt_e shape: {Qt_e.shape}, device: {Qt_e.device}")
-        
-
         X_t_final_output = x1_x_out
         x1_bond_edge_final_output = x1_bond_edge_x_out
-
-        # print(f"\n=== 初始化最终输出 ===")
-        # print(f"X_t_final_output shape: {X_t_final_output.shape}, device: {X_t_final_output.device}")
-        # print(f"x1_bond_edge_final_output shape: {x1_bond_edge_final_output.shape}, device: {x1_bond_edge_final_output.device}")
         
         # 4. 计算后验分布 p(x_{t-1} | x_t, x_0)
         def compute_batched_over0_posterior_distribution(X_t, Qt, Qsb, Qtb):
@@ -1452,18 +1451,10 @@ def inference_sample(
             后验分布概率，形状为 [batch_size, N, original_dim, feature_dim_t-1]
             其中 N 是节点数（对于节点特征）或节点数的平方（对于边特征）
             """
-            
-            # 步骤1：展平特征张量以便批量处理
-            # 注意：这一行对节点特征不做任何操作，但对边特征会将其从 [bs, n, n, dt] 映射到 [bs, n*n, dt]
-            # 这样可以统一处理节点特征和边特征
-            # X_t = X_t.flatten(start_dim=1, end_dim=-2).to(torch.float32)  # [bs, N, dt]
-            # 首先，没有多批的概念，然后，边这边已经自动处理好了
-            
-            # 步骤2：计算分子部分 - 当前状态与转移矩阵的乘积
-            # print(f"    输入 X_t shape: {X_t.shape}, device: {X_t.device}")
-            # print(f"    输入 Qt shape: {Qt.shape}, device: {Qt.device}")
-            # print(f"    输入 Qsb shape: {Qsb.shape}, device: {Qsb.device}")
-            # print(f"    输入 Qtb shape: {Qtb.shape}, device: {Qtb.device}")
+            X_t = X_t.float()
+            Qt = Qt.float()
+            Qsb = Qsb.float()
+            Qtb = Qtb.float()
 
             Qt_T = Qt.transpose(-1, -2)                 # 转置转移矩阵：[bs, dt, d_t-1]
             left_term = X_t @ Qt_T                      # 矩阵乘法：[bs, N, d_t-1]
@@ -1489,8 +1480,6 @@ def inference_sample(
             # 这是贝叶斯公式的实现：posterior = likelihood * prior / evidence
             out = numerator / denominator               # [bs, N, d0, d_t-1]
 
-            # print(f"    最终输出 out shape: {out.shape}")
-            
             return out
         
         # 5. 计算原子特征的后验分布
@@ -1506,14 +1495,6 @@ def inference_sample(
 
             atom_posterior_prob = atom_posterior_prob.squeeze(0)
 
-            # 从后验分布中
-            # print("x1_x_out shape:", x1_x_out.shape)
-            # print("Qt shape:", Qt_batch.shape)
-            # print("Qtb_atom shape:", Qtb_atom.shape)
-            # print("Qsb_atom shape:", Qsb_atom.shape)
-
-            # 从后验分布中
-            # print("atom_posterior_prob shape:", atom_posterior_prob.shape)
 
             # 数值保护
             weighted_X = pred_x1_x.unsqueeze(-1) * atom_posterior_prob
@@ -1523,40 +1504,12 @@ def inference_sample(
             prob_X = unnormalized_prob_X / (torch.sum(unnormalized_prob_X, dim=-1, keepdim=True) + 1e-8)
             assert ((prob_X.sum(dim=-1) - 1).abs() < 1e-3).all()
 
-            # 采样
-            # print("prob_X")
-            # print(prob_X.shape)
-
             _, num_classes_x = prob_X.shape
-            # print(num_classes_x)
-
-
-            # ===================================================================================================================
-            # print("Checking prob_X...")
-            # print("Shape:", prob_X.shape)
-
-            # 检查是否有 NaN 或 inf
-            # if torch.isnan(prob_X).any() or torch.isinf(prob_X).any():
-                # print("!!! prob_X contains NaN or Inf !!!")
-
-            # 检查是否有负值
-            # if (prob_X < 0).any():
-                # print("!!! prob_X contains negative values !!!")
-                
-            # 检查每行的和
-            # row_sums = prob_X.sum(dim=-1)
-            # if (row_sums == 0).any():
-            #     # print("!!! Some rows in prob_X sum to zero !!!")
-            #     # 找出是哪些行
-            #     zero_sum_indices = torch.where(row_sums == 0)
-                # print("Indices of zero-sum rows:", zero_sum_indices)
-            # ===================================================================================================================
 
             X_t = prob_X.multinomial(1)
             X_t_indices = X_t.squeeze(-1)
 
-            # print("shape indices:", X_t_indices.shape)
-            X_t_final_output = F.one_hot(X_t_indices, num_classes=num_classes_x) # 原子特征数量
+            X_t_final_output = F.one_hot(X_t_indices, num_classes=num_classes_x).float() # 原子特征数量
         else:
             X_t_final_output = x1_x_out
 
@@ -1577,25 +1530,20 @@ def inference_sample(
             # 从后验分布中采样
             # 计算加权概率
             weighted_E = pred_x1_bond.unsqueeze(-1) * bond_posterior_prob
-            # print("加权概率 weighted_E:", weighted_E)
-            # print("weighted_E shape:", weighted_E.shape)
+
 
             # 计算未归一化概率
             unnormalized_prob_E = weighted_E.sum(dim=-2)
-            # print("未归一化概率 unnormalized_prob_E:", unnormalized_prob_E)
-            # print("unnormalized_prob_E shape:", unnormalized_prob_E.shape)
+
 
             # 处理零概率情况
             zero_mask = torch.sum(unnormalized_prob_E, dim=-1) == 0
-            # print("零概率掩码 zero_mask:", zero_mask)
             unnormalized_prob_E[zero_mask] = 1e-7
 
             # 计算归一化概率
             prob_sum = torch.sum(unnormalized_prob_E, dim=-1, keepdim=True)
-            # print("概率和 prob_sum:", prob_sum)
             prob_E = unnormalized_prob_E / prob_sum
-            # print("归一化概率 prob_E:", prob_E)
-            # print("prob_E shape:", prob_E.shape)
+
 
             # 验证概率和为1
             prob_sum_check = prob_E.sum(dim=-1)
@@ -1603,45 +1551,22 @@ def inference_sample(
             large_diff_mask = prob_diff.abs() > 1e-4
             large_diff_indices = torch.where(large_diff_mask)
 
-            # print("概率和检查 - 差值大于1e-4的位置:")
-            # print(f"  总共有 {large_diff_mask.sum().item()} 个位置的差值大于1e-4")
-
-            # if large_diff_mask.any():
-            #     print(f"  位置索引: {large_diff_indices}")
-            #     print(f"  这些位置的差值: {prob_diff[large_diff_mask]}")
-            #     print(f"  这些位置的原始概率和: {prob_sum_check[large_diff_mask]}")
-                
-            #     # 显示前10个异常位置的详细信息
-            #     num_to_show = min(10, large_diff_mask.sum().item())
-            #     if num_to_show > 0:
-            #         print(f"  前{num_to_show}个异常位置详情:")
-            #         for i in range(num_to_show):
-            #             idx = large_diff_indices[0][i].item() if len(large_diff_indices[0].shape) > 0 else large_diff_indices[0].item()
-            #             print(f"    位置[{idx}]: 概率和={prob_sum_check[idx]:.8f}, 差值={prob_diff[idx]:.8f}")
-            # else:
-            #     print("  所有位置的概率和都在1e-4误差范围内")
-
             assert ((prob_sum_check - 1).abs() < 1e-3).all()
 
             # 采样
             _, num_classes_e = prob_E.shape
 
-            # print(f"num_classes_e: {num_classes_e}")
-
             # 检查prob_E中是否存在负数
             if torch.any(prob_E < 0):
                 # 获取负数位置的索引
                 neg_indices = torch.where(prob_E < 0)
-                # 打印详细信息
-                # print(f"Warning: prob_E contains negative values at indices: {neg_indices}")
-                # print(f"Negative values: {prob_E[neg_indices]}")
-                # print(f"Full prob_E tensor: {prob_E}")
+
                 # 将负数替换为0以确保multinomial采样可以进行
                 prob_E = torch.clamp(prob_E, min=0.0)
             
             E_t = prob_E.multinomial(1)
             E_t_indices = E_t.squeeze(-1)
-            x1_bond_edge_final_output = F.one_hot(E_t_indices, num_classes=num_classes_e) # 5种键类型
+            x1_bond_edge_final_output = F.one_hot(E_t_indices, num_classes=num_classes_e).float() # 5种键类型
         else:
             # 最后一步，直接使用预测结果
             x1_bond_edge_final_output = x1_bond_edge_x_out
@@ -1690,14 +1615,18 @@ def inference_sample(
         x4_direction_t = x4_direction_t_1  # 更新X4药效团方向
         x4_x_t = x4_x_t_1  # 更新X4药效团类型
         
-        with open(f'log.txt\{t}', 'a') as f:
+        # 确保log文件夹存在
+        os.makedirs('log', exist_ok=True)
+        
+        # 将时间步作为文件名保存到log文件夹
+        with open(f'log/{t}.txt', 'a') as f:
             f.write(f'\nTime step {t}:\n\n')  # 添加换行确保新记录清晰分隔
             f.write(f'X1 atom features: {x1_x_t}\n\n')  # 原子特征
             f.write(f'X1 bond features: {x1_bond_edge_x_t}\n\n')  # 化学键特征
             f.write(f'X1 positions: {x1_pos_t}\n\n')  # 原子位置坐标
             f.write(f'X4 positions: {x4_pos_t}\n\n')  # 药效团位置
             f.write(f'X4 directions: {x4_direction_t}\n\n')  # 药效团方向
-            f.write(f'X4 types: {x4_x_t}\n\n')  # 药效团类型 
+            f.write(f'X4 types: {x4_x_t}\n\n')  # 药效团类型
 
         # 时间步递减，向t=0迭代
         t = t - 1  # 主时间步递减
@@ -1732,21 +1661,36 @@ def inference_sample(
     x1_pos_final = x1_pos_t[~virtual_node_mask_x1].cpu().numpy()  # 提取非虚拟节点的原子最终位置
     # 这两行代码的主要目的是将模型输出的连续值特征转换回离散的原子和键类型索引
 
-    # 命名fix
-    x1_bond_edge_x_final = x1_bond_edge_x_t.long()
+    edge_index = bond_edge_index_x1 
+    edge_mask = (~virtual_node_mask_x1[edge_index[0]]) & (~virtual_node_mask_x1[edge_index[1]])
+    # 使用边掩码过滤键特征
+    x1_bond_edge_x_final = x1_bond_edge_x_t[edge_mask].long()
     
     # 将原子类型索引重新映射到实际的原子序数
-    atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14], device=device)  # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
-    x1_x_final = atomic_number_remapping[x1_x_t.long()]  # 应用原子序数映射
-    
+    atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14])  # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
+    x1_x_final = x1_x_t[~virtual_node_mask_x1].long().cpu().numpy()  # 应用原子序数映射
+
+
+
+    atoms_indices = np.argmax(x1_x_final, axis=1)
+
+
+    x_really_finally =[]
+    for b, x in enumerate(x1_x_final):
+        num = atomic_number_remapping[atoms_indices[b]].item() 
+        x_really_finally.append(num)
+
+
+    x_really_finally = np.array(x_really_finally)
     
     # ==================== 返回生成的结构 ====================
     # 将所有模态的最终结果组织成结构化字典并返回
     generated_structures = []  # 存储生成的结构列表
     for b in range(batch_size):  # 遍历批次中的每个样本
+
         generated_dict = {
             'x1': {  # X1模态：分子结构
-                'atoms': np.array_split(x1_x_final.cpu().numpy(), batch_size)[b],  # 原子类型（原子序数）
+                'atoms': np.array_split(x_really_finally, batch_size)[b],  # 原子类型（原子序数）
                 #'formal_charges': None, # 形式电荷（待提取）：从x1_x_t[~virtual_node_mask_x1, -len(params['dataset']['x1']['charge_types']):]中提取
                 'bonds': np.array_split(x1_bond_edge_x_final, batch_size)[b],  # 键类型
                 'positions': np.array_split(x1_pos_final, batch_size)[b],  # 原子位置坐标
