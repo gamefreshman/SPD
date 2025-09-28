@@ -116,10 +116,18 @@ if __name__ == '__main__':
     
     # CHANGE ME ONCE FULL DATASETS ARE DOWNLOADED
     if params['data'] == 'MOSES_aq':
-        # sample data
+
+        # full dataset
         molblocks_and_charges = []
-        with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
-            molblocks_and_charges = pickle.load(f)
+        for i in [0,1,2,3,4]:
+            with open(f'conformers/moses_aq/molblock_charges_{i}.pkl', 'rb') as f:
+                molblocks_and_charges_ = pickle.load(f) 
+            molblocks_and_charges += molblocks_and_charges_
+
+        # sample data
+        # molblocks_and_charges = []
+        # with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
+        #     molblocks_and_charges = pickle.load(f)
 
         output_file = "MOSES_aq"
 
@@ -139,14 +147,7 @@ if __name__ == '__main__':
 
         except IOError as e:
             print("error happens in file writing")
-        """
-        # full dataset
-        molblocks_and_charges = []
-        for i in [0,1,2,3,4]:
-            with open(f'conformers/moses_aq/molblock_charges_{i}.pkl', 'rb') as f:
-                molblocks_and_charges_ = pickle.load(f) 
-            molblocks_and_charges += molblocks_and_charges_
-        """
+
 
     from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
 

@@ -150,7 +150,7 @@ def create_rdkit_molecule(sample):
             continue
 
     if mol_final is None:
-        logging.warning("Bond determination failed for all charge states")
+        logging.warning("Bond determination failed for all charge states") # 现在是会爆出这个错误
         return None
     
     # validate molecule

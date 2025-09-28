@@ -47,8 +47,6 @@ from rdkit.Chem import rdDetermineBonds  # 键序确定功能
 
 # 数值计算和可视化
 import numpy as np  # 数值计算
-import matplotlib.pyplot as plt  # 绘图库
-
 # PyTorch深度学习框架
 import torch  # 核心PyTorch库
 import torch_geometric  # 图神经网络库
@@ -79,12 +77,68 @@ import torch
 np.set_printoptions(threshold=np.inf, linewidth=200, suppress=True)
 torch.set_printoptions(profile="full")
 
+def compute_batched_over0_posterior_distribution(X_t, Qt, Qsb, Qtb):
+    """ 
+    计算离散扩散模型中的后验分布 p(x_{t-1} | x_t, x_0)
+    
+    这个函数是离散扩散模型去噪过程的核心计算函数，用于计算给定当前状态 x_t 和预测的原始状态 x_0 时，
+    前一时间步状态 x_{t-1} 的后验概率分布。
+    
+    数学原理：
+    计算公式为 xt @ Qt.T * x0 @ Qsb / x0 @ Qtb @ xt.T，对每个可能的 x0 值进行计算
+    这基于贝叶斯定理：p(x_{t-1} | x_t, x_0) ∝ p(x_t | x_{t-1}) * p(x_{t-1} | x_0)
+    
+    参数说明：
+    X_t: 当前时间步 t 的特征状态
+            - 对于节点特征：形状为 [batch_size, num_nodes, feature_dim_t]
+            - 对于边特征：形状为 [batch_size, num_nodes, num_nodes, feature_dim_t]
+    Qt: 单步转移矩阵，从时间步 t-1 到 t 的转移概率
+        形状为 [batch_size, feature_dim_t-1, feature_dim_t]
+    Qsb: 累积转移矩阵，从原始数据 x_0 到时间步 s (即 t-1) 的转移概率
+            形状为 [batch_size, original_dim, feature_dim_t-1]
+    Qtb: 累积转移矩阵，从原始数据 x_0 到时间步 t 的转移概率
+            形状为 [batch_size, original_dim, feature_dim_t]
+    
+    返回值：
+    后验分布概率，形状为 [batch_size, N, original_dim, feature_dim_t-1]
+    其中 N 是节点数（对于节点特征）或节点数的平方（对于边特征）
+    """
+    X_t = X_t.float()
+    Qt = Qt.float()
+    Qsb = Qsb.float()
+    Qtb = Qtb.float()
+
+    Qt_T = Qt.transpose(-1, -2)                 # 转置转移矩阵：[bs, dt, d_t-1]
+    left_term = X_t @ Qt_T                      # 矩阵乘法：[bs, N, d_t-1]
+    left_term = left_term.unsqueeze(dim=2)      # 增加维度用于广播：[bs, N, 1, d_t-1]
+    
+    # 步骤3：计算分子部分 - 与累积转移矩阵 Qsb 相乘
+    right_term = Qsb.unsqueeze(1)               # 增加维度用于广播：[bs, 1, d0, d_t-1]
+    numerator = left_term * right_term          # 逐元素相乘（广播）：[bs, N, d0, d_t-1]
+    
+    # 步骤4：计算分母部分
+    X_t_transposed = X_t.transpose(-1, -2)      # 转置当前状态：[bs, dt, N]
+    
+    # 计算 Qtb @ X_t^T，这表示从 x_0 到 x_t 的概率与当前状态的乘积
+    prod = Qtb @ X_t_transposed                 # 矩阵乘法：[bs, d0, N]
+    prod = prod.transpose(-1, -2)               # 转置回来：[bs, N, d0]
+    denominator = prod.unsqueeze(-1)            # 增加维度用于除法：[bs, N, d0, 1]
+    
+    # 步骤5：数值稳定性处理
+    # 避免除零错误，将零值替换为很小的正数
+    denominator[denominator.abs() < 1e-6] = 1e-6
+    
+    # 步骤6：计算最终的后验概率分布
+    # 这是贝叶斯公式的实现：posterior = likelihood * prior / evidence
+    out = numerator / (denominator + 1e-8)              # [bs, N, d0, d_t-1]
+
+    return out
 
 # ============================================================================
 # 协调化函数（Harmonization Functions）
 # ============================================================================
 
-def initial_sample_discrete_feature_noise(limit_dist_x, limit_dist_e, num_atoms, include_virtual_node):
+def initial_sample_discrete_feature_noise(limit_dist_x, limit_dist_e, num_atoms):
     """ 
     从扩散过程的极限分布中采样初始噪声。
     
@@ -122,7 +176,6 @@ def initial_sample_discrete_feature_noise(limit_dist_x, limit_dist_e, num_atoms,
     U_X = F.one_hot(U_X_indices, num_classes=x_limit.shape[-1]).float()
     bond_edge_x = F.one_hot(bond_edge_x_indices, num_classes=e_limit.shape[-1]).float()
     
-    # 函数现在需要返回三个值
     return U_X, bond_edge_x
 
 def forward_jump_parameters(t_start_idx, jump, sigma_ts):
@@ -578,28 +631,6 @@ def inference_sample(
         deterministic = deterministic_inpainting_x2,  # 确定性标志
     )
     
-    # X3模态（静电势位置）的修复轨迹
-    x3_pos_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x3_pos,  # 目标静电势位置
-        ts = params['noise_schedules']['x3']['ts'],
-        alpha_ts = params['noise_schedules']['x3']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x3']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x3_mask,
-        deterministic = deterministic_inpainting_x3,
-    )
-    
-    # X3模态（静电势值）的修复轨迹
-    x3_x_inpainting_trajectory = forward_trajectory(
-        x = target_inpaint_x3_x,  # 目标静电势值
-        ts = params['noise_schedules']['x3']['ts'],
-        alpha_ts = params['noise_schedules']['x3']['alpha_ts'],
-        sigma_ts = params['noise_schedules']['x3']['sigma_ts'],
-        remove_COM_from_noise = False,
-        mask = target_inpaint_x3_mask,
-        deterministic = deterministic_inpainting_x3,
-    )
-    
     # X4模态（药效团类型）的修复轨迹
     x4_x_inpainting_trajectory = forward_trajectory(
         x = target_inpaint_x4_x,  # 目标药效团类型
@@ -639,9 +670,6 @@ def inference_sample(
 
     # 如果设置为无条件生成，则禁用所有修复选项
     if unconditional:
-        inpaint_x2_pos = False      # 禁用表面点位置修复
-        inpaint_x3_pos = False      # 禁用静电势位置修复
-        inpaint_x3_x = False        # 禁用静电势值修复
         inpaint_x4_pos = False      # 禁用药效团位置修复
         inpaint_x4_direction = False # 禁用药效团方向修复
         inpaint_x4_type = False     # 禁用药效团类型修复
@@ -692,7 +720,6 @@ def inference_sample(
     x2_batch = torch.cat([
         torch.ones(N_x2 + int(include_virtual_node), dtype = torch.long) * i for i in range(batch_size)
     ]).to(device)
-    virtual_node_pos_x2 = torch.tensor([[0.,0.,0.]], dtype = torch.float).to(device)  # 与X1相同的虚拟节点位置
     
     # ============================================================================
     # X3模态（静电势）的批次配置
@@ -702,8 +729,6 @@ def inference_sample(
     x3_batch = torch.cat([
         torch.ones(N_x3 + int(include_virtual_node), dtype = torch.long) * i for i in range(batch_size)
     ]).to(device)
-    virtual_node_pos_x3 = torch.tensor([[0.,0.,0.]], dtype = torch.float).to(device)  # 与X1相同的虚拟节点位置
-    virtual_node_x_x3 = torch.tensor([0.0], dtype = torch.float).to(device)  # 虚拟节点的静电势值
     
     # ============================================================================
     # X4模态（药效团）的批次配置
@@ -766,7 +791,7 @@ def inference_sample(
         # ========================================================================
         
         # 原子特征的连续高斯噪声
-        x1_x_T, x1_bond_edge_x_T = initial_sample_discrete_feature_noise(atom_marginals, bond_marginals, N_x1, include_virtual_node)
+        x1_x_T, x1_bond_edge_x_T = initial_sample_discrete_feature_noise(atom_marginals, bond_marginals, N_x1)
 
         x1_bond_edge_x_T = torch.as_tensor(x1_bond_edge_x_T, dtype = torch.long).to(device)
         x1_x_T = torch.as_tensor(x1_x_T, dtype = torch.long).to(device)
@@ -1257,17 +1282,6 @@ def inference_sample(
         # 提取并打印原子坐标噪声预测
         x1_pos_out = output_dict['x1']['decoder']['denoiser']['pos_out'].detach()  # 原子坐标噪声预测
         
-        # 检查并处理NaN值，防止数值不稳定导致的计算错误
-        if torch.any(torch.isnan(x1_pos_out)):
-            print(f"Warning: x1_pos_out contains NaN values at timestep {t}, replacing with zeros")
-            x1_pos_out = torch.nan_to_num(x1_pos_out, nan=0.0)  # 将NaN替换为0
-        if torch.any(torch.isnan(x1_x_out)):
-            print(f"Warning: x1_x_out contains NaN values at timestep {t}, replacing with zeros")
-            x1_x_out = torch.nan_to_num(x1_x_out, nan=0.0)  # 将NaN替换为0
-        if torch.any(torch.isnan(x1_bond_edge_x_out)):
-            print(f"Warning: x1_bond_edge_x_out contains NaN values at timestep {t}, replacing with zeros")
-            x1_bond_edge_x_out = torch.nan_to_num(x1_bond_edge_x_out, nan=0.0)  # 将NaN替换为0
-        
         # 从预测的位置噪声中移除质心（COM），保持分子的平移不变性
         x1_pos_out = x1_pos_out - torch_scatter.scatter_mean(x1_pos_out[~virtual_node_mask_x1], x1_batch[~virtual_node_mask_x1], dim = 0)[x1_batch]
         
@@ -1285,17 +1299,6 @@ def inference_sample(
             x4_direction_out = x4_direction_out.detach()# 方向向量噪声预测
             x4_x_out = x4_x_out.detach()  # 类型特征噪声预测
             x4_x_out = x4_x_out.squeeze()  # 移除多余的维度
-            
-            # 检查并处理X4的NaN值，防止数值不稳定
-            if torch.any(torch.isnan(x4_pos_out)):
-                print(f"Warning: x4_pos_out contains NaN values at timestep {t}, replacing with zeros")
-                x4_pos_out = torch.nan_to_num(x4_pos_out, nan=0.0)  # 将NaN替换为0
-            if torch.any(torch.isnan(x4_direction_out)):
-                print(f"Warning: x4_direction_out contains NaN values at timestep {t}, replacing with zeros")
-                x4_direction_out = torch.nan_to_num(x4_direction_out, nan=0.0)  # 将NaN替换为0
-            if torch.any(torch.isnan(x4_x_out)):
-                print(f"Warning: x4_x_out contains NaN values at timestep {t}, replacing with zeros")
-                x4_x_out = torch.nan_to_num(x4_x_out, nan=0.0)  # 将NaN替换为0
             
             # 将虚拟节点的预测噪声设为零
             x4_pos_out[virtual_node_mask_x4, :] = 0.0  # 虚拟节点位置噪声置零
@@ -1319,11 +1322,6 @@ def inference_sample(
         # 从位置噪声中移除质心，保持分子的平移不变性
         x1_pos_epsilon = x1_pos_epsilon - torch_scatter.scatter_mean(x1_pos_epsilon[~virtual_node_mask_x1], x1_batch[~virtual_node_mask_x1], dim = 0)[x1_batch]
         x1_pos_epsilon[virtual_node_mask_x1, :] = 0.0  # 虚拟节点位置噪声置零
-        
-        # x1_x_epsilon = torch.randn(x1_batch_size_nodes, num_atom_types, device=device)  # 生成原子特征随机噪声
-        # x1_x_epsilon[virtual_node_mask_x1, :] = 0.0  # 虚拟节点特征噪声置零
-        
-        # x1_bond_edge_x_epsilon = torch.randn_like(x1_bond_edge_x_out)  # 生成键特征随机噪声
         
         # 计算X1模态的噪声系数，用于控制添加噪声的强度
         x1_c_t = (x1_sigma_t * x1_sigma_dash_t_1) / (x1_sigma_dash_t) if x1_t_idx > 0 else 0
@@ -1425,69 +1423,13 @@ def inference_sample(
         x1_bond_edge_final_output = x1_bond_edge_x_out
         
         # 4. 计算后验分布 p(x_{t-1} | x_t, x_0)
-        def compute_batched_over0_posterior_distribution(X_t, Qt, Qsb, Qtb):
-            """ 
-            计算离散扩散模型中的后验分布 p(x_{t-1} | x_t, x_0)
-            
-            这个函数是离散扩散模型去噪过程的核心计算函数，用于计算给定当前状态 x_t 和预测的原始状态 x_0 时，
-            前一时间步状态 x_{t-1} 的后验概率分布。
-            
-            数学原理：
-            计算公式为 xt @ Qt.T * x0 @ Qsb / x0 @ Qtb @ xt.T，对每个可能的 x0 值进行计算
-            这基于贝叶斯定理：p(x_{t-1} | x_t, x_0) ∝ p(x_t | x_{t-1}) * p(x_{t-1} | x_0)
-            
-            参数说明：
-            X_t: 当前时间步 t 的特征状态
-                 - 对于节点特征：形状为 [batch_size, num_nodes, feature_dim_t]
-                 - 对于边特征：形状为 [batch_size, num_nodes, num_nodes, feature_dim_t]
-            Qt: 单步转移矩阵，从时间步 t-1 到 t 的转移概率
-                形状为 [batch_size, feature_dim_t-1, feature_dim_t]
-            Qsb: 累积转移矩阵，从原始数据 x_0 到时间步 s (即 t-1) 的转移概率
-                 形状为 [batch_size, original_dim, feature_dim_t-1]
-            Qtb: 累积转移矩阵，从原始数据 x_0 到时间步 t 的转移概率
-                 形状为 [batch_size, original_dim, feature_dim_t]
-            
-            返回值：
-            后验分布概率，形状为 [batch_size, N, original_dim, feature_dim_t-1]
-            其中 N 是节点数（对于节点特征）或节点数的平方（对于边特征）
-            """
-            X_t = X_t.float()
-            Qt = Qt.float()
-            Qsb = Qsb.float()
-            Qtb = Qtb.float()
 
-            Qt_T = Qt.transpose(-1, -2)                 # 转置转移矩阵：[bs, dt, d_t-1]
-            left_term = X_t @ Qt_T                      # 矩阵乘法：[bs, N, d_t-1]
-            left_term = left_term.unsqueeze(dim=2)      # 增加维度用于广播：[bs, N, 1, d_t-1]
-            
-            # 步骤3：计算分子部分 - 与累积转移矩阵 Qsb 相乘
-            right_term = Qsb.unsqueeze(1)               # 增加维度用于广播：[bs, 1, d0, d_t-1]
-            numerator = left_term * right_term          # 逐元素相乘（广播）：[bs, N, d0, d_t-1]
-            
-            # 步骤4：计算分母部分
-            X_t_transposed = X_t.transpose(-1, -2)      # 转置当前状态：[bs, dt, N]
-            
-            # 计算 Qtb @ X_t^T，这表示从 x_0 到 x_t 的概率与当前状态的乘积
-            prod = Qtb @ X_t_transposed                 # 矩阵乘法：[bs, d0, N]
-            prod = prod.transpose(-1, -2)               # 转置回来：[bs, N, d0]
-            denominator = prod.unsqueeze(-1)            # 增加维度用于除法：[bs, N, d0, 1]
-            
-            # 步骤5：数值稳定性处理
-            # 避免除零错误，将零值替换为很小的正数
-            denominator[denominator == 0] = 1e-6
-            
-            # 步骤6：计算最终的后验概率分布
-            # 这是贝叶斯公式的实现：posterior = likelihood * prior / evidence
-            out = numerator / denominator               # [bs, N, d0, d_t-1]
-
-            return out
-        
         # 5. 计算原子特征的后验分布
         if s_int >= 0:
             x1_x_out_batch = x1_x_out.unsqueeze(0)
             Qt_batch = Qt_x.unsqueeze(0)
             # 非最后一步，使用后验分布采样
-            atom_posterior_prob = compute_batched_over0_posterior_distribution( # 这个函数导致出现了负数
+            atom_posterior_prob = compute_batched_over0_posterior_distribution(
                 x1_x_out_batch , 
                 Qt_batch ,
                 Qtb_atom, Qsb_atom
@@ -1664,23 +1606,23 @@ def inference_sample(
     edge_index = bond_edge_index_x1 
     edge_mask = (~virtual_node_mask_x1[edge_index[0]]) & (~virtual_node_mask_x1[edge_index[1]])
     # 使用边掩码过滤键特征
-    x1_bond_edge_x_final = x1_bond_edge_x_t[edge_mask].long()
+
+    # x1_bond_edge_x_final = x1_bond_edge_x_t[edge_mask].long()
+    x1_bond_edge_x_final = torch.argmax(x1_bond_edge_x_t[edge_mask], dim=-1).cpu().numpy()
     
     # 将原子类型索引重新映射到实际的原子序数
     atomic_number_remapping = torch.tensor([0,1,6,7,8,9,17,35,53,16,15,14])  # [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
-    x1_x_final = x1_x_t[~virtual_node_mask_x1].long().cpu().numpy()  # 应用原子序数映射
+    
+    # x1_x_final = x1_x_t[~virtual_node_mask_x1].long().cpu().numpy()  # 应用原子序数映射
 
+    x1_x_final_indices = torch.argmax(x1_x_t[~virtual_node_mask_x1], dim=-1).cpu().numpy()
 
+    # atoms_indices = np.argmax(x1_x_final, axis=1)
 
-    atoms_indices = np.argmax(x1_x_final, axis=1)
-
-
-    x_really_finally =[]
-    for b, x in enumerate(x1_x_final):
-        num = atomic_number_remapping[atoms_indices[b]].item() 
+    x_really_finally = []
+    for idx in x1_x_final_indices:
+        num = atomic_number_remapping[idx].item()
         x_really_finally.append(num)
-
-
     x_really_finally = np.array(x_really_finally)
     
     # ==================== 返回生成的结构 ====================
