@@ -30,6 +30,21 @@ class LightningModule(pl.LightningModule):
         self.lr = params['training']['lr']
         self.min_lr = params['training']['min_lr']
         self.lr_steps = params['training']['lr_steps']
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """
+        覆盖 PyTorch Lightning 的默认加载行为。
+        当从一个包含了旧模型（例如，包含 x3_decoder）权重的检查点文件恢复训练时，
+        而当前模型配置又不包含这些模块（如此处 explicit_diffusion_variables 不含 'x3'），
+        默认的 strict=True 会导致“Unexpected key(s)”错误。
+
+        通过将 strict 设置为 False，我们告诉加载器忽略那些在检查点中存在但在当前模型中不存在的键，
+        从而允许我们灵活地从具有不同配置的旧检查点恢复训练，只加载匹配的权重。
+        """
+        # 调用父类（torch.nn.Module）的 load_state_dict 方法，但强制 strict=False
+        # 这样可以加载所有匹配的权重，并静默地忽略不匹配的权重（例如 x3_decoder 的权重）。
+        print("正在以非严格模式加载模型状态，将忽略检查点中不匹配的键...")
+        super().load_state_dict(state_dict, strict=False)
     
     
     def configure_optimizers(self):
@@ -196,8 +211,8 @@ class LightningModule(pl.LightningModule):
         
         output_dict = self.forward_training(input_dict)
         
-        loss = 0.0
-        #loss = torch.tensor(0.0, requires_grad=True)
+        loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+
         if self.train_x1_denoising:
             loss_x1, feature_loss_x1, pos_loss_x1, bond_loss_x1 = self.x1_denoising_loss(input_dict, output_dict)
             loss = loss + loss_x1
@@ -299,6 +314,12 @@ class LightningModule(pl.LightningModule):
     def x3_denoising_loss(self, input_dict, output_dict):
         
         mask = ~input_dict['x3']['decoder']['virtual_node_mask']
+        
+        # 检查是否有非虚拟节点，避免在空张量上计算损失
+        if mask.sum() == 0:
+            zero_loss = torch.tensor(0.0, device=self.device)
+            return zero_loss, zero_loss, zero_loss
+
         feature_loss = torch.mean(
             (input_dict['x3']['decoder']['x_noise'] - output_dict['x3']['decoder']['denoiser']['x_out'].squeeze())[mask] ** 2.0
         )
@@ -306,23 +327,35 @@ class LightningModule(pl.LightningModule):
         pos_loss = torch.mean(
             (input_dict['x3']['decoder']['pos_noise'] - output_dict['x3']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
         )
+        
+        # 将两个损失相加
+        loss = feature_loss + pos_loss
+        
+        # 返回总损失和分量
+        return loss, feature_loss, pos_loss
     
     def x4_denoising_loss(self, input_dict, output_dict):
-        
         mask = ~input_dict['x4']['decoder']['virtual_node_mask']
-        if sum(mask) == 0:
-            return 0.0, 0.0, 0.0, 0.0
+        if mask.sum() == 0:
+            # 增加对空张量的处理，避免在.item()上调用
+            # 并且返回四个零张量以匹配函数签名
+            zero_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            return zero_loss, zero_loss.detach(), zero_loss.detach(), zero_loss.detach()
         
-        feature_loss = torch.mean(
-            (input_dict['x4']['decoder']['x_noise'] - output_dict['x4']['decoder']['denoiser']['x_out'].squeeze())[mask] ** 2.0
-        )
+        # --- 药效团类型损失 (离散, 使用交叉熵) ---
+        pred_pharm_logits = output_dict['x4']['decoder']['denoiser']['x_out']
+        true_pharm_labels = torch.argmax(input_dict['x4']['decoder']['true_pharm_types_t0'], dim=1)
         
+        # 只在非虚拟节点上计算损失
+        feature_loss = F.cross_entropy(pred_pharm_logits[mask], true_pharm_labels[mask])
+
+        # --- 连续特征损失 (MSE) ---
         pos_loss = torch.mean(
-                (input_dict['x4']['decoder']['pos_noise'] - output_dict['x4']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
+            (input_dict['x4']['decoder']['pos_noise'] - output_dict['x4']['decoder']['denoiser']['pos_out'])[mask] ** 2.0
         )
         
         direction_loss = torch.mean(
-                (input_dict['x4']['decoder']['direction_noise'] - output_dict['x4']['decoder']['denoiser']['direction_out'])[mask] ** 2.0
+            (input_dict['x4']['decoder']['direction_noise'] - output_dict['x4']['decoder']['denoiser']['direction_out'])[mask] ** 2.0
         )
         
         loss = feature_loss + pos_loss + direction_loss

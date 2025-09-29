@@ -1,6 +1,7 @@
 import resource
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
+
 #  **功能**: 提高系统允许打开的文件数量上限。
 #  **讲解**: 
 # 在数据加载时，尤其是使用多个工作进程 (`num_workers > 0`) 时，每个进程都可能打开数据文件。
@@ -40,6 +41,157 @@ from shepherd.new_datasets import HeteroDataset # NEW (adjust path as needed)
 from lightning_fabric.utilities.seed import seed_everything # 这么酷的名字
 
 import importlib
+
+import os
+import torch
+import rdkit
+from tqdm import tqdm
+import multiprocessing
+from functools import partial
+
+# --- 并行计算的工作函数 ---
+def process_batch(batch, atom_types_x1, bond_types_x1, max_node_types_x4, params):
+    """
+    处理一小批分子数据，并返回该批次中各种特征的计数结果。
+    这是并行化的核心部分。
+    """
+    # 初始化当前批次的计数器
+    batch_atom_counts = torch.zeros(len(atom_types_x1), dtype=torch.float)
+    batch_bond_counts = torch.zeros(len(bond_types_x1), dtype=torch.float)
+    batch_pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
+
+    # 辅助函数：将 RDKit 键类型对象映射到参数中使用的字符串表示形式
+    def get_bond_type_str(bond):
+        return str(bond.GetBondType())
+
+    # 导入 get_pharmacophores 函数
+    from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
+
+    # 迭代处理批次中的每个分子
+    for mol_block, _ in batch:
+        mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
+        if not mol:
+            continue
+
+        # --- 1. 统计原子和键的类型 (for x1) ---
+        if params['dataset']['compute_x1']:
+            if params['dataset']['x1']['add_virtual_node']:
+                batch_atom_counts[atom_types_x1.index(None)] += 1
+            
+            for atom in mol.GetAtoms(): # 遍历rdkit分子中的每个原子
+                symbol = atom.GetSymbol()
+                if symbol in atom_types_x1:
+                    batch_atom_counts[atom_types_x1.index(symbol)] += 1
+
+            for bond in mol.GetBonds():
+                bond_str = get_bond_type_str(bond)
+                if bond_str in bond_types_x1:
+                    batch_bond_counts[bond_types_x1.index(bond_str)] += 1
+
+        # --- 2. 统计药效团类型 (for x4) ---
+        if params['dataset']['compute_x4']:
+            if params['dataset']['x4']['add_virtual_node']:
+                batch_pharm_counts[0] += 1
+            
+            try: # 返回三个值（类型、位置和方向）
+                pharm_types, _, _ = get_pharmacophores(
+                    mol, 
+                    multi_vector=params['dataset']['x4']['multivectors'],  # 是否使用多向量
+                    check_access=params['dataset']['x4']['check_accessibility'] # 是否检查 accessibility
+                )
+                for p_type in (pharm_types + 1):
+                    if p_type < max_node_types_x4:
+                        batch_pharm_counts[p_type] += 1
+            except Exception:
+                # 忽略无法处理的分子
+                pass
+    
+    return batch_atom_counts, batch_bond_counts, batch_pharm_counts
+
+# --- 主函数，用于缓存、加载和并行计算 (修正版) ---
+def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached_marginals"):
+    """
+    计算或加载缓存的特征边际分布。
+    如果缓存文件存在，则直接加载；否则，并行计算特征，保存结果，然后返回。
+    """
+    # 确保缓存目录存在
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # 定义缓存文件路径
+    dataset_name = params['data']
+    atom_marginals_file = os.path.join(cache_dir, f"{dataset_name}_atom_marginals.pt")
+    bond_marginals_file = os.path.join(cache_dir, f"{dataset_name}_bond_marginals.pt")
+    pharm_marginals_file = os.path.join(cache_dir, f"{dataset_name}_pharm_marginals.pt")
+
+    # --- 1. 检查并加载缓存 ---
+    if os.path.exists(atom_marginals_file) and \
+       os.path.exists(bond_marginals_file) and \
+       os.path.exists(pharm_marginals_file):
+        
+        print(f"--- 从 '{cache_dir}' 加载已缓存的边际分布 ---")
+        atom_marginals_x1 = torch.load(atom_marginals_file, weights_only=True)
+        bond_marginals_x1 = torch.load(bond_marginals_file, weights_only=True)
+        pharm_marginals_x4 = torch.load(pharm_marginals_file, weights_only=True)
+        print("--- 边际分布加载完毕 ---\n")
+        return atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4
+
+    # --- 2. 如果没有缓存，则进行并行计算 ---
+    print("--- 未找到缓存，开始并行计算特征边际分布 ---")
+    
+    atom_types_x1 = params['dataset']['x1']['atom_types']
+    bond_types_x1 = params['dataset']['x1']['bond_types']
+    max_node_types_x4 = params['dataset']['x4']['max_node_types']
+
+    # 初始化总计数器
+    total_atom_counts = torch.zeros(len(atom_types_x1), dtype=torch.float)
+    total_bond_counts = torch.zeros(len(bond_types_x1), dtype=torch.float)
+    total_pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
+    
+    # 设置并行计算参数
+    num_processes = multiprocessing.cpu_count()  # 使用所有可用的CPU核心
+    
+    # 【修正点 1】定义一个合理的批次大小，并创建 batches 列表
+    # 这个值决定了每个“工作包裹”的大小
+    batch_size_for_processing = 1000 
+    batches = [molblocks_and_charges[i:i + batch_size_for_processing] for i in range(0, len(molblocks_and_charges), batch_size_for_processing)]
+    
+    # 创建一个偏函数 (partial function) 来固定 process_batch 的参数
+    worker_fn = partial(process_batch, 
+                        atom_types_x1=atom_types_x1, 
+                        bond_types_x1=bond_types_x1, 
+                        max_node_types_x4=max_node_types_x4,
+                        params=params)
+
+    # 【修正点 2】使用进程池并行处理我们创建好的 batches
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        # 使用 tqdm 显示进度条。imap 现在迭代的是 batches 列表。
+        # chunksize=1 表示每次给一个工作进程分配一个 batch，这对于已经分好块的任务是高效的。
+        results = list(tqdm(pool.imap(worker_fn, batches, chunksize=1), total=len(batches), desc="并行统计特征"))
+
+    # 汇总所有进程的结果
+    for res in results:
+        total_atom_counts += res[0]
+        total_bond_counts += res[1]
+        total_pharm_counts += res[2]
+
+    # --- 3. 计算边际分布 ---
+    atom_marginals_x1 = (total_atom_counts / total_atom_counts.sum()) if total_atom_counts.sum() > 0 else torch.ones_like(total_atom_counts) / len(total_atom_counts)
+    bond_marginals_x1 = (total_bond_counts / total_bond_counts.sum()) if total_bond_counts.sum() > 0 else torch.ones_like(total_bond_counts) / len(total_bond_counts)
+    pharm_marginals_x4 = (total_pharm_counts / total_pharm_counts.sum()) if total_pharm_counts.sum() > 0 else torch.ones_like(total_pharm_counts) / len(total_pharm_counts)
+    
+    print("\n--- 边际分布 计算完毕 ---")
+    print(f"Atom Marginals (x1): {atom_marginals_x1}")
+    print(f"Bond Marginals (x1): {bond_marginals_x1}")
+    print(f"Pharmacophore Marginals (x4): {pharm_marginals_x4}")
+    
+    # --- 4. 保存结果以备后用 ---
+    print(f"--- 将计算结果缓存到 '{cache_dir}' ---")
+    torch.save(atom_marginals_x1, atom_marginals_file)
+    torch.save(bond_marginals_x1, bond_marginals_file)
+    torch.save(pharm_marginals_x4, pharm_marginals_file)
+    print("---------------------------------------\n")
+
+    return atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4
 
 # PyTorch 的 DataLoader 在使用多进程时，需要在主进程和工作进程之间共享数据。
 # 默认的共享策略是 "file_descriptor"，它有时会因为文件描述符耗尽而出错（与上面的 resource 设置相关）。
@@ -81,24 +233,6 @@ if __name__ == '__main__':
 
         output_file = "GDB17"
 
-        try:
-            with open(output_file, 'w',  encoding='utf-8') as output:
-                if isinstance(molblocks_and_charges, (list, tuple)):
-                    for item in molblocks_and_charges:
-                        molblock_string = item[0]
-                        charges_list = item[1]
-                        output.write(str(molblock_string) + '\n')
-                        output.write('\n\n--- Charges ---\n')
-                        output.write(str(charges_list) + '\n')
-
-                else:
-                    output.write(str(molblocks_and_charges))
-
-            print("finish date file 1 save")
-
-        except IOError as e:
-            print("error happens in file writing")
-
         """
         # full dataset
         molblocks_and_charges = []
@@ -120,115 +254,22 @@ if __name__ == '__main__':
         # full dataset
         molblocks_and_charges = []
         for i in [0,1,2,3,4]:
-            with open(f'conformers/moses_aq/molblock_charges_{i}.pkl', 'rb') as f:
+            with open(f'../data/molblock_charges_{i}.pkl', 'rb') as f:
                 molblocks_and_charges_ = pickle.load(f) 
             molblocks_and_charges += molblocks_and_charges_
 
-        # sample data
+        # sample data data/molblock_charges_0.pkl
         # molblocks_and_charges = []
         # with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
         #     molblocks_and_charges = pickle.load(f)
 
         output_file = "MOSES_aq"
 
-        try:
-            with open(output_file, 'w',  encoding='utf-8') as output:
-                if isinstance(molblocks_and_charges,  (list, tuple)):
-                    for item in molblocks_and_charges:
-                        molblock_string = item[0]
-                        charges_list = item[1]
-                        output.write(str(molblock_string) + '\n')
-                        output.write('\n\n--- Charges ---\n')
-                        output.write(str(charges_list) + '\n')
-                else:
-                    output.write(str(molblocks_and_charges))
-
-            print(f"finish date : {params['data']} save")
-
-        except IOError as e:
-            print("error happens in file writing")
-
-
-    from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
-
-    print("初始化用于统计各类特征出现次数的计数器")
-
-    # Get feature type definitions from parameters file
-    atom_types_x1 = params['dataset']['x1']['atom_types']
-    bond_types_x1 = params['dataset']['x1']['bond_types']
-    max_node_types_x4 = params['dataset']['x4']['max_node_types']
-
-    # Initialize counters for each feature type
-    # We use torch.zeros as the final output should be a tensor
-    atom_counts = torch.zeros(len(atom_types_x1), dtype=torch.float)
-    bond_counts = torch.zeros(len(bond_types_x1), dtype=torch.float)
-    pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
-
-    # Helper to map RDKit bond type object to the string representation used in params
-    def get_bond_type_str(bond):
-        return str(bond.GetBondType())
-
-    # Iterate over the entire dataset to count occurrences
-    for mol_block, _ in tqdm(molblocks_and_charges, desc="Counting feature occurrences"):
-        # Create an RDKit molecule object from the MolBlock string
-        mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
-        if not mol:
-            print("Warning: Failed to create molecule from MolBlock. Skipping.")
-            continue
-        
-        # --- 1. Count Atom and Bond types (for x1) ---
-        if params['dataset']['compute_x1']:
-            # 虚拟节点
-            # Account for the virtual node, which has type `None` at index 0
-            if params['dataset']['x1']['add_virtual_node']:
-                atom_counts[atom_types_x1.index(None)] += 1
-            
-            # Count each atom
-            for atom in mol.GetAtoms():
-                symbol = atom.GetSymbol()
-                if symbol in atom_types_x1:
-                    atom_counts[atom_types_x1.index(symbol)] += 1
-
-            # Count each bond
-            for bond in mol.GetBonds():
-                bond_str = get_bond_type_str(bond)
-                if bond_str in bond_types_x1:
-                    bond_counts[bond_types_x1.index(bond_str)] += 1
-
-        # --- 2. Count Pharmacophore types (for x4) ---
-        if params['dataset']['compute_x4']:
-            # Account for the virtual node at index 0
-            if params['dataset']['x4']['add_virtual_node']:
-                pharm_counts[0] += 1
-            
-            try:
-                # Generate pharmacophores for the molecule
-                pharm_types, _, _ = get_pharmacophores(
-                    mol, 
-                    multi_vector=params['dataset']['x4']['multivectors'], 
-                    check_access=params['dataset']['x4']['check_accessibility']
-                )
-                # The dataset code adds 1 to each pharmacophore type to make space for the virtual node at index 0.
-                # We must replicate this logic here for accurate counting.
-                for p_type in (pharm_types + 1):
-                    if p_type < max_node_types_x4:
-                        pharm_counts[p_type] += 1
-            except Exception as e:
-                # This can happen for molecules that don't have RDKit's feature definitions
-                print(f"Warning: Could not get pharmacophores for a molecule. Skipping. Error: {e}")
-
-    # --- 3. Normalize counts to get probabilities (marginals) ---
-
-    # Handle the case where a feature type might have zero counts to avoid division by zero
-    atom_marginals_x1 = (atom_counts / atom_counts.sum()) if atom_counts.sum() > 0 else torch.ones_like(atom_counts) / len(atom_counts)
-    bond_marginals_x1 = (bond_counts / bond_counts.sum()) if bond_counts.sum() > 0 else torch.ones_like(bond_counts) / len(bond_counts)
-    pharm_marginals_x4 = (pharm_counts / pharm_counts.sum()) if pharm_counts.sum() > 0 else torch.ones_like(pharm_counts) / len(pharm_counts)
-
-    print("\n--- 边际分布 计算完毕 ---")
-    print(f"Atom Marginals (x1): {atom_marginals_x1}")
-    print(f"Bond Marginals (x1): {bond_marginals_x1}")
-    print(f"Pharmacophore Marginals (x4): {pharm_marginals_x4}")
-    print("---------------------------------------\n")
+    #  pharmacophore 用于计算分子的药效团特征
+    atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4 = compute_and_cache_marginals(
+        params=params, 
+        molblocks_and_charges=molblocks_and_charges
+    )
 
     dataset = HeteroDataset(
         molblocks_and_charges = molblocks_and_charges, 

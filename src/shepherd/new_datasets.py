@@ -1011,8 +1011,8 @@ class HeteroDataset(torch_geometric.data.Dataset):
         data['direction_noise'] = torch.from_numpy(direction_noise.copy()).float()  # 方向噪声
 
         # 将噪声应用到连续特征上
-        data['pos_forward_noised'] = data['pos'] + data['pos_noise'] * sigma_dash_t  # 加噪后的位置
-        data['direction_forward_noised'] = data['direction'] + data['direction_noise'] * sigma_dash_t  # 加噪后的方向
+        data['pos_forward_noised'] = alpha_dash_t * data['pos'] + data['pos_noise'] * sigma_dash_t  # 加噪后的位置
+        data['direction_forward_noised'] = alpha_dash_t * data['direction'] + data['direction_noise'] * sigma_dash_t  # 加噪后的方向
         
         # 离散特征（药效团类型）的噪声处理
         device = data['x'].device  # 获取张量设备
@@ -1190,7 +1190,7 @@ class HeteroDataset(torch_geometric.data.Dataset):
                 virtual_node_pos = None
             
             # 生成x2模态的训练数据（分子表面点云）
-            x2_data, x2_pos, x2_virtual_node_mask = self.get_x2_data(
+            x2_data, _, _ = self.get_x2_data(
                 radii,                    # 原子范德华半径
                 atom_centers,             # 原子中心坐标
                 self.num_points_x2,       # 表面点数量

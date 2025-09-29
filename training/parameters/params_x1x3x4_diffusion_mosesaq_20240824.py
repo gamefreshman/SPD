@@ -29,7 +29,7 @@ params = {
     'x1_formal_charge_diffusion': diffuse_formal_charges, # 明确禁用形式电荷扩散
     
     # 显式扩散变量
-    'explicit_diffusion_variables': ['x1', 'x3', 'x4'],
+    'explicit_diffusion_variables': ['x1', 'x4'],
     
     'exclude_variables_from_decoder_heterogeneous_graph': [], 
     # if any variables (besides x1) get recentered in the decoder/denoiser, exclude them from any heterogeneous graph (which requires a common reference frame).

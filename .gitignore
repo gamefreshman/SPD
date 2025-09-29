@@ -1,4 +1,7 @@
 # ssh github
+*pkl*
+*pt*
+*zip*
 ssh/
 evaluation/core/log/*
 
@@ -539,3 +542,5 @@ cython_debug/
 training/jobs/x1x3x4_diffusion_mosesaq_20240824/last_2025_08_19_22_02.ckpt
 src/score/shepherd_score/evaluations/pdbs/1iep.pdbqt
 evaluation/core/log/1.txt
+data/molblock_charges_0.pkl
+training/MOSES_aq
