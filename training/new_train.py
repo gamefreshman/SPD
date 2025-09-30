@@ -327,16 +327,16 @@ if __name__ == '__main__':
         
     )
     
-    # debug : 非并行
+    # debug : 非并行  multiprocessing提供的是进程启动方式，spawn安全，不共享内存  ['training']['multiprocessing_spawn']启动选择
     if params['training']['multiprocessing_spawn']:
         train_loader = torch_geometric.loader.DataLoader(
             dataset = dataset,
-            num_workers = params['training']['num_workers'],            
+            num_workers = params['training']['num_workers'],     # 多进程       
             batch_size = params['training']['batch_size'],
             shuffle = True,
             multiprocessing_context = multiprocessing.get_context("spawn"),
             worker_init_fn=set_worker_sharing_strategy,
-            persistent_workers=True,  # 添加这一行
+            persistent_workers=True,  # 添加这一行 减少冷启动开销
         )
     else:
         train_loader = torch_geometric.loader.DataLoader(
