@@ -152,7 +152,7 @@ def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached
     
     # 【修正点 1】定义一个合理的批次大小，并创建 batches 列表
     # 这个值决定了每个“工作包裹”的大小
-    batch_size_for_processing = 1000 
+    batch_size_for_processing = 1000   # 一直写死吗
     batches = [molblocks_and_charges[i:i + batch_size_for_processing] for i in range(0, len(molblocks_and_charges), batch_size_for_processing)]
     
     # 创建一个偏函数 (partial function) 来固定 process_batch 的参数
@@ -355,7 +355,7 @@ if __name__ == '__main__':
     try: os.mkdir(output_dir)
     except: pass
     
-    checkpoint_callback = ModelCheckpoint(
+    checkpoint_callback = ModelCheckpoint( # 保存训练过程中模型
         save_top_k = 0,
         save_last = True,
         monitor="train_loss",
@@ -364,7 +364,7 @@ if __name__ == '__main__':
         filename="best-{step:09d}",
         every_n_train_steps = params['training']['log_every_n_steps'],
     )
-    csv_logger = CSVLogger(
+    csv_logger = CSVLogger( # 
         save_dir = output_dir,
         name = 'csv_logger',
     )
@@ -376,8 +376,8 @@ if __name__ == '__main__':
         log_model="all", 
     )
     
-    gradient_clip_val = params['training']['gradient_clip_val']
-    accumulate_grad_batches = params['training']['accumulate_grad_batches']
+    gradient_clip_val = params['training']['gradient_clip_val'] # 梯度裁剪阈值
+    accumulate_grad_batches = params['training']['accumulate_grad_batches'] # 累积多少个batch才更新
     
     from pytorch_lightning.strategies.ddp import DDPStrategy
     
@@ -386,31 +386,32 @@ if __name__ == '__main__':
     
     trainer = pl.Trainer(
         callbacks = [checkpoint_callback],
-        logger = [csv_logger, wandb_logger],
+        logger = [csv_logger, wandb_logger], # 可以挂多个
         
         default_root_dir = output_dir,
         accelerator = "gpu" if (params['training']['num_gpus'] >= 1 and cuda_available) else 'cpu', 
         
         max_epochs = 10000,
         
-        gradient_clip_val = gradient_clip_val,
-        accumulate_grad_batches = accumulate_grad_batches,
+        gradient_clip_val = gradient_clip_val, # 在 optimizer.step() 前自动应用裁剪，防止梯度爆炸
+        accumulate_grad_batches = accumulate_grad_batches, # 梯度累积步数
         
-        log_every_n_steps = params['training']['log_every_n_steps'], # 临时调整    
+        log_every_n_steps = params['training']['log_every_n_steps'], # 临时调整    多少step输出一次
             
         reload_dataloaders_every_n_epochs = 1, # re-shuffle training data after each epoch
         
-        devices = num_gpus_to_use  if cuda_available else "auto",
+        devices = num_gpus_to_use  if cuda_available else "auto", # 
         
         strategy = DDPStrategy(find_unused_parameters=True) if (params['training']['num_gpus'] > 1 and cuda_available) else 'auto',
-        precision = 32,
+        # DDP：单机多卡分布式训练  find_unused_parameters=True增加开销
+        precision = 32, 
         
-        detect_anomaly = True,
+        detect_anomaly = True, # 出现异常时，会抛出带栈信息的错误  调试使用
     )
     
     model_pl = LightningModule(params)
 
-    wandb_logger.watch(model_pl, log="all", log_freq=500)
+    wandb_logger.watch(model_pl, log="all", log_freq=500) # wandb 开始跟踪模型参数和梯度
 
 
     print(sum(p.numel() for p in model_pl.parameters() if p.requires_grad))
@@ -420,7 +421,7 @@ if __name__ == '__main__':
     ckpt_path = f"{output_dir}/last.ckpt"
     ckpt_path = ckpt_path if (os.path.exists(ckpt_path) & resume_from_checkpoint) else None
     
-    # avoid overwriting previous "last.ckpt"
+    # avoid overwriting previous "last.ckpt"    trainer.global_rank保证只有主进程进行拷贝
     if (ckpt_path is not None) and (trainer.global_rank == 0):
         date = datetime.datetime.now()
         timestamp = str(date.year) + '_' + str(date.month).zfill(2) + '_' + str(date.day).zfill(2) + '_' + str(date.hour).zfill(2) + '_' + str(date.minute).zfill(2)

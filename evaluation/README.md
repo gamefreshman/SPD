@@ -34,7 +34,7 @@ evaluation/
 ├── run_variable_tracking.py               # 变量追踪主程序
 ├── conditional_generation_evaluation.py   # 条件生成和评估核心模块
 ├── evaluation.py                          # 增强版综合评估系统
-├── simplified_variable_tracker.py         # 简化变量追踪器
+├── simplified_variable_tracker.py         # 简化变量追踪器 1
 ├── complete_variable_tracking_summary.json # 完整变量追踪汇总数据
 ├── final_complete_tracking_summary.json   # 最终完整追踪数据
 └── detailed_tracking_results/             # 详细追踪结果目录
