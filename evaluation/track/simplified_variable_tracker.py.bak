@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+简化的变量追踪器
+
+专门用于追踪推理过程中5个关键变量的实际数值：
+1. x1_x_out
+2. x1_bond_edge_x_out  
+3. x4_pos_out
+4. x4_direction_out
+5. x4_x_out
+
+当检测到NaN值时生成警告信息，保持原始数据精度。
+"""
+
+import torch
+import numpy as np
+import json
+import time
+import logging
+from typing import Dict, List, Any, Optional
+from copy import deepcopy
+
+logger = logging.getLogger(__name__)
+
+class SimplifiedVariableTracker:
+    """
+    简化的变量追踪器类
+    
+    专门用于追踪5个关键变量的实际数值：
+    1. x1_x_out
+    2. x1_bond_edge_x_out  
+    3. x4_pos_out
+    4. x4_direction_out
+    5. x4_x_out
+    
+    当检测到NaN值时生成警告信息，保持原始数据精度。
+    """
+    
+    def __init__(self, model, device: torch.device):
+        """
+        初始化简化追踪器
+        
+        Args:
+            model: 模型实例
+            device: 计算设备
+        """
+        self.model = model
+        self.device = device
+        self.target_variables = [
+            'x1_x_out',
+            'x1_bond_edge_x_out', 
+            'x4_pos_out',
+            'x4_direction_out',
+            'x4_x_out'
+        ]
+        self.tracking_data = {
+            'metadata': {},
+            'variables': {var: [] for var in self.target_variables},
+            'warnings': [],
+            'step_count': 0
+        }
+        self.hooks = []
+        
+    def track_variables_in_step(self, step_data: Dict, step_number: int) -> Dict:
+        """
+        追踪单步中的变量数据
+        
+        Args:
+            step_data: 步骤数据
+            step_number: 步骤编号
+            
+        Returns:
+            追踪结果字典
+        """
+        step_result = {
+            'step': step_number,
+            'timestamp': time.time(),
+            'variables_found': {},
+            'warnings': []
+        }
+        
+        for var_name in self.target_variables:
+            var_data = self._extract_variable_data(step_data, var_name)
+            step_result['variables_found'][var_name] = var_data
+            
+            # 检查NaN值
+            nan_warning = self._check_nan_values(var_data, var_name, step_number)
+            if nan_warning:
+                step_result['warnings'].append(nan_warning)
+                self.tracking_data['warnings'].append(nan_warning)
+        
+        return step_result
+        
+    def _extract_variable_data(self, step_data: Dict, var_name: str) -> Dict:
+        """
+        从步骤数据中提取指定变量的数据
+        
+        Args:
+            step_data: 步骤数据
+            var_name: 变量名
+            
+        Returns:
+            变量数据字典
+        """
+        result = {
+            'found': False,
+            'data': None,
+            'shape': None,
+            'dtype': None
+        }
+        
+        # 在step_data中搜索变量
+        var_value = self._search_variable_in_data(step_data, var_name)
+        
+        if var_value is not None:
+            result['found'] = True
+            
+            # 转换为Python原生类型以确保JSON序列化
+            if isinstance(var_value, torch.Tensor):
+                result['data'] = var_value.detach().cpu().numpy().tolist()
+                result['shape'] = list(var_value.shape)
+                result['dtype'] = str(var_value.dtype)
+            elif isinstance(var_value, np.ndarray):
+                result['data'] = var_value.tolist()
+                result['shape'] = list(var_value.shape)
+                result['dtype'] = str(var_value.dtype)
+            else:
+                result['data'] = var_value
+                result['shape'] = 'scalar'
+                result['dtype'] = type(var_value).__name__
+        
+        return result
+    
+    def _search_variable_in_data(self, data: Any, var_name: str) -> Any:
+        """
+        在数据结构中递归搜索指定变量
+        
+        Args:
+            data: 数据结构
+            var_name: 变量名
+            
+        Returns:
+            找到的变量值，未找到返回None
+        """
+        if isinstance(data, dict):
+            # 直接匹配键名
+            if var_name in data:
+                return data[var_name]
+            
+            # 递归搜索所有值
+            for key, value in data.items():
+                if var_name in key.lower():
+                    return value
+                result = self._search_variable_in_data(value, var_name)
+                if result is not None:
+                    return result
+                    
+        elif isinstance(data, (list, tuple)):
+            for item in data:
+                result = self._search_variable_in_data(item, var_name)
+                if result is not None:
+                    return result
+                    
+        elif hasattr(data, '__dict__'):
+            return self._search_variable_in_data(data.__dict__, var_name)
+            
+        return None
+    
+    def _check_nan_values(self, var_data: Dict, var_name: str, step_number: int) -> Optional[Dict]:
+        """
+        检查变量数据中的NaN值
+        
+        Args:
+            var_data: 变量数据
+            var_name: 变量名
+            step_number: 步骤编号
+            
+        Returns:
+            如果发现NaN值，返回警告字典；否则返回None
+        """
+        if not var_data['found'] or var_data['data'] is None:
+            return None
+            
+        try:
+            data = var_data['data']
+            if isinstance(data, list):
+                # 递归检查嵌套列表中的NaN值
+                def has_nan(lst):
+                    if isinstance(lst, list):
+                        return any(has_nan(item) for item in lst)
+                    else:
+                        return isinstance(lst, float) and (lst != lst)  # NaN检查
+                
+                if has_nan(data):
+                    return {
+                        'step': step_number,
+                        'variable': var_name,
+                        'warning_type': 'nan_detected',
+                        'message': f'Variable {var_name} contains NaN values at step {step_number}',
+                        'timestamp': time.time()
+                    }
+        except Exception as e:
+            logger.warning(f"Error checking NaN values for {var_name}: {e}")
+            
+        return None
+    
+    def set_metadata(self, metadata: Dict):
+        """
+        设置追踪元数据
+        
+        Args:
+            metadata: 元数据字典
+        """
+        self.tracking_data['metadata'].update(metadata)
+    
+    def get_tracking_summary(self) -> Dict:
+        """
+        获取追踪摘要
+        
+        Returns:
+            追踪摘要字典
+        """
+        summary = {
+            'total_steps': self.tracking_data['step_count'],
+            'total_warnings': len(self.tracking_data['warnings']),
+            'variables_stats': {}
+        }
+        
+        for var_name in self.target_variables:
+            var_data = self.tracking_data['variables'][var_name]
+            found_count = sum(1 for step in var_data if step.get('variables_found', {}).get(var_name, {}).get('found', False))
+            summary['variables_stats'][var_name] = {
+                'found_count': found_count,
+                'found_rate': found_count / max(1, self.tracking_data['step_count'])
+            }
+        
+        return summary
+    
+    def save_tracking_data(self, filepath: str) -> bool:
+        """
+        保存追踪数据到JSON文件
+        
+        Args:
+            filepath: 文件路径
+            
+        Returns:
+            保存是否成功
+        """
+        try:
+            # 准备数据进行序列化
+            save_data = self._prepare_data_for_save(self.tracking_data)
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"追踪数据已保存到: {filepath}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"保存追踪数据失败: {e}")
+            return False
+    
+    def _prepare_data_for_save(self, data: Any) -> Any:
+        """
+        准备数据进行JSON序列化
+        
+        Args:
+            data: 原始数据
+            
+        Returns:
+            可序列化的数据
+        """
+        if isinstance(data, dict):
+            return {key: self._prepare_data_for_save(value) for key, value in data.items()}
+        elif isinstance(data, list):
+            return [self._prepare_data_for_save(item) for item in data]
+        elif isinstance(data, tuple):
+            return [self._prepare_data_for_save(item) for item in data]
+        elif isinstance(data, np.ndarray):
+            return data.tolist()
+        elif isinstance(data, torch.Tensor):
+            return data.detach().cpu().numpy().tolist()
+        elif isinstance(data, np.bool_):
+            return bool(data)
+        elif isinstance(data, (np.int8, np.int16, np.int32, np.int64)):
+            return int(data)
+        elif isinstance(data, (np.float16, np.float32, np.float64)):
+            return float(data)
+        elif isinstance(data, (int, float, bool, str, type(None))):
+            return data
+        else:
+            try:
+                return str(data)
+            except:
+                return "<non-serializable>"
+    
+    def register_hooks(self):
+        """
+        注册前向钩子以捕获推理过程中的变量
+        注意：对于ScriptModules，钩子注册会失败，需要使用其他方法
+        """
+        try:
+            # 检查模型是否为ScriptModule
+            if hasattr(self.model, '_c') or 'ScriptModule' in str(type(self.model)):
+                logger.warning("检测到ScriptModule，无法注册钩子，将使用替代方法")
+                return
+            
+            def create_hook(name):
+                def hook_fn(module, input, output):
+                    # 捕获模块的输出
+                    step_data = {
+                        'module_name': name,
+                        'input': input,
+                        'output': output
+                    }
+                    
+                    # 追踪当前步骤的变量
+                    step_result = self.track_variables_in_step(step_data, self.tracking_data['step_count'])
+                    
+                    # 保存步骤结果
+                    for var_name in self.target_variables:
+                        if step_result['variables_found'][var_name]['found']:
+                            self.tracking_data['variables'][var_name].append({
+                                'step': self.tracking_data['step_count'],
+                                'data': step_result['variables_found'][var_name]
+                            })
+                    
+                    self.tracking_data['step_count'] += 1
+                    
+                return hook_fn
+            
+            # 为模型的关键模块注册钩子
+            if hasattr(self.model, 'model'):
+                for name, module in self.model.model.named_modules():
+                    if any(target in name.lower() for target in ['x1', 'x4', 'out']):
+                        hook = module.register_forward_hook(create_hook(name))
+                        self.hooks.append(hook)
+            
+            logger.info(f"已注册 {len(self.hooks)} 个钩子")
+            
+        except Exception as e:
+            logger.warning(f"注册钩子失败: {e}，将使用替代追踪方法")
+            # 不抛出异常，继续执行
+    
+    def remove_hooks(self):
+        """
+        移除所有注册的钩子
+        """
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+    
+    def track_inference_step(self, step_number: int, model_output: Any) -> Dict:
+        """
+        追踪单个推理步骤
+        
+        Args:
+            step_number: 步骤编号
+            model_output: 模型输出
+            
+        Returns:
+            步骤追踪结果
+        """
+        step_result = self.track_variables_in_step(model_output, step_number)
+        
+        # 保存步骤结果到追踪数据
+        for var_name in self.target_variables:
+            if step_result['variables_found'][var_name]['found']:
+                self.tracking_data['variables'][var_name].append({
+                    'step': step_number,
+                    'data': step_result['variables_found'][var_name]
+                })
+        
+        self.tracking_data['step_count'] = max(self.tracking_data['step_count'], step_number + 1)
+        
+        return step_result
