@@ -1,3 +1,4 @@
+from gc import callbacks
 import resource
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
@@ -7,6 +8,12 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
 # 在数据加载时，尤其是使用多个工作进程 (`num_workers > 0`) 时，每个进程都可能打开数据文件。
 # 操作系统对单个进程能打开的文件描述符数量有限制。
 # 这几行代码获取当前的限制 (`getrlimit`)，然后将其下限提高到 2048 (`setrlimit`)，以防止因打开文件过多而导致程序崩溃。
+
+# 过滤pydantic警告
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*UnsupportedFieldAttributeWarning.*")
+warnings.filterwarnings("ignore", message=".*'repr' attribute.*")
+warnings.filterwarnings("ignore", message=".*'frozen' attribute.*")
 
 import rdkit
 import numpy as np
@@ -37,6 +44,12 @@ from shepherd.lightning_module import LightningModule
 # 数据集类，负责加载和预处理分子数据。
 # from shepherd.datasets import HeteroDataset  # OLD
 from shepherd.new_datasets import HeteroDataset # NEW (adjust path as needed)
+
+# DPO相关导入
+from shepherd.dpo_dataset import DPODataset
+from shepherd.mixed_dataloader import create_mixed_dataloader
+from shepherd.callbacks import OnlineSamplingCallback, DPOMetricsCallback
+from shepherd.dpo_utils import OnlineSampler, ShepherdScorer
 
 from lightning_fabric.utilities.seed import seed_everything # 这么酷的名字
 
@@ -327,26 +340,55 @@ if __name__ == '__main__':
         
     )
     
-    # debug : 非并行  multiprocessing提供的是进程启动方式，spawn安全，不共享内存  ['training']['multiprocessing_spawn']启动选择
-    if params['training']['multiprocessing_spawn']:
-        train_loader = torch_geometric.loader.DataLoader(
-            dataset = dataset,
-            num_workers = params['training']['num_workers'],     # 多进程       
-            batch_size = params['training']['batch_size'],
-            shuffle = True,
-            multiprocessing_context = multiprocessing.get_context("spawn"),
+    # 创建DPO数据集（如果启用）
+    dpo_dataset = None
+    if params['training'].get('enable_dpo', False):
+        print("\n初始化DPO数据集...")
+        dpo_dataset = DPODataset(
+            preference_pairs=[],  # 初始为空，会在第一个epoch后填充
+            base_dataset=dataset,
+            noise_schedule_dict=params['noise_schedules'],
+            params=params,
+        )
+    
+    # 创建DataLoader（标准或混合模式）
+    if params['training'].get('enable_dpo', False) and dpo_dataset is not None:
+        print("创建混合DataLoader（标准 + DPO）...")
+        # 混合DataLoader
+        train_loader = create_mixed_dataloader(
+            standard_dataset=dataset,
+            dpo_dataset=dpo_dataset,
+            batch_size=params['training']['batch_size'],
+            num_workers=params['training']['num_workers'],
+            dpo_ratio=params['training'].get('dpo_batch_ratio', 0.3),
+            shuffle=True,
+            params=params,
+            multiprocessing_context=multiprocessing.get_context("spawn") if params['training']['multiprocessing_spawn'] else None,
             worker_init_fn=set_worker_sharing_strategy,
-            persistent_workers=True,  # 添加这一行 减少冷启动开销
+            persistent_workers=True,
         )
     else:
-        train_loader = torch_geometric.loader.DataLoader(
-            dataset = dataset,
-            num_workers = params['training']['num_workers'],
-            batch_size = params['training']['batch_size'],
-            shuffle = True,
-            worker_init_fn=set_worker_sharing_strategy,
-            persistent_workers=True,  # 添加这一行
-        )
+        print("创建标准DataLoader...")
+        # 标准DataLoader
+        if params['training']['multiprocessing_spawn']:
+            train_loader = torch_geometric.loader.DataLoader(
+                dataset = dataset,
+                num_workers = params['training']['num_workers'],     # 多进程       
+                batch_size = params['training']['batch_size'],
+                shuffle = True,
+                multiprocessing_context = multiprocessing.get_context("spawn"),
+                worker_init_fn=set_worker_sharing_strategy,
+                persistent_workers=True,
+            )
+        else:
+            train_loader = torch_geometric.loader.DataLoader(
+                dataset = dataset,
+                num_workers = params['training']['num_workers'],
+                batch_size = params['training']['batch_size'],
+                shuffle = True,
+                worker_init_fn=set_worker_sharing_strategy,
+                persistent_workers=True,
+            )
     
     
     output_dir = f"jobs/{params['training']['output_dir']}"
@@ -383,9 +425,24 @@ if __name__ == '__main__':
     
     cuda_available = torch.cuda.is_available()
     num_gpus_to_use = torch.cuda.device_count()
+
+    # 准备回调列表
+    callbacks = [checkpoint_callback]
+    
+    # 添加DPO回调
+    if params['training'].get('enable_dpo', False):
+        print("\n添加DPO在线采样回调...")
+        sampling_callback = OnlineSamplingCallback(
+            params=params,
+            dataset=dataset, 
+            molblocks_and_charges=molblocks_and_charges
+        )
+        dpo_metrics_callback = DPOMetricsCallback()
+        callbacks.extend([sampling_callback, dpo_metrics_callback])
+        print("DPO回调已添加")
     
     trainer = pl.Trainer(
-        callbacks = [checkpoint_callback],
+        callbacks = callbacks,
         logger = [csv_logger, wandb_logger], # 可以挂多个
         
         default_root_dir = output_dir,
@@ -419,7 +476,44 @@ if __name__ == '__main__':
     resume_from_checkpoint = True
 
     ckpt_path = f"{output_dir}/last.ckpt"
-    ckpt_path = ckpt_path if (os.path.exists(ckpt_path) & resume_from_checkpoint) else None
+    
+    # 如果启用DPO且模型结构变化，处理checkpoint加载
+    if params['training'].get('enable_dpo', False):
+        if os.path.exists(ckpt_path) and resume_from_checkpoint:
+            # 检查是否要从标准训练的checkpoint迁移到DPO训练
+            load_weights_only = params['training'].get('dpo_load_weights_only', True)
+            
+            if load_weights_only:
+                print("\n✅ DPO模式：加载旧checkpoint的模型权重（不加载optimizer状态）")
+                try:
+                    # 只加载模型权重
+                    checkpoint = torch.load(ckpt_path, map_location='cpu')
+                    model_state_dict = checkpoint['state_dict']
+                    
+                    # 过滤掉ref_model的权重（如果有的话）
+                    model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
+                    
+                    # 加载到model_pl.model
+                    model_pl.model.load_state_dict(model_weights, strict=False)
+                    
+                    # 同步权重到ref_model
+                    if hasattr(model_pl, 'ref_model'):
+                        model_pl.ref_model.load_state_dict(model_weights, strict=False)
+                    
+                    print(f"   已从 {ckpt_path} 加载模型权重")
+                    ckpt_path = None  # 不使用完整checkpoint恢复
+                except Exception as e:
+                    print(f"   ⚠️ 加载权重失败: {e}")
+                    print("   将从头开始训练")
+                    ckpt_path = None
+            else:
+                print("\n⚠️  DPO模式：尝试完整恢复checkpoint（可能因optimizer不匹配而失败）")
+                # 保持ckpt_path不变，让trainer尝试完整加载
+        else:
+            print("\n📝 DPO模式：未找到checkpoint，从头开始训练")
+            ckpt_path = None
+    else:
+        ckpt_path = ckpt_path if (os.path.exists(ckpt_path) & resume_from_checkpoint) else None
     
     # avoid overwriting previous "last.ckpt"    trainer.global_rank保证只有主进程进行拷贝
     if (ckpt_path is not None) and (trainer.global_rank == 0):

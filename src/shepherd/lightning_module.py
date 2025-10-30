@@ -15,9 +15,7 @@ class LightningModule(pl.LightningModule):
     
     def __init__(self, params):
         super().__init__()
-        
         self.save_hyperparameters()
-        
         self.params = params
         
         self.model = Model(params)
@@ -30,6 +28,30 @@ class LightningModule(pl.LightningModule):
         self.lr = params['training']['lr']
         self.min_lr = params['training']['min_lr']
         self.lr_steps = params['training']['lr_steps']
+
+        # DPO 参考模型 初始化
+        self.enable_dpo = params['training'].get('enable_dpo', False)
+        if self.enable_dpo:
+            self.ref_model = Model(params)
+            self.ref_model.eval()
+            for param in self.ref_model.parameters():
+                param.requires_grad = False
+
+        # beta_dpo，dpo 的 模型与参考模型的偏离度
+        # dpo_max_weight，dpo 的 DPO损失与标准损失的混合比例的最高权重
+        self.beta_dpo = params['training'].get('beta_dpo', 0.2)
+        self.dpo_ramp_up_epochs = params['training'].get('dpo_ramp_up_epochs', 5)
+        self.dpo_max_weight = params['training'].get('dpo_max_weight', 0.5)
+        
+    def get_dpo_weight(self):
+        if not self.enable_dpo:
+            return 0.0
+        
+        epoch = self.current_epoch
+        if epoch < self.dpo_ramp_up_epochs:
+            return  (epoch + 1) * self.dpo_max_weight / self.dpo_ramp_up_epochs
+        else:
+            return self.dpo_max_weight
 
     def load_state_dict(self, state_dict, strict: bool = True):
         """
@@ -204,59 +226,100 @@ class LightningModule(pl.LightningModule):
     
     
     def training_step(self, train_batch, batch_idx):
-        data = train_batch
-        batch_size = data.molecule_id.shape[0]
-        
-        input_dict = self.get_training_input_dict(data)
-        
-        output_dict = self.forward_training(input_dict)
-        
-        loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        if self.train_x1_denoising:
-            loss_x1, feature_loss_x1, pos_loss_x1, bond_loss_x1 = self.x1_denoising_loss(input_dict, output_dict)
-            loss = loss + loss_x1
+        if isinstance(train_batch, dict) and 'batch_type' in train_batch:
             
-            batch_size_nodes = (~input_dict['x1']['decoder']['virtual_node_mask']).sum().item()
-            batch_size_edges = input_dict['x1']['decoder']['bond_edge_x_noise'].shape[0]
-            
-            self.log('train_loss_x1', loss_x1, batch_size = batch_size_nodes)
-            self.log('train_pos_loss_x1', pos_loss_x1, batch_size = batch_size_nodes)
-            self.log('train_feature_loss_x1', feature_loss_x1, batch_size = batch_size_nodes)
-            self.log('train_bond_loss_x1', bond_loss_x1, batch_size = batch_size_edges)
-            
-        if self.train_x2_denoising:
-            loss_x2 = self.x2_denoising_loss(input_dict, output_dict)
-            loss = loss + loss_x2
-            
-            batch_size_nodes = (~input_dict['x2']['decoder']['virtual_node_mask']).sum().item()
-            
-            self.log('train_loss_x2', loss_x2, batch_size = batch_size_nodes)
-            
-        if self.train_x3_denoising:
-            loss_x3, feature_loss_x3, pos_loss_x3 = self.x3_denoising_loss(input_dict, output_dict)
-            loss = loss + loss_x3
-            
-            batch_size_nodes = (~input_dict['x3']['decoder']['virtual_node_mask']).sum().item()
-            
-            self.log('train_loss_x3', loss_x3, batch_size = batch_size_nodes)
-            self.log('train_pos_loss_x3', pos_loss_x3, batch_size = batch_size_nodes)
-            self.log('train_feature_loss_x3', feature_loss_x3, batch_size = batch_size_nodes)
+            batch_type = train_batch['batch_type']
         
-        if self.train_x4_denoising:
-            loss_x4, feature_loss_x4, pos_loss_x4, direction_loss_x4 = self.x4_denoising_loss(input_dict, output_dict)
-            loss = loss + loss_x4
+        else:
             
-            batch_size_nodes = (~input_dict['x4']['decoder']['virtual_node_mask']).sum().item()
+            batch_type = 'standard'
+
+        if batch_type == 'standard':
+
+            data = train_batch
+
+            batch_size = data.molecule_id.shape[0]
             
-            self.log('train_loss_x4', loss_x4, batch_size = batch_size_nodes)
-            self.log('train_pos_loss_x4', pos_loss_x4, batch_size = batch_size_nodes)
-            self.log('train_direction_loss_x4', direction_loss_x4, batch_size = batch_size_nodes)
-            self.log('train_feature_loss_x4', feature_loss_x4, batch_size = batch_size_nodes)
-        
-        self.log('train_loss', loss, batch_size = batch_size)
-        return loss
-    
+            input_dict = self.get_training_input_dict(data)
+            
+            output_dict = self.forward_training(input_dict)
+            
+            loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+            if self.train_x1_denoising:
+                loss_x1, feature_loss_x1, pos_loss_x1, bond_loss_x1 = self.x1_denoising_loss(input_dict, output_dict)
+                loss = loss + loss_x1
+                
+                batch_size_nodes = (~input_dict['x1']['decoder']['virtual_node_mask']).sum().item()
+                batch_size_edges = input_dict['x1']['decoder']['bond_edge_x_noise'].shape[0]
+                
+                self.log('train_loss_x1', loss_x1, batch_size = batch_size_nodes)
+                self.log('train_pos_loss_x1', pos_loss_x1, batch_size = batch_size_nodes)
+                self.log('train_feature_loss_x1', feature_loss_x1, batch_size = batch_size_nodes)
+                self.log('train_bond_loss_x1', bond_loss_x1, batch_size = batch_size_edges)
+                
+            if self.train_x2_denoising:
+                loss_x2 = self.x2_denoising_loss(input_dict, output_dict)
+                loss = loss + loss_x2
+                
+                batch_size_nodes = (~input_dict['x2']['decoder']['virtual_node_mask']).sum().item()
+                
+                self.log('train_loss_x2', loss_x2, batch_size = batch_size_nodes)
+                
+            if self.train_x3_denoising:
+                loss_x3, feature_loss_x3, pos_loss_x3 = self.x3_denoising_loss(input_dict, output_dict)
+                loss = loss + loss_x3
+                
+                batch_size_nodes = (~input_dict['x3']['decoder']['virtual_node_mask']).sum().item()
+                
+                self.log('train_loss_x3', loss_x3, batch_size = batch_size_nodes)
+                self.log('train_pos_loss_x3', pos_loss_x3, batch_size = batch_size_nodes)
+                self.log('train_feature_loss_x3', feature_loss_x3, batch_size = batch_size_nodes)
+            
+            if self.train_x4_denoising:
+                loss_x4, feature_loss_x4, pos_loss_x4, direction_loss_x4 = self.x4_denoising_loss(input_dict, output_dict)
+                loss = loss + loss_x4
+                
+                batch_size_nodes = (~input_dict['x4']['decoder']['virtual_node_mask']).sum().item()
+                
+                self.log('train_loss_x4', loss_x4, batch_size = batch_size_nodes)
+                self.log('train_pos_loss_x4', pos_loss_x4, batch_size = batch_size_nodes)
+                self.log('train_direction_loss_x4', direction_loss_x4, batch_size = batch_size_nodes)
+                self.log('train_feature_loss_x4', feature_loss_x4, batch_size = batch_size_nodes)
+            
+            self.log('train_loss', loss, batch_size = batch_size)
+
+            return loss
+
+        elif batch_type == 'dpo':
+            
+            batch_winner = train_batch['winner']
+            batch_loser = train_batch['loser']
+            shared_noise = train_batch['shared_noise']
+            shared_timestep = train_batch['shared_timestep']
+
+            input_winner = self.get_training_input_dict(batch_winner)
+            output_winner = self.forward_training(input_winner)
+            loss_std, _, _, _ = self.x1_denoising_loss(input_winner, output_winner)
+
+            loss_dpo, implicit_acc, model_diff, ref_diff = self.compute_dpo_loss(
+                batch_winner, batch_loser, shared_noise, shared_timestep
+            )
+
+            dpo_weight = self.get_dpo_weight()
+
+            loss = (1 - dpo_weight) * loss_std + dpo_weight * loss_dpo
+
+            self.log('dpo_weight', dpo_weight)
+            self.log('implicit_acc', implicit_acc)
+            self.log('model_loss_diff', model_diff)
+            self.log('ref_loss_diff', ref_diff)
+            self.log('loss_dpo', loss_dpo)
+            self.log('loss_std_on_winner', loss_std)
+            self.log('train_loss', loss)
+            
+            return loss
 
     def x1_denoising_loss(self, input_dict, output_dict):
         
@@ -362,3 +425,76 @@ class LightningModule(pl.LightningModule):
         
         return loss, feature_loss, pos_loss, direction_loss
         
+    def compute_dpo_loss(self, batch_winner, batch_loser,  shared_noise, shared_timestep):
+        
+        input_winner = self.get_training_input_dict(batch_winner)
+        input_loser = self.get_training_input_dict(batch_loser)
+
+        output_model_winner = self.model.forward(input_winner)[1]
+        output_model_loser = self.model.forward(input_loser)[1] 
+
+        with torch.no_grad():
+            output_ref_winner = self.ref_model.forward(input_winner)[1]
+            output_ref_loser = self.ref_model.forward(input_loser)[1]
+
+        loss_dpo_continuous = 0.0
+        loss_dpo_discrete = 0.0
+
+        if self.train_x1_denoising:
+        # 计算MSE损失
+            mask_w = ~input_winner['x1']['decoder']['virtual_node_mask']
+            mask_l = ~input_loser['x1']['decoder']['virtual_node_mask']
+            
+            # Model losses
+            noise_pred_w = output_model_winner['x1']['decoder']['denoiser']['pos_out']
+            noise_pred_l = output_model_loser['x1']['decoder']['denoiser']['pos_out']
+            noise_true_w = input_winner['x1']['decoder']['pos_noise']
+            noise_true_l = input_loser['x1']['decoder']['pos_noise']
+            
+            model_loss_w = torch.mean((noise_pred_w[mask_w] - noise_true_w[mask_w]) ** 2)
+            model_loss_l = torch.mean((noise_pred_l[mask_l] - noise_true_l[mask_l]) ** 2)
+            
+            # Ref losses
+            noise_ref_w = output_ref_winner['x1']['decoder']['denoiser']['pos_out']
+            noise_ref_l = output_ref_loser['x1']['decoder']['denoiser']['pos_out']
+            
+            ref_loss_w = torch.mean((noise_ref_w[mask_w] - noise_true_w[mask_w]) ** 2)
+            ref_loss_l = torch.mean((noise_ref_l[mask_l] - noise_true_l[mask_l]) ** 2)
+            
+            # DPO公式
+            model_diff = model_loss_w - model_loss_l
+            ref_diff = ref_loss_w - ref_loss_l
+            inside_term = -0.5 * self.beta_dpo * (model_diff - ref_diff)
+            loss_dpo_continuous = -torch.log(torch.sigmoid(inside_term) + 1e-8)
+
+        if self.train_x1_denoising:
+            mask_w = ~input_winner['x1']['decoder']['virtual_node_mask']
+            mask_l = ~input_loser['x1']['decoder']['virtual_node_mask']
+            
+            # Model losses - atom types
+            logits_w = output_model_winner['x1']['decoder']['denoiser']['x_out']
+            logits_l = output_model_loser['x1']['decoder']['denoiser']['x_out']
+            true_labels_w = torch.argmax(input_winner['x1']['decoder']['true_atom_types_t0'], dim=1)
+            true_labels_l = torch.argmax(input_loser['x1']['decoder']['true_atom_types_t0'], dim=1)
+            
+            model_loss_w = F.cross_entropy(logits_w[mask_w], true_labels_w[mask_w])
+            model_loss_l = F.cross_entropy(logits_l[mask_l], true_labels_l[mask_l])
+            
+            # Ref losses
+            logits_ref_w = output_ref_winner['x1']['decoder']['denoiser']['x_out']
+            logits_ref_l = output_ref_loser['x1']['decoder']['denoiser']['x_out']
+            
+            ref_loss_w = F.cross_entropy(logits_ref_w[mask_w], true_labels_w[mask_w])
+            ref_loss_l = F.cross_entropy(logits_ref_l[mask_l], true_labels_l[mask_l])
+            
+            # DPO公式
+            model_diff = model_loss_w - model_loss_l
+            ref_diff = ref_loss_w - ref_loss_l
+            inside_term = -0.5 * self.beta_dpo * (model_diff - ref_diff)
+            loss_dpo_discrete = -torch.log(torch.sigmoid(inside_term) + 1e-8)
+
+        implicit_acc =  (model_diff < 0).float().mean()
+
+        loss_dpo_total = loss_dpo_continuous + loss_dpo_discrete
+
+        return loss_dpo_total, implicit_acc, model_diff, ref_diff

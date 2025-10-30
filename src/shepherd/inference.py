@@ -1117,16 +1117,16 @@ def inference_sample(
         
         # ==================== 准备当前时间步的模型输入数据 ====================
         # 为每个批次样本创建当前时间步的张量，用于模型推理
-        x1_timestep = torch.tensor([x1_t] * batch_size)  # X1模态的时间步张量
-        x4_timestep = torch.tensor([x4_t] * batch_size)  # X4模态的时间步张量
+        x1_timestep = torch.tensor([x1_t] * batch_size, device=device)  # X1模态的时间步张量
+        x4_timestep = torch.tensor([x4_t] * batch_size, device=device)  # X4模态的时间步张量
         
         # 为每个批次样本创建当前时间步的噪声参数张量
         # 这些参数用于模型内部的噪声调度计算
-        x1_sigma_dash_t_ = torch.tensor([x1_sigma_dash_t] * batch_size, dtype = torch.float)  # X1累积sigma参数
-        x1_alpha_dash_t_ = torch.tensor([x1_alpha_dash_t] * batch_size, dtype = torch.float)  # X1累积alpha参数
+        x1_sigma_dash_t_ = torch.tensor([x1_sigma_dash_t] * batch_size, dtype=torch.float, device=device)  # X1累积sigma参数
+        x1_alpha_dash_t_ = torch.tensor([x1_alpha_dash_t] * batch_size, dtype=torch.float, device=device)  # X1累积alpha参数
         
-        x4_sigma_dash_t_ = torch.tensor([x4_sigma_dash_t] * batch_size, dtype = torch.float)  # X4累积sigma参数
-        x4_alpha_dash_t_ = torch.tensor([x4_alpha_dash_t] * batch_size, dtype = torch.float)  # X4累积alpha参数
+        x4_sigma_dash_t_ = torch.tensor([x4_sigma_dash_t] * batch_size, dtype=torch.float, device=device)  # X4累积sigma参数
+        x4_alpha_dash_t_ = torch.tensor([x4_alpha_dash_t] * batch_size, dtype=torch.float, device=device)  # X4累积alpha参数
         
         
         

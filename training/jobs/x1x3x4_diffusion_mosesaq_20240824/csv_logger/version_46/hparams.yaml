@@ -81,6 +81,9 @@ params:
     num_sphere_samples: 128
     sphere_channels: 64
     use: true
+  dpo:
+    min_score_gap: 0.5
+    sampling_ratio: 0.05
   exclude_variables_from_decoder_heterogeneous_graph: []
   explicit_diffusion_variables:
   - x1
@@ -94,7 +97,7 @@ params:
   noise_schedules:
     x1:
       T: 400
-      alpha_dash_ts: &id003 !!python/object/apply:numpy._core.multiarray._reconstruct
+      alpha_dash_ts: &id003 !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - &id001 !!python/name:numpy.ndarray ''
         - !!python/tuple
@@ -178,7 +181,7 @@ params:
           jj8hgl1+dkCNPzpgpGrERYw/1iC6ADtPiz88g4M1xlyKP6R1oq5Rbok/ypSutsiDiD8HvJsvFp2H
           P9Xy94IkuoY/7kKWj93ahT905SKUKv+EP+II/RX0JoQ/INqIwyFSgz8xRPZQmoCCP051MU5DsoE/
           LkBT9ADngD8=
-      alpha_ts: &id004 !!python/object/apply:numpy._core.multiarray._reconstruct
+      alpha_ts: &id004 !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
         - !!python/tuple
@@ -249,7 +252,7 @@ params:
           7j9vjxOSTPLuP8ZALm3A7e4/LSFtqvXo7j+h/a6p5uPuP0eFAhmN3u4/DjVW2OHY7j/hC5LX3NLu
           Pzupxu10zO4/h6O9p5/F7j/uorcLUb7uP882ek97tu4/XV/ofA6u7j+1vSQA+KTuP6Drhhgim+4/
           AZ9II3OQ7j8=
-      sigma_dash_ts: &id005 !!python/object/apply:numpy._core.multiarray._reconstruct
+      sigma_dash_ts: &id005 !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
         - !!python/tuple
@@ -320,7 +323,7 @@ params:
           7z955W8SKv/vP0lHESg4/+8/PtoiikX/7z9kzq8/Uv/vP0boh09e/+8/rfJAwGn/7z/4JjiYdP/v
           P5+Lk91+/+8/X0hDloj/7z9w7wLIkf/vPwy7Wnia/+8/Rb6grKL/7z/5B/ppqv/vP3i2W7Wx/+8/
           0fmLk7j/7z8=
-      sigma_ts: &id006 !!python/object/apply:numpy._core.multiarray._reconstruct
+      sigma_ts: &id006 !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
         - !!python/tuple
@@ -391,7 +394,7 @@ params:
           0D+7tOmabknQP9q8EqLXa9A/jWHwtceP0D/tHMK9XbXQPx1NIwa83NA/Zl7JvQgG0T9g/KeIbjHR
           P8WUXi4dX9E/aokXakqP0T82NanjMsLRP8RK9lsb+NE/1xJvGVIx0j8dgXSlMG7SP/8CnfAdr9I/
           AacJ+5D00j8=
-      ts: &id007 !!python/object/apply:numpy._core.multiarray._reconstruct
+      ts: &id007 !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
         - !!python/tuple
@@ -475,7 +478,7 @@ params:
           AACCAQAAAAAAAIMBAAAAAAAAhAEAAAAAAACFAQAAAAAAAIYBAAAAAAAAhwEAAAAAAACIAQAAAAAA
           AIkBAAAAAAAAigEAAAAAAACLAQAAAAAAAIwBAAAAAAAAjQEAAAAAAACOAQAAAAAAAI8BAAAAAAAA
           kAEAAAAAAAA=
-      var_dash_ts: &id008 !!python/object/apply:numpy._core.multiarray._reconstruct
+      var_dash_ts: &id008 !!python/object/apply:numpy.core.multiarray._reconstruct
         args:
         - *id001
         - !!python/tuple
@@ -570,9 +573,22 @@ params:
       sigma_ts: *id006
       ts: *id007
       var_dash_ts: *id008
+  sampling:
+    num_samples_per_molecule: 4
+    timesteps: 1000
   training:
     accumulate_grad_batches: 3
     batch_size: 4
+    beta_dpo: 0.2
+    dpo_batch_ratio: 0.3
+    dpo_keep_old_ratio: 0.5
+    dpo_load_weights_only: true
+    dpo_max_weight: 0.5
+    dpo_min_score_gap: 0.5
+    dpo_ramp_up_epochs: 5
+    dpo_sampling_ratio: 0.05
+    dpo_skip_first_epoch: false
+    enable_dpo: true
     gradient_clip_val: 5.0
     log_every_n_steps: 50
     lr: 0.0003
@@ -582,6 +598,7 @@ params:
     num_gpus: 2
     num_workers: 6
     output_dir: x1x3x4_diffusion_mosesaq_20240824/
+    save_preference_pairs: true
     train_x1_denoising: true
     train_x2_denoising: false
     train_x3_denoising: false

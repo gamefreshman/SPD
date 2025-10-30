@@ -61,6 +61,41 @@ params = {
         'log_every_n_steps': 50, # 1000 to 50
         
         'multiprocessing_spawn': True,
+
+        # ==================== DPO配置 ====================
+        'enable_dpo': True,  # 是否启用DPO
+        
+        # DPO核心参数
+        'beta_dpo': 0.2,  # DPO温度参数（dpo_beta改名为beta_dpo）
+        'dpo_ramp_up_epochs': 5,  # 权重预热轮数
+        'dpo_max_weight': 0.5,  # 最大DPO权重
+        
+        # 采样策略
+        'dpo_sampling_ratio': 0.05,  # 每个epoch采样的数据比例（5%）
+        'dpo_batch_ratio': 0.3,  # DPO batch占总batch的比例（30%）
+        
+        # 偏好对构建
+        'dpo_min_score_gap': 0.5,  # 最小分数差距阈值
+        'dpo_keep_old_ratio': 0.5,  # 保留旧偏好对的比例
+        
+        # checkpoint和采样控制
+        'dpo_skip_first_epoch': False,  # 从epoch 0就开始采样
+        'dpo_load_weights_only': True,  # 从旧checkpoint只加载权重
+        
+        # 其他选项
+        'save_preference_pairs': True,  # 是否保存偏好对
+    },
+    
+    # ==================== DPO采样配置 ====================
+    'sampling': {
+        'timesteps': 1000,  # 采样步数（用于inference_sample）
+        'num_samples_per_molecule': 4,  # 每个种子分子生成4个样本
+    },
+    
+    # ==================== DPO评分权重 ====================
+    'dpo': {
+        'sampling_ratio': 0.05,
+        'min_score_gap': 0.5,
     },
     
     
