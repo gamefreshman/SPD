@@ -13,6 +13,17 @@ from tqdm import tqdm
 from typing import List, Tuple, Dict, Optional
 import pickle
 
+# 采样所需的工具函数
+from shepherd.shepherd_score_utils.conformer_generation import update_mol_coordinates
+from shepherd.shepherd_score_utils.generate_point_cloud import (
+    get_atomic_vdw_radii, 
+    get_molecular_surface,
+    get_electrostatics_given_point_charges,
+)
+from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
+from shepherd.inference import inference_sample
+from shepherd.extract import create_rdkit_molecule
+
 
 class ShepherdScorer:
     """
@@ -237,26 +248,37 @@ class OnlineSampler:
         Returns:
             List[rdkit.Mol]: 生成的分子列表
         """
+        print(f"\n  📌 开始从种子分子生成 {self.num_samples_per_mol} 个样本...")
         generated_mols = []
         
         # 将模型设为评估模式
         self.model.eval()
         
         with torch.no_grad():
-            for _ in range(self.num_samples_per_mol):
+            for i in range(self.num_samples_per_mol):
                 try:
+                    print(f"    🔬 样本 {i+1}/{self.num_samples_per_mol}: 开始扩散采样...")
                     # 使用完整的inference_sample进行条件生成
                     mol = self._sample_one_molecule(seed_mol_data)
+                    
+                    if mol is not None:
+                        print(f"    ✅ 样本 {i+1}/{self.num_samples_per_mol}: 成功生成分子")
+                    else:
+                        print(f"    ⚠️  样本 {i+1}/{self.num_samples_per_mol}: 生成失败")
+                    
                     generated_mols.append(mol)
                     
                 except Exception as e:
-                    print(f"采样失败: {e}")
+                    print(f"    ❌ 样本 {i+1}/{self.num_samples_per_mol}: 采样失败 - {e}")
                     import traceback
                     traceback.print_exc()
                     generated_mols.append(None)
         
         # 恢复训练模式
         self.model.train()
+        
+        valid_count = sum(1 for mol in generated_mols if mol is not None)
+        print(f"  📊 种子分子采样完成: {valid_count}/{self.num_samples_per_mol} 个有效分子\n")
         
         return generated_mols
     
@@ -272,18 +294,11 @@ class OnlineSampler:
             rdkit.Mol: 生成的分子对象（如果成功），否则返回None
         """
         try:
-            import rdkit.Chem as Chem
-            from shepherd.shepherd_score_utils.conformer_generation import update_mol_coordinates
-            from shepherd.shepherd_score_utils.generate_point_cloud import (
-                get_atomic_vdw_radii, 
-                get_molecular_surface,
-                get_electrostatics_given_point_charges,
-            )
-            from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
-            from shepherd.inference import inference_sample
-            from shepherd.extract import create_rdkit_molecule
+            # 输出每个阶段
+            print("  🔮 开始采样一个分子")
             
             # 1. 从种子数据创建分子
+            print("    🧬 从种子数据创建分子")
             mol_block, charges = seed_data
             seed_mol = Chem.MolFromMolBlock(mol_block, removeHs=False)
             
@@ -291,15 +306,18 @@ class OnlineSampler:
                 return None
             
             # 2. 预处理分子坐标（中心化）
+            print("    🪧 预处理分子坐标（中心化）")
             mol_coordinates = np.array(seed_mol.GetConformer().GetPositions())
             mol_coordinates = mol_coordinates - np.mean(mol_coordinates, axis=0)
             seed_mol = update_mol_coordinates(seed_mol, mol_coordinates)
             
             # 3. 提取条件特征（参考evaluation/main.ipynb）
+            print("    🔍 提取条件特征")
             centers = seed_mol.GetConformer().GetPositions()
             radii = get_atomic_vdw_radii(seed_mol)
             
             # 生成分子表面点云（x2模态）
+            print("    📈 生成分子表面点云")
             surface = get_molecular_surface(
                 centers, 
                 radii, 
@@ -309,6 +327,7 @@ class OnlineSampler:
             )
             
             # 提取药效团特征（x4模态）
+            print("    🧵 提取药效团特征")
             pharm_types, pharm_pos, pharm_direction = get_pharmacophores(
                 seed_mol,
                 multi_vector=self.params['dataset']['x4']['multivectors'],
@@ -316,11 +335,13 @@ class OnlineSampler:
             )
             
             # 计算表面静电势（x3模态）
+            print("    🔋 计算表面静电势")
             electrostatics = get_electrostatics_given_point_charges(
                 charges, centers, surface,
             )
             
             # 4. 使用inference_sample生成新分子
+            print("    🔁 使用inference_sample生成新分子")
             n_atoms = len(seed_mol.GetAtoms())
             num_pharmacophores = len(pharm_types)
             
@@ -377,16 +398,24 @@ class OnlineSampler:
             )
             
             # 5. 提取生成的分子
+            print(f"      🔄 采样完成，正在转换为RDKit分子...")
             if len(generated_samples) > 0:
                 sample_dict = generated_samples[0]
                 generated_mol = create_rdkit_molecule(sample_dict)
+
+                print("创建函数结束")
                 
                 if generated_mol is not None:
                     try:
+                        print(f"      ✓ RDKit分子创建成功，正在验证...")
                         Chem.SanitizeMol(generated_mol)
+                        print(f"      ✓ 分子验证通过")
                         return generated_mol
-                    except:
+                    except Exception as e:
+                        print(f"      ✗ 分子验证失败: {e}")
                         return None
+                else:
+                    print(f"      ✗ RDKit分子创建失败")
             
             return None
                 
@@ -444,17 +473,22 @@ class PreferencePairBuilder:
         # 过滤掉None
         valid_mols = [mol for mol in generated_mols if mol is not None]
         
+        print(f"  🎯 开始评分: {len(valid_mols)} 个有效分子")
         if len(valid_mols) < 2:
+            print(f"  ⚠️  分子数量不足，无法构建偏好对")
             return None
         
         # 评分（返回字典列表）
+        print(f"  ⏳ 使用Shepherd Score评分系统评分中...")
         score_dicts = self.scorer.score_batch(valid_mols, reference_mol)
         
         # 过滤掉无效分子
         valid_pairs = [(mol, score_dict) for mol, score_dict in zip(valid_mols, score_dicts) 
                        if score_dict.get('is_valid', False)]
         
+        print(f"  📋 评分完成: {len(valid_pairs)}/{len(valid_mols)} 个分子评分有效")
         if len(valid_pairs) < 2:
+            print(f"  ⚠️  有效评分不足2个，无法构建偏好对")
             return None
         
         # 按total_score排序
@@ -465,9 +499,13 @@ class PreferencePairBuilder:
         
         # 检查分数差距是否足够大
         score_gap = winner_score_dict['total_score'] - loser_score_dict['total_score']
+        print(f"  📊 最高分: {winner_score_dict['total_score']:.3f}, 最低分: {loser_score_dict['total_score']:.3f}, 分差: {score_gap:.3f}")
+        
         if score_gap < self.min_score_gap:
+            print(f"  ⚠️  分数差距 ({score_gap:.3f}) 小于阈值 ({self.min_score_gap})，舍弃该偏好对")
             return None
         
+        print(f"  ✅ 成功构建偏好对 (分差: {score_gap:.3f})")
         return (winner_mol, loser_mol, winner_score_dict, loser_score_dict)
     
     def batch_build_pairs(self, all_generated_mols, reference_mols=None, show_progress=True):

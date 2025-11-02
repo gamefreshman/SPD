@@ -18,7 +18,6 @@ ShEPhERD推理模块
 """
 
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 # 3D点云处理库
 import open3d 
@@ -134,6 +133,18 @@ def compute_batched_over0_posterior_distribution(X_t, Qt, Qsb, Qtb):
 
     return out
 
+def move_to_device(data, device):
+
+    if isinstance(data, torch.Tensor):
+        return data.to(device)
+    
+    if isinstance(data, dict):
+        return {k: move_to_device(v, device) for k, v in data.items()}
+
+    if isinstance(data, list):
+        return [move_to_device(elem, device) for elem in data]
+
+    return data
 # ============================================================================
 # 协调化函数（Harmonization Functions）
 # ============================================================================
@@ -510,7 +521,7 @@ def inference_sample(
     # 初始化模型参数和设备配置
     # ============================================================================
     params = model_pl.params  # 获取模型参数配置
-    device = model_pl.device  # 获取计算设备（CPU/GPU）
+    device = next(model_pl.model.parameters()).device  # 获取模型实际所在的计算设备（CPU/GPU）
 
     T = params['noise_schedules']['x1']['ts'].max()  # 获取最大时间步T
 
@@ -1131,8 +1142,8 @@ def inference_sample(
         
         
         # ==================== 构建模型输入字典 ====================
-        # 获取模型所在的设备（CPU或GPU），确保数据在正确设备上
-        device = model_pl.model.device
+        # 注意：这里不重新赋值device，使用前面已经获取的device（model_pl.device）
+        # device = model_pl.model.device  # 删除此行，避免设备不一致
         input_dict = {}  # 初始化模型输入字典
         input_dict['device'] = device  # 设置设备信息
         input_dict['dtype'] = torch.float32  # 设置数据类型为32位浮点数
@@ -1181,8 +1192,8 @@ def inference_sample(
         x2_pos_t = pos_forward_noised_x2
         x2_x_t = x_forward_noised_x2
         
-        x2_sigma_dash_t_ = torch.tensor([0] * batch_size, dtype = torch.float) # 不模糊 0
-        x2_alpha_dash_t_ = torch.tensor([1] * batch_size, dtype = torch.float) # 很清晰 1
+        x2_sigma_dash_t_ = torch.tensor([0] * batch_size, dtype = torch.float, device=device) # 不模糊 0
+        x2_alpha_dash_t_ = torch.tensor([1] * batch_size, dtype = torch.float, device=device) # 很清晰 1
         
         ###
         
@@ -1204,8 +1215,8 @@ def inference_sample(
         x3_pos_t = pos_forward_noised_x3
         x3_x_t = x_forward_noised_x3
 
-        x3_sigma_dash_t_ = torch.tensor([0] * batch_size, dtype = torch.float)
-        x3_alpha_dash_t_ = torch.tensor([1] * batch_size, dtype = torch.float) 
+        x3_sigma_dash_t_ = torch.tensor([0] * batch_size, dtype = torch.float, device=device)
+        x3_alpha_dash_t_ = torch.tensor([1] * batch_size, dtype = torch.float, device=device) 
         
         # X2模态（口袋结构）的输入数据配置
         input_dict['x2'] =  {
@@ -1267,6 +1278,9 @@ def inference_sample(
         # 使用训练好的扩散模型预测当前时间步的噪声
         # torch.no_grad()确保推理过程不计算梯度，节省内存和计算资源
         with torch.no_grad():
+            # 确保所有输入数据在正确的设备上
+            input_dict = move_to_device(input_dict, device)
+            
             _, output_dict = model_pl.model.forward(input_dict)  # 前向传播获取噪声预测结果
         
         # ==================== 提取X1模态的噪声预测结果 ====================

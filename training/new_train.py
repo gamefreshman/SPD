@@ -41,8 +41,6 @@ from torch_geometric.data import HeteroData
 from shepherd.model.model import Model
 from shepherd.lightning_module import LightningModule
 
-# 数据集类，负责加载和预处理分子数据。
-# from shepherd.datasets import HeteroDataset  # OLD
 from shepherd.new_datasets import HeteroDataset # NEW (adjust path as needed)
 
 # DPO相关导入
@@ -264,25 +262,36 @@ if __name__ == '__main__':
     # CHANGE ME ONCE FULL DATASETS ARE DOWNLOADED
     if params['data'] == 'MOSES_aq':
 
-        # full dataset
-        molblocks_and_charges = []
-        for i in [0,1,2,3,4]:
-            with open(f'../data/molblock_charges_{i}.pkl', 'rb') as f:
-                molblocks_and_charges_ = pickle.load(f) 
-            molblocks_and_charges += molblocks_and_charges_
-
-        # sample data data/molblock_charges_0.pkl
+        # full dataset (注释掉用于调试)
         # molblocks_and_charges = []
-        # with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
-        #     molblocks_and_charges = pickle.load(f)
+        # for i in [0,1,2,3,4]:
+        #     with open(f'../data/molblock_charges_{i}.pkl', 'rb') as f:
+        #         molblocks_and_charges_ = pickle.load(f) 
+        #     molblocks_and_charges += molblocks_and_charges_
+
+        # sample data - 用于调试
+        molblocks_and_charges = []
+        with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
+            molblocks_and_charges = pickle.load(f)
 
         output_file = "MOSES_aq"
+    
+    # NPs数据集 - 用于DPO微调（3个天然产物分子）
+    if params['data'] == 'NPs':
+        molblocks_and_charges = []
+        with open(f'../data/conformers/np/molblock_charges_NPs.pkl', 'rb') as f:
+            molblocks_and_charges = pickle.load(f)
+        
+        print(f"\n✅ 加载NPs数据集: {len(molblocks_and_charges)} 个分子（用于DPO微调）")
+        output_file = "NPs"
 
     #  pharmacophore 用于计算分子的药效团特征
     atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4 = compute_and_cache_marginals(
         params=params, 
         molblocks_and_charges=molblocks_and_charges
     )
+
+    print("✅ 计算完边际分布！")
 
     dataset = HeteroDataset(
         molblocks_and_charges = molblocks_and_charges, 
@@ -336,9 +345,10 @@ if __name__ == '__main__':
         multivectors = params['dataset']['x4']['multivectors'],
         check_accessibility = params['dataset']['x4']['check_accessibility'],
         
-        probe_radius = params['dataset']['probe_radius'], # for x2 and x3
-        
+        probe_radius = params['dataset']['probe_radius'], # for x2 and x3   
     )
+
+    print("配置普通数据集完成")
     
     # 创建DPO数据集（如果启用）
     dpo_dataset = None
@@ -479,39 +489,98 @@ if __name__ == '__main__':
     
     # 如果启用DPO且模型结构变化，处理checkpoint加载
     if params['training'].get('enable_dpo', False):
-        if os.path.exists(ckpt_path) and resume_from_checkpoint:
-            # 检查是否要从标准训练的checkpoint迁移到DPO训练
-            load_weights_only = params['training'].get('dpo_load_weights_only', True)
-            
-            if load_weights_only:
-                print("\n✅ DPO模式：加载旧checkpoint的模型权重（不加载optimizer状态）")
+        # 优先检查是否配置了预训练模型路径
+        pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
+        if pretrained_path is not None:
+            # 构建完整路径
+            pretrained_ckpt_path = f"jobs/{pretrained_path}"
+            if os.path.exists(pretrained_ckpt_path):
+                print(f"\n🔄 DPO微调：从预训练模型加载权重")
+                print(f"   预训练checkpoint: {pretrained_ckpt_path}")
                 try:
-                    # 只加载模型权重
-                    checkpoint = torch.load(ckpt_path, map_location='cpu')
+                    # 只加载模型权重（不加载optimizer等训练状态）
+                    checkpoint = torch.load(pretrained_ckpt_path, map_location='cpu')
                     model_state_dict = checkpoint['state_dict']
                     
-                    # 过滤掉ref_model的权重（如果有的话）
+                    # 过滤出model的权重（排除ref_model）
                     model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
                     
-                    # 加载到model_pl.model
-                    model_pl.model.load_state_dict(model_weights, strict=False)
+                    # 加载到当前模型
+                    missing, unexpected = model_pl.model.load_state_dict(model_weights, strict=False)
                     
-                    # 同步权重到ref_model
+                    # 同步权重到ref_model（DPO的参考模型）
                     if hasattr(model_pl, 'ref_model'):
                         model_pl.ref_model.load_state_dict(model_weights, strict=False)
+                        print(f"   ✅ 已同步权重到参考模型（ref_model）")
                     
-                    print(f"   已从 {ckpt_path} 加载模型权重")
-                    ckpt_path = None  # 不使用完整checkpoint恢复
+                    print(f"   ✅ 成功加载预训练权重")
+                    if len(missing) > 0:
+                        print(f"   ⚠️  缺失的键: {len(missing)} 个")
+                    if len(unexpected) > 0:
+                        print(f"   ⚠️  未预期的键: {len(unexpected)} 个")
+                    
+                    # 检查是否有当前任务的checkpoint可以继续训练
+                    if os.path.exists(ckpt_path) and resume_from_checkpoint:
+                        print(f"\n   发现当前任务的checkpoint: {ckpt_path}")
+                        print(f"   将继续当前任务的训练（而不是从预训练重新开始）")
+                        # 保持ckpt_path，让trainer恢复训练状态
+                    else:
+                        print(f"\n   未找到当前任务的checkpoint，将从预训练模型开始新的DPO微调")
+                        ckpt_path = None  # 从预训练开始，不恢复训练状态
+                    
                 except Exception as e:
-                    print(f"   ⚠️ 加载权重失败: {e}")
-                    print("   将从头开始训练")
+                    print(f"   ❌ 加载预训练权重失败: {e}")
+                    print(f"   将从头开始训练")
                     ckpt_path = None
             else:
-                print("\n⚠️  DPO模式：尝试完整恢复checkpoint（可能因optimizer不匹配而失败）")
-                # 保持ckpt_path不变，让trainer尝试完整加载
+                print(f"\n⚠️  预训练checkpoint不存在: {pretrained_ckpt_path}")
+                print(f"   将检查当前任务的checkpoint")
+                
+                # 降级到检查当前目录的checkpoint
+                if os.path.exists(ckpt_path) and resume_from_checkpoint:
+                    load_weights_only = params['training'].get('dpo_load_weights_only', True)
+                    if load_weights_only:
+                        print("\n✅ DPO模式：加载当前checkpoint的模型权重")
+                        try:
+                            checkpoint = torch.load(ckpt_path, map_location='cpu')
+                            model_state_dict = checkpoint['state_dict']
+                            model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
+                            model_pl.model.load_state_dict(model_weights, strict=False)
+                            if hasattr(model_pl, 'ref_model'):
+                                model_pl.ref_model.load_state_dict(model_weights, strict=False)
+                            print(f"   已从 {ckpt_path} 加载模型权重")
+                            ckpt_path = None
+                        except Exception as e:
+                            print(f"   ⚠️ 加载权重失败: {e}")
+                            ckpt_path = None
+                else:
+                    print("\n📝 DPO模式：未找到任何checkpoint，从头开始训练")
+                    ckpt_path = None
         else:
-            print("\n📝 DPO模式：未找到checkpoint，从头开始训练")
-            ckpt_path = None
+            # 没有配置预训练路径，按原有逻辑处理
+            if os.path.exists(ckpt_path) and resume_from_checkpoint:
+                load_weights_only = params['training'].get('dpo_load_weights_only', True)
+                
+                if load_weights_only:
+                    print("\n✅ DPO模式：加载旧checkpoint的模型权重（不加载optimizer状态）")
+                    try:
+                        checkpoint = torch.load(ckpt_path, map_location='cpu')
+                        model_state_dict = checkpoint['state_dict']
+                        model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
+                        model_pl.model.load_state_dict(model_weights, strict=False)
+                        if hasattr(model_pl, 'ref_model'):
+                            model_pl.ref_model.load_state_dict(model_weights, strict=False)
+                        print(f"   已从 {ckpt_path} 加载模型权重")
+                        ckpt_path = None
+                    except Exception as e:
+                        print(f"   ⚠️ 加载权重失败: {e}")
+                        print("   将从头开始训练")
+                        ckpt_path = None
+                else:
+                    print("\n⚠️  DPO模式：尝试完整恢复checkpoint（可能因optimizer不匹配而失败）")
+            else:
+                print("\n📝 DPO模式：未找到checkpoint，从头开始训练")
+                ckpt_path = None
     else:
         ckpt_path = ckpt_path if (os.path.exists(ckpt_path) & resume_from_checkpoint) else None
     

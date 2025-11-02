@@ -121,11 +121,18 @@ class OnlineSamplingCallback(Callback):
             )
             
             # 4. 批量采样
-            print("开始生成分子...")
+            print(f"\n{'='*60}")
+            print(f"🧬 阶段1/2: 生成分子样本")
+            print(f"{'='*60}")
             all_generated_mols = sampler.batch_sample(seed_mol_list, show_progress=True)
             
+
+            ### 卡在这里？？？
+
             # 5. 构建偏好对
-            print("开始构建偏好对...")
+            print(f"\n{'='*60}")
+            print(f"🏆 阶段2/2: 构建偏好对")
+            print(f"{'='*60}")
             new_pairs = self.pair_builder.batch_build_pairs(
                 all_generated_mols,
                 reference_mols=None,  # 如果需要参考分子，这里传入

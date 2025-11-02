@@ -6,9 +6,123 @@ This module provides helper functions for working with ShEPhERD's inference outp
 
 import logging
 from copy import deepcopy
+import signal
+from contextlib import contextmanager
+import numpy as np
 
 from rdkit import Chem
 from rdkit.Chem import rdDetermineBonds
+
+# 共价半径字典 (单位: Angstrom)
+# 来源: Cordero et al. (2008) Dalton Trans., 2832-2838
+COVALENT_RADII = {
+    1: 0.31, 2: 0.28, 3: 1.28, 4: 0.96, 5: 0.84, 6: 0.76, 7: 0.71, 8: 0.66,
+    9: 0.57, 10: 0.58, 11: 1.66, 12: 1.41, 13: 1.21, 14: 1.11, 15: 1.07, 16: 1.05,
+    17: 1.02, 18: 1.06, 19: 2.03, 20: 1.76, 21: 1.70, 22: 1.60, 23: 1.53, 24: 1.39,
+    25: 1.39, 26: 1.32, 27: 1.26, 28: 1.24, 29: 1.32, 30: 1.22, 31: 1.22, 32: 1.20,
+    33: 1.19, 34: 1.20, 35: 1.20, 36: 1.16, 37: 2.20, 38: 1.95, 39: 1.90, 40: 1.75,
+    41: 1.64, 42: 1.54, 43: 1.47, 44: 1.46, 45: 1.42, 46: 1.39, 47: 1.45, 48: 1.44,
+    49: 1.42, 50: 1.39, 51: 1.39, 52: 1.38, 53: 1.39, 54: 1.40
+}
+
+
+def add_bonds_by_distance(mol):
+    """
+    基于原子间距离手动添加化学键
+    
+    Args:
+        mol: RDKit分子对象（只包含原子和3D坐标）
+        
+    Returns:
+        RDKit分子对象（包含键信息）
+    """
+    from rdkit import Chem
+    from rdkit.Chem import rdchem
+    
+    conf = mol.GetConformer()
+    num_atoms = mol.GetNumAtoms()
+    
+    print(f"  开始基于距离添加键（{num_atoms}个原子）...")
+    
+    # 创建可编辑的分子
+    editable_mol = Chem.EditableMol(mol)
+    bonds_added = 0
+    
+    # 遍历所有原子对
+    for i in range(num_atoms):
+        for j in range(i + 1, num_atoms):
+            atom_i = mol.GetAtomWithIdx(i)
+            atom_j = mol.GetAtomWithIdx(j)
+            
+            # 获取原子序数
+            atomic_num_i = atom_i.GetAtomicNum()
+            atomic_num_j = atom_j.GetAtomicNum()
+            
+            # 获取共价半径（如果不在字典中，使用默认值1.0）
+            radius_i = COVALENT_RADII.get(atomic_num_i, 1.0)
+            radius_j = COVALENT_RADII.get(atomic_num_j, 1.0)
+            
+            # 计算原子间距离
+            pos_i = conf.GetAtomPosition(i)
+            pos_j = conf.GetAtomPosition(j)
+            distance = pos_i.Distance(pos_j)
+            
+            # 键长阈值：共价半径之和的0.8到1.3倍
+            min_bond_length = (radius_i + radius_j) * 0.75
+            max_bond_length = (radius_i + radius_j) * 1.30
+            
+            # 如果距离在合理范围内，添加键
+            if min_bond_length <= distance <= max_bond_length:
+                # 根据距离判断键的类型
+                ideal_single = (radius_i + radius_j)
+                ideal_double = ideal_single * 0.87  # 双键通常短10-15%
+                ideal_triple = ideal_single * 0.78  # 三键通常短20-25%
+                
+                # 判断键类型（简化判断）
+                if distance < ideal_triple * 1.1:
+                    bond_type = rdchem.BondType.TRIPLE
+                elif distance < ideal_double * 1.1:
+                    bond_type = rdchem.BondType.DOUBLE
+                else:
+                    bond_type = rdchem.BondType.SINGLE
+                
+                try:
+                    editable_mol.AddBond(i, j, bond_type)
+                    bonds_added += 1
+                except Exception as e:
+                    print(f"    警告: 无法添加键 {i}-{j}: {e}")
+    
+    print(f"  ✓ 成功添加 {bonds_added} 个化学键")
+    
+    # 转换回普通分子
+    mol_with_bonds = editable_mol.GetMol()
+    
+    return mol_with_bonds
+
+
+class TimeoutException(Exception):
+    """超时异常"""
+    pass
+
+
+@contextmanager
+def time_limit(seconds):
+    """
+    超时上下文管理器
+    Args:
+        seconds: 超时秒数
+    """
+    def signal_handler(signum, frame):
+        raise TimeoutException("操作超时")
+    
+    # 设置信号处理器
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        # 取消alarm
+        signal.alarm(0)
 
 
 def get_xyz_content(sample):
@@ -63,27 +177,40 @@ def create_rdkit_molecule(sample):
     Returns:
         rdkit.Chem.rdchem.Mol: RDKit molecule object or None if conversion fails.
     """
+    print("=" * 60)
+    print("🧪 开始创建RDKit分子对象")
+    print("=" * 60)
+    
+    # 阶段1: 检查输入数据
+    print("📋 阶段1/7: 检查输入数据...")
     if 'x1' not in sample:
-        logging.warning("No atom data (x1) found in sample")
+        print("❌ 未找到原子数据(x1)")
         return None
+    print("✓ 输入数据检查通过")
 
     # try:
-    # extract atoms and their positions from x1
+    # 阶段2: 提取原子和位置数据
+    print("\n📦 阶段2/7: 提取原子和位置数据...")
     atoms = sample['x1']['atoms']
     positions = sample['x1']['positions']
+    print(f"✓ 提取到 {len(atoms)} 个原子, {len(positions)} 个坐标")
     
-    # 检查数据完整性
+    # 阶段3: 检查数据完整性
+    print("\n🔍 阶段3/7: 检查数据完整性...")
     if len(atoms) == 0 or len(positions) == 0:
-        logging.warning("Empty atoms or positions data")
+        print("❌ 原子或坐标数据为空")
         return None
         
     if len(atoms) != len(positions):
-        logging.warning(f"Mismatch between atoms ({len(atoms)}) and positions ({len(positions)}) count")
+        print(f"❌ 原子数({len(atoms)})与坐标数({len(positions)})不匹配")
         return None
+    print(f"✓ 数据完整性检查通过: {len(atoms)} 个原子")
 
-    # 过滤有效的原子和位置数据
+    # 阶段4: 过滤有效的原子和位置数据
+    print("\n🧹 阶段4/7: 过滤和验证原子数据...")
     valid_atoms = []
     valid_positions = []
+    invalid_count = 0  # 统计无效原子数量
     
     for a in range(len(atoms)):
         try:
@@ -92,97 +219,109 @@ def create_rdkit_molecule(sample):
             
             # 检查原子序数是否有效
             if atomic_number <= 0 or atomic_number > 118:
-                logging.warning(f"Invalid atomic number: {atomic_number}")
+                print(f"Invalid atomic number: {atomic_number}")
+                invalid_count += 1
                 continue
             
             # 检查位置是否包含NaN或无穷值
             import numpy as np
             if np.any(np.isnan(position)) or np.any(np.isinf(position)):
-                logging.warning(f"Atom {a} has invalid position (NaN/Inf): {position}")
+                print(f"Atom {a} has invalid position (NaN/Inf): {position}")
+                invalid_count += 1
                 continue
             
             # 检查位置坐标是否合理（不能过大）
             if np.any(np.abs(position) > 1000):
-                logging.warning(f"Atom {a} has unreasonable position: {position}")
+                print(f"Atom {a} has unreasonable position: {position}")
+                invalid_count += 1
                 continue
             
             valid_atoms.append(atomic_number)
             valid_positions.append(position)
             
         except (ValueError, TypeError, IndexError) as e:
-            logging.warning(f"Error processing atom {a}: {e}")
+            print(f"Error processing atom {a}: {e}")
+            invalid_count += 1
             continue
     
+    # 统计并打印无效原子信息
+    total_atoms = len(atoms)
+    valid_count = len(valid_atoms)
+    invalid_ratio = (invalid_count / total_atoms * 100) if total_atoms > 0 else 0
+    
+    if invalid_count > 0:
+        print(f"📊 原子统计: 总数={total_atoms}, 有效={valid_count}, 无效={invalid_count} ({invalid_ratio:.1f}%)")
+    else:
+        print(f"✓ 所有 {valid_count} 个原子均有效")
+    
     if len(valid_atoms) == 0:
-        logging.warning("No valid atoms found after filtering")
+        print("❌ 过滤后没有有效原子")
         return None
 
-    # create XYZ format string with valid data only
+    # 阶段5: 创建XYZ格式字符串
+    print(f"\n📝 阶段5/7: 创建XYZ格式字符串（{len(valid_atoms)}个原子）...")
     xyz = f'{len(valid_atoms)}\n\n'
     for i, (atomic_number, position) in enumerate(zip(valid_atoms, valid_positions)):
         try:
             symbol = Chem.Atom(atomic_number).GetSymbol()
             xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
         except Exception as e:
-            logging.warning(f"Error creating XYZ line for atom {i}: {e}")
+            print(f"Error creating XYZ line for atom {i}: {e}")
             continue
 
-    # create molecule from XYZ block
+    print("✓ XYZ格式字符串创建完成")
+    
+    # 阶段6: 从XYZ创建分子对象
+    print("\n🔬 阶段6/7: 从XYZ创建分子对象...")
     mol = Chem.MolFromXYZBlock(xyz)
     if mol is None:
-        logging.warning("Failed to create molecule from XYZ block")
-        logging.debug(f"XYZ content:\n{xyz}")
+        print("❌ 从XYZ创建分子失败")
+        print(f"XYZ内容:\n{xyz}")
         return None
+    print(f"✓ 分子对象创建成功（{mol.GetNumAtoms()}个原子）")
 
-    # mol 不合理
-
-    # try different charge states for bond determination
-    mol_final = None
-    for charge in [0, 1, -1, 2, -2]: # 这里出现问题了
-        mol_copy = deepcopy(mol)
-        try:
-            rdDetermineBonds.DetermineBonds(mol_copy, charge=charge, embedChiral=True)
-            logging.debug(f"Bond determination successful with charge {charge}")
-            mol_final = mol_copy
-            break
-        except Exception as e:
-            logging.debug(f"Bond determination failed with charge {charge}: {e}")
-            continue
-
-    if mol_final is None:
-        logging.warning("Bond determination failed for all charge states") # 现在是会爆出这个错误
+    # 阶段7: 确定化学键（基于距离）
+    print("\n🔗 阶段7/7: 基于原子间距离确定化学键...")
+    try:
+        mol_final = add_bonds_by_distance(mol)
+        if mol_final is None:
+            print("❌ 基于距离添加键失败")
+            return None
+    except Exception as e:
+        print(f"❌ 添加化学键时出错: {e}")
         return None
     
+    print("\n✅ 化学键确定成功，开始验证分子...")
     # validate molecule
     try:
         radical_electrons = sum([a.GetNumRadicalElectrons() for a in mol_final.GetAtoms()])
         if radical_electrons > 0:
-            logging.warning(f"Molecule has {radical_electrons} radical electrons")
+            print(f"⚠️  分子包含 {radical_electrons} 个自由基电子")
         
         mol_final.UpdatePropertyCache()
         Chem.GetSymmSSSR(mol_final)
-        logging.debug("Molecule validation successful")
+        print("✓ 分子验证成功")
     except Exception as e:
-        logging.warning(f"Molecule validation failed: {e}")
+        print(f"❌ 分子验证失败: {e}")
         return None
 
     # try to generate SMILES to verify molecule
+    print("\n🧬 生成SMILES并验证...")
     try:
         smiles = Chem.MolToSmiles(mol_final)
-        logging.debug(f"Generated SMILES: {smiles}")
+        print(f"✓ SMILES: {smiles}")
     except Exception as e:
-        logging.warning(f"SMILES generation failed: {e}")
+        print(f"❌ SMILES生成失败: {e}")
 
     if '.' in smiles:
-        logging.warning("Molecule is a fragment, failed to create molecule")
+        print("❌ 分子是片段（包含'.'），创建失败")
         return None
 
+    print("=" * 60)
+    print("🎉 分子创建成功！")
+    print("=" * 60)
     return mol_final
         
-    # except Exception as e:
-    #     logging.warning(f"Error creating molecule: {e}")
-    #     return None
-
 def create_rdkit_molecule_from_mol(atoms, positions):
     """
     Create an RDKit molecule from ShEPhERD output using XYZ block approach.
@@ -214,6 +353,7 @@ def create_rdkit_molecule_from_mol(atoms, positions):
     # 过滤有效的原子和位置数据
     valid_atoms = []
     valid_positions = []
+    invalid_count = 0  # 统计无效原子数量
     
     for a in range(len(atoms)):
         try:
@@ -222,26 +362,38 @@ def create_rdkit_molecule_from_mol(atoms, positions):
             
             # 检查原子序数是否有效
             if atomic_number <= 0 or atomic_number > 118:
-                logging.warning(f"Invalid atomic number: {atomic_number}")
+                print(f"Invalid atomic number: {atomic_number}")
+                invalid_count += 1
                 continue
             
             # 检查位置是否包含NaN或无穷值
             import numpy as np
             if np.any(np.isnan(position)) or np.any(np.isinf(position)):
-                logging.warning(f"Atom {a} has invalid position (NaN/Inf): {position}")
+                print(f"Atom {a} has invalid position (NaN/Inf): {position}")
+                invalid_count += 1
                 continue
             
             # 检查位置坐标是否合理（不能过大）
             if np.any(np.abs(position) > 1000):
-                logging.warning(f"Atom {a} has unreasonable position: {position}")
+                print(f"Atom {a} has unreasonable position: {position}")
+                invalid_count += 1
                 continue
             
             valid_atoms.append(atomic_number)
             valid_positions.append(position)
             
         except (ValueError, TypeError, IndexError) as e:
-            logging.warning(f"Error processing atom {a}: {e}")
+            print(f"Error processing atom {a}: {e}")
+            invalid_count += 1
             continue
+    
+    # 统计并打印无效原子信息
+    total_atoms = len(atoms)
+    valid_count = len(valid_atoms)
+    invalid_ratio = (invalid_count / total_atoms * 100) if total_atoms > 0 else 0
+    
+    if invalid_count > 0:
+        logging.info(f"📊 原子统计: 总数={total_atoms}, 有效={valid_count}, 无效={invalid_count} ({invalid_ratio:.1f}%)")
     
     if len(valid_atoms) == 0:
         logging.warning("No valid atoms found after filtering")
@@ -266,21 +418,15 @@ def create_rdkit_molecule_from_mol(atoms, positions):
 
     # mol 不合理
 
-    # try different charge states for bond determination
-    mol_final = None
-    for charge in [0, 1, -1, 2, -2]: # 这里出现问题了
-        mol_copy = deepcopy(mol)
-        try:
-            rdDetermineBonds.DetermineBonds(mol_copy, charge=charge, embedChiral=True)
-            logging.debug(f"Bond determination successful with charge {charge}")
-            mol_final = mol_copy
-            break
-        except Exception as e:
-            logging.debug(f"Bond determination failed with charge {charge}: {e}")
-            continue
-
-    if mol_final is None:
-        logging.warning("Bond determination failed for all charge states")
+    # 基于距离添加化学键
+    logging.info(f"🔗 正在基于原子间距离确定化学键...")
+    try:
+        mol_final = add_bonds_by_distance(mol)
+        if mol_final is None:
+            logging.warning("Failed to add bonds based on distance")
+            return None
+    except Exception as e:
+        logging.warning(f"Error adding bonds: {e}")
         return None
     
     # validate molecule
