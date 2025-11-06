@@ -4,6 +4,7 @@ Utility functions for ShEPhERD inference scaling.
 This module provides helper functions for working with ShEPhERD's inference output.
 """
 
+import json
 import logging
 from copy import deepcopy
 import signal
@@ -11,99 +12,130 @@ from contextlib import contextmanager
 import numpy as np
 
 from rdkit import Chem
-from rdkit.Chem import rdDetermineBonds
+from rdkit.Chem import rdDetermineBonds, AllChem
+from rdkit.Geometry import Point3D
 
-# 共价半径字典 (单位: Angstrom)
-# 来源: Cordero et al. (2008) Dalton Trans., 2832-2838
-COVALENT_RADII = {
-    1: 0.31, 2: 0.28, 3: 1.28, 4: 0.96, 5: 0.84, 6: 0.76, 7: 0.71, 8: 0.66,
-    9: 0.57, 10: 0.58, 11: 1.66, 12: 1.41, 13: 1.21, 14: 1.11, 15: 1.07, 16: 1.05,
-    17: 1.02, 18: 1.06, 19: 2.03, 20: 1.76, 21: 1.70, 22: 1.60, 23: 1.53, 24: 1.39,
-    25: 1.39, 26: 1.32, 27: 1.26, 28: 1.24, 29: 1.32, 30: 1.22, 31: 1.22, 32: 1.20,
-    33: 1.19, 34: 1.20, 35: 1.20, 36: 1.16, 37: 2.20, 38: 1.95, 39: 1.90, 40: 1.75,
-    41: 1.64, 42: 1.54, 43: 1.47, 44: 1.46, 45: 1.42, 46: 1.39, 47: 1.45, 48: 1.44,
-    49: 1.42, 50: 1.39, 51: 1.39, 52: 1.38, 53: 1.39, 54: 1.40
-}
-
-
-def add_bonds_by_distance(mol):
+def edge_list_to_adjacency_matrix(num_atoms, edge_index, edge_types):
     """
-    基于原子间距离手动添加化学键
+    Convert edge list format to adjacency matrix format.
     
-    Args:
-        mol: RDKit分子对象（只包含原子和3D坐标）
-        
+    Parameters:
+    - num_atoms: int, number of atoms
+    - edge_index: array of shape (2, num_edges) or (num_edges, 2) with edge indices
+    - edge_types: array of shape (num_edges,) with edge type indices
+    
     Returns:
-        RDKit分子对象（包含键信息）
+    - adjacency_matrix: array of shape (num_atoms, num_atoms) with bond type indices
     """
-    from rdkit import Chem
-    from rdkit.Chem import rdchem
+    adjacency_matrix = np.zeros((num_atoms, num_atoms), dtype=int)
     
-    conf = mol.GetConformer()
-    num_atoms = mol.GetNumAtoms()
+    # Ensure edge_index has shape (2, num_edges)
+    if edge_index.shape[0] != 2:
+        edge_index = edge_index.T
     
-    print(f"  开始基于距离添加键（{num_atoms}个原子）...")
+    # Fill adjacency matrix (upper triangular)
+    for idx in range(edge_index.shape[1]):
+        i, j = edge_index[0, idx], edge_index[1, idx]
+        # Ensure upper triangular
+        if i < j:
+            adjacency_matrix[i, j] = edge_types[idx]
+        else:
+            adjacency_matrix[j, i] = edge_types[idx]
     
-    # 创建可编辑的分子
-    editable_mol = Chem.EditableMol(mol)
-    bonds_added = 0
+    return adjacency_matrix
+
+
+def build_3d_mol_from_arrays(atom_type_array, bond_adjacent_array, positions_3d, bond_types=None):
+    """
+    Build a 3D RDKit molecule from atom types, bond adjacency array, and 3D positions.
     
-    # 遍历所有原子对
-    for i in range(num_atoms):
-        for j in range(i + 1, num_atoms):
-            atom_i = mol.GetAtomWithIdx(i)
-            atom_j = mol.GetAtomWithIdx(j)
+    Parameters:
+    - atom_type_array: array of shape (N,) with atomic numbers (1=H, 6=C, 7=N, 8=O, etc.)
+    - bond_adjacent_array: array of shape (N, N) with bond type indices (upper triangular)
+    - positions_3d: array of shape (N, 3) with 3D coordinates
+    - bond_types: list of bond type strings (default: [None, 'SINGLE', 'DOUBLE', 'TRIPLE', 'AROMATIC'])
+    
+    Returns:
+    - RDKit Mol object with 3D coordinates
+    """
+    
+    if bond_types is None:
+        bond_types = [None, 'SINGLE', 'DOUBLE', 'TRIPLE', 'AROMATIC']
+    
+    # Create editable molecule
+    mol = Chem.EditableMol(Chem.Mol())
+    
+    # Keep track of original to new atom indices (excluding H atoms)
+    atom_idx_mapping = {}
+    new_atom_idx = 0
+    
+    # Add atoms (skip hydrogen atoms with atomic number 1)
+    for i, atomic_number in enumerate(atom_type_array):
+        if atomic_number == 0 or atomic_number == 1:
+            continue  # Skip None (0) or hydrogen atoms (1)
             
-            # 获取原子序数
-            atomic_num_i = atom_i.GetAtomicNum()
-            atomic_num_j = atom_j.GetAtomicNum()
-            
-            # 获取共价半径（如果不在字典中，使用默认值1.0）
-            radius_i = COVALENT_RADII.get(atomic_num_i, 1.0)
-            radius_j = COVALENT_RADII.get(atomic_num_j, 1.0)
-            
-            # 计算原子间距离
-            pos_i = conf.GetAtomPosition(i)
-            pos_j = conf.GetAtomPosition(j)
-            distance = pos_i.Distance(pos_j)
-            
-            # 键长阈值：共价半径之和的0.8到1.3倍
-            min_bond_length = (radius_i + radius_j) * 0.75
-            max_bond_length = (radius_i + radius_j) * 1.30
-            
-            # 如果距离在合理范围内，添加键
-            if min_bond_length <= distance <= max_bond_length:
-                # 根据距离判断键的类型
-                ideal_single = (radius_i + radius_j)
-                ideal_double = ideal_single * 0.87  # 双键通常短10-15%
-                ideal_triple = ideal_single * 0.78  # 三键通常短20-25%
+        # Create atom using atomic number
+        atom = Chem.Atom(int(atomic_number))
+        mol.AddAtom(atom)
+        atom_idx_mapping[i] = new_atom_idx
+        new_atom_idx += 1
+    
+    # Add bonds
+    n_atoms = len(atom_type_array)
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            # Skip if either atom was excluded (hydrogen or invalid)
+            if i not in atom_idx_mapping or j not in atom_idx_mapping:
+                continue
                 
-                # 判断键类型（简化判断）
-                if distance < ideal_triple * 1.1:
-                    bond_type = rdchem.BondType.TRIPLE
-                elif distance < ideal_double * 1.1:
-                    bond_type = rdchem.BondType.DOUBLE
-                else:
-                    bond_type = rdchem.BondType.SINGLE
+            bond_type_idx = bond_adjacent_array[i][j]
+            if bond_type_idx == 0 or bond_type_idx >= len(bond_types):
+                continue  # Skip None bonds or invalid indices
                 
-                try:
-                    editable_mol.AddBond(i, j, bond_type)
-                    bonds_added += 1
-                except Exception as e:
-                    print(f"    警告: 无法添加键 {i}-{j}: {e}")
+            bond_type_str = bond_types[bond_type_idx]
+            
+            # Convert bond type string to RDKit bond type
+            if bond_type_str == 'SINGLE':
+                bond_type = Chem.BondType.SINGLE
+            elif bond_type_str == 'DOUBLE':
+                bond_type = Chem.BondType.DOUBLE
+            elif bond_type_str == 'TRIPLE':
+                bond_type = Chem.BondType.TRIPLE
+            elif bond_type_str == 'AROMATIC':
+                bond_type = Chem.BondType.AROMATIC
+            else:
+                continue  # Skip unknown bond types
+            
+            mol.AddBond(atom_idx_mapping[i], atom_idx_mapping[j], bond_type)
     
-    print(f"  ✓ 成功添加 {bonds_added} 个化学键")
+    # Convert to molecule
+    mol = mol.GetMol()
     
-    # 转换回普通分子
-    mol_with_bonds = editable_mol.GetMol()
+    if mol is None:
+        return None
     
-    return mol_with_bonds
+    # Add 3D coordinates
+    conf = Chem.Conformer(mol.GetNumAtoms())
+    for orig_idx, new_idx in atom_idx_mapping.items():
+        x, y, z = positions_3d[orig_idx]
+        conf.SetAtomPosition(new_idx, Point3D(float(x), float(y), float(z)))
+    
+    mol.AddConformer(conf)
+    
+    # Sanitize molecule
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception as e:
+        print(f"Warning: Could not sanitize molecule: {e}")
+        print("Returning unsanitized molecule.")
+    
+    return mol
+
 
 
 class TimeoutException(Exception):
     """超时异常"""
     pass
-
 
 @contextmanager
 def time_limit(seconds):
@@ -189,11 +221,16 @@ def create_rdkit_molecule(sample):
     print("✓ 输入数据检查通过")
 
     # try:
-    # 阶段2: 提取原子和位置数据
-    print("\n📦 阶段2/7: 提取原子和位置数据...")
+    # 阶段2: 提取原子、位置和键数据
+    print("\n📦 阶段2/7: 提取原子、位置和键数据...")
     atoms = sample['x1']['atoms']
     positions = sample['x1']['positions']
+    bonds = sample['x1'].get('bonds', None)  # 键类型数据（edge list格式）
     print(f"✓ 提取到 {len(atoms)} 个原子, {len(positions)} 个坐标")
+    if bonds is not None:
+        print(f"✓ 提取到 {len(bonds)} 条键")
+    else:
+        print("⚠️  未找到键数据，将尝试使用备用方法")
     
     # 阶段3: 检查数据完整性
     print("\n🔍 阶段3/7: 检查数据完整性...")
@@ -206,11 +243,41 @@ def create_rdkit_molecule(sample):
         return None
     print(f"✓ 数据完整性检查通过: {len(atoms)} 个原子")
 
-    # 阶段4: 过滤有效的原子和位置数据
-    print("\n🧹 阶段4/7: 过滤和验证原子数据...")
+    # 阶段4: 先构建原始的邻接矩阵（基于所有原子）
+    print("\n📝 阶段4/7: 构建原始键邻接矩阵...")
+    original_bond_adjacent_array = None
+    
+    if bonds is not None:
+        try:
+            # 根据inference.py的逻辑，bonds是基于所有原子的完全图上三角矩阵
+            num_atoms_original = len(atoms)
+            expected_edges = num_atoms_original * (num_atoms_original - 1) // 2
+            
+            print(f"原始原子数: {num_atoms_original}, 期望边数: {expected_edges}, 实际bonds数: {len(bonds)}")
+            
+            if len(bonds) == expected_edges:
+                # 创建上三角邻接矩阵的edge_index
+                edge_sources = []
+                edge_targets = []
+                for i in range(num_atoms_original):
+                    for j in range(i + 1, num_atoms_original):
+                        edge_sources.append(i)
+                        edge_targets.append(j)
+                
+                edge_index = np.array([edge_sources, edge_targets])
+                original_bond_adjacent_array = edge_list_to_adjacency_matrix(num_atoms_original, edge_index, bonds)
+                print(f"✓ 成功构建原始键邻接矩阵（{np.sum(original_bond_adjacent_array > 0)}条键）")
+            else:
+                print(f"⚠️ 键数据长度({len(bonds)})与期望边数({expected_edges})不匹配")
+        except Exception as e:
+            print(f"⚠️ 构建原始邻接矩阵失败: {e}")
+    
+    # 阶段5: 过滤有效的原子、位置和对应的键
+    print("\n🧹 阶段5/7: 过滤和验证原子数据...")
     valid_atoms = []
     valid_positions = []
-    invalid_count = 0  # 统计无效原子数量
+    valid_indices = []  # 记录有效原子在原始数组中的索引
+    invalid_count = 0
     
     for a in range(len(atoms)):
         try:
@@ -224,7 +291,6 @@ def create_rdkit_molecule(sample):
                 continue
             
             # 检查位置是否包含NaN或无穷值
-            import numpy as np
             if np.any(np.isnan(position)) or np.any(np.isinf(position)):
                 print(f"Atom {a} has invalid position (NaN/Inf): {position}")
                 invalid_count += 1
@@ -238,6 +304,7 @@ def create_rdkit_molecule(sample):
             
             valid_atoms.append(atomic_number)
             valid_positions.append(position)
+            valid_indices.append(a)
             
         except (ValueError, TypeError, IndexError) as e:
             print(f"Error processing atom {a}: {e}")
@@ -257,39 +324,48 @@ def create_rdkit_molecule(sample):
     if len(valid_atoms) == 0:
         print("❌ 过滤后没有有效原子")
         return None
-
-    # 阶段5: 创建XYZ格式字符串
-    print(f"\n📝 阶段5/7: 创建XYZ格式字符串（{len(valid_atoms)}个原子）...")
-    xyz = f'{len(valid_atoms)}\n\n'
-    for i, (atomic_number, position) in enumerate(zip(valid_atoms, valid_positions)):
-        try:
-            symbol = Chem.Atom(atomic_number).GetSymbol()
-            xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
-        except Exception as e:
-            print(f"Error creating XYZ line for atom {i}: {e}")
-            continue
-
-    print("✓ XYZ格式字符串创建完成")
     
-    # 阶段6: 从XYZ创建分子对象
-    print("\n🔬 阶段6/7: 从XYZ创建分子对象...")
-    mol = Chem.MolFromXYZBlock(xyz)
-    if mol is None:
-        print("❌ 从XYZ创建分子失败")
-        print(f"XYZ内容:\n{xyz}")
+    # 从原始邻接矩阵中提取有效原子之间的键
+    bond_adjacent_array = None
+    if original_bond_adjacent_array is not None:
+        try:
+            print("提取有效原子之间的键...")
+            num_valid = len(valid_atoms)
+            bond_adjacent_array = np.zeros((num_valid, num_valid), dtype=int)
+            
+            for i in range(num_valid):
+                for j in range(i + 1, num_valid):
+                    orig_i = valid_indices[i]
+                    orig_j = valid_indices[j]
+                    bond_adjacent_array[i, j] = original_bond_adjacent_array[orig_i, orig_j]
+            
+            num_bonds = np.sum(bond_adjacent_array > 0)
+            print(f"✓ 成功提取键邻接矩阵（{num_bonds}条键）")
+        except Exception as e:
+            print(f"⚠️ 提取键信息失败: {e}")
+            bond_adjacent_array = None
+    
+    # 阶段6: 使用build_3d_mol_from_arrays创建分子
+    print("\n🔬 阶段6/7: 使用build_3d_mol_from_arrays创建分子对象...")
+    
+    if bond_adjacent_array is None:
+        print("❌ 键邻接矩阵不可用，跳过此分子")
         return None
-    print(f"✓ 分子对象创建成功（{mol.GetNumAtoms()}个原子）")
-
-    # 阶段7: 确定化学键（基于距离）
-    print("\n🔗 阶段7/7: 基于原子间距离确定化学键...")
-    try:
-        mol_final = add_bonds_by_distance(mol)
-        if mol_final is None:
-            print("❌ 基于距离添加键失败")
-            return None
-    except Exception as e:
-        print(f"❌ 添加化学键时出错: {e}")
+    
+    # 使用预测的键数据
+    print("使用模型预测的键数据构建分子...")
+    mol_final = build_3d_mol_from_arrays(
+        atom_type_array=np.array(valid_atoms),
+        bond_adjacent_array=bond_adjacent_array,
+        positions_3d=np.array(valid_positions)
+    )
+    if mol_final is None:
+        print("❌ 使用预测键数据创建分子失败，跳过此分子")
         return None
+    print(f"✓ 分子对象创建成功（{mol_final.GetNumAtoms()}个原子，{mol_final.GetNumBonds()}条键）")
+    
+    # 阶段7: 验证分子
+    print("\n🔗 阶段7/7: 验证分子...")
     
     print("\n✅ 化学键确定成功，开始验证分子...")
     # validate molecule
@@ -322,12 +398,14 @@ def create_rdkit_molecule(sample):
     print("=" * 60)
     return mol_final
         
-def create_rdkit_molecule_from_mol(atoms, positions):
+def create_rdkit_molecule_from_mol(atoms, positions, bonds=None):
     """
-    Create an RDKit molecule from ShEPhERD output using XYZ block approach.
+    Create an RDKit molecule from atoms, positions, and optional bonds data.
     
     Args:
-        sample (dict): ShEPhERD output dictionary with x1 containing atoms and positions.
+        atoms: array of atomic numbers
+        positions: array of 3D coordinates
+        bonds: optional array of bond types (edge list format)
         
     Returns:
         rdkit.Chem.rdchem.Mol: RDKit molecule object or None if conversion fails.
@@ -350,10 +428,38 @@ def create_rdkit_molecule_from_mol(atoms, positions):
         logging.warning(f"Mismatch between atoms ({len(atoms)}) and positions ({len(positions)}) count")
         return None
 
-    # 过滤有效的原子和位置数据
+    # 先构建原始的邻接矩阵（基于所有原子）
+    original_bond_adjacent_array = None
+    
+    if bonds is not None:
+        try:
+            num_atoms_original = len(atoms)
+            expected_edges = num_atoms_original * (num_atoms_original - 1) // 2
+            
+            logging.info(f"原始原子数: {num_atoms_original}, 期望边数: {expected_edges}, 实际bonds数: {len(bonds)}")
+            
+            if len(bonds) == expected_edges:
+                # 创建上三角邻接矩阵的edge_index
+                edge_sources = []
+                edge_targets = []
+                for i in range(num_atoms_original):
+                    for j in range(i + 1, num_atoms_original):
+                        edge_sources.append(i)
+                        edge_targets.append(j)
+                
+                edge_index = np.array([edge_sources, edge_targets])
+                original_bond_adjacent_array = edge_list_to_adjacency_matrix(num_atoms_original, edge_index, bonds)
+                logging.info(f"成功构建原始键邻接矩阵（{np.sum(original_bond_adjacent_array > 0)}条键）")
+            else:
+                logging.warning(f"键数据长度({len(bonds)})与期望边数({expected_edges})不匹配")
+        except Exception as e:
+            logging.warning(f"构建原始邻接矩阵失败: {e}")
+
+    # 过滤有效的原子、位置和对应的键
     valid_atoms = []
     valid_positions = []
-    invalid_count = 0  # 统计无效原子数量
+    valid_indices = []  # 记录有效原子在原始数组中的索引
+    invalid_count = 0
     
     for a in range(len(atoms)):
         try:
@@ -367,7 +473,6 @@ def create_rdkit_molecule_from_mol(atoms, positions):
                 continue
             
             # 检查位置是否包含NaN或无穷值
-            import numpy as np
             if np.any(np.isnan(position)) or np.any(np.isinf(position)):
                 print(f"Atom {a} has invalid position (NaN/Inf): {position}")
                 invalid_count += 1
@@ -381,6 +486,7 @@ def create_rdkit_molecule_from_mol(atoms, positions):
             
             valid_atoms.append(atomic_number)
             valid_positions.append(position)
+            valid_indices.append(a)
             
         except (ValueError, TypeError, IndexError) as e:
             print(f"Error processing atom {a}: {e}")
@@ -399,35 +505,42 @@ def create_rdkit_molecule_from_mol(atoms, positions):
         logging.warning("No valid atoms found after filtering")
         return None
 
-    # create XYZ format string with valid data only
-    xyz = f'{len(valid_atoms)}\n\n'
-    for i, (atomic_number, position) in enumerate(zip(valid_atoms, valid_positions)):
+    # 从原始邻接矩阵中提取有效原子之间的键
+    bond_adjacent_array = None
+    if original_bond_adjacent_array is not None:
         try:
-            symbol = Chem.Atom(atomic_number).GetSymbol()
-            xyz += f'{symbol} {position[0]:.3f} {position[1]:.3f} {position[2]:.3f}\n'
+            logging.info("提取有效原子之间的键...")
+            num_valid = len(valid_atoms)
+            bond_adjacent_array = np.zeros((num_valid, num_valid), dtype=int)
+            
+            for i in range(num_valid):
+                for j in range(i + 1, num_valid):
+                    orig_i = valid_indices[i]
+                    orig_j = valid_indices[j]
+                    bond_adjacent_array[i, j] = original_bond_adjacent_array[orig_i, orig_j]
+            
+            num_bonds = np.sum(bond_adjacent_array > 0)
+            logging.info(f"成功提取键邻接矩阵（{num_bonds}条键）")
         except Exception as e:
-            logging.warning(f"Error creating XYZ line for atom {i}: {e}")
-            continue
-
-    # create molecule from XYZ block
-    mol = Chem.MolFromXYZBlock(xyz)
-    if mol is None:
-        logging.warning("Failed to create molecule from XYZ block")
-        logging.debug(f"XYZ content:\n{xyz}")
+            logging.warning(f"提取键信息失败: {e}")
+            bond_adjacent_array = None
+    
+    # 使用build_3d_mol_from_arrays创建分子
+    if bond_adjacent_array is None:
+        logging.warning("键邻接矩阵不可用，跳过此分子")
         return None
-
-    # mol 不合理
-
-    # 基于距离添加化学键
-    logging.info(f"🔗 正在基于原子间距离确定化学键...")
-    try:
-        mol_final = add_bonds_by_distance(mol)
-        if mol_final is None:
-            logging.warning("Failed to add bonds based on distance")
-            return None
-    except Exception as e:
-        logging.warning(f"Error adding bonds: {e}")
+    
+    # 使用预测的键数据
+    logging.info("使用模型预测的键数据构建分子...")
+    mol_final = build_3d_mol_from_arrays(
+        atom_type_array=np.array(valid_atoms),
+        bond_adjacent_array=bond_adjacent_array,
+        positions_3d=np.array(valid_positions)
+    )
+    if mol_final is None:
+        logging.warning("使用预测键数据创建分子失败，跳过此分子")
         return None
+    logging.info(f"分子对象创建成功（{mol_final.GetNumAtoms()}个原子，{mol_final.GetNumBonds()}条键）")
     
     # validate molecule
     try:

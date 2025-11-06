@@ -126,8 +126,17 @@ class OnlineSamplingCallback(Callback):
             print(f"{'='*60}")
             all_generated_mols = sampler.batch_sample(seed_mol_list, show_progress=True)
             
-
-            ### 卡在这里？？？
+            # 统计采样结果
+            total_attempted = sum(len(mols) for mols in all_generated_mols)
+            total_successful = sum(sum(1 for mol in mols if mol is not None) for mols in all_generated_mols)
+            success_rate = (total_successful / total_attempted * 100) if total_attempted > 0 else 0.0
+            
+            print(f"\n{'='*60}")
+            print(f"📊 采样统计")
+            print(f"{'='*60}")
+            print(f"  ✅ 成功创建分子: {total_successful}/{total_attempted} ({success_rate:.1f}%)")
+            print(f"  ❌ 失败分子数: {total_attempted - total_successful}")
+            print(f"{'='*60}")
 
             # 5. 构建偏好对
             print(f"\n{'='*60}")
@@ -139,25 +148,45 @@ class OnlineSamplingCallback(Callback):
                 show_progress=True
             )
             
-            # 6. 数据重用策略：保留50%旧数据
-            if len(self.old_pairs_buffer) > 0:
-                keep_ratio = 0.5
-                n_keep = int(len(self.old_pairs_buffer) * keep_ratio)
-                kept_pairs = self.old_pairs_buffer[:n_keep]
-                print(f"保留了 {len(kept_pairs)} 个旧偏好对")
+            # 🛡️ 鲁棒性检查：如果所有样本生成都失败
+            if len(new_pairs) == 0:
+                print(f"\n{'='*60}")
+                print(f"⚠️  警告：所有样本生成失败，未能构建任何偏好对！")
+                print(f"{'='*60}")
                 
-                # 合并新旧数据
-                self.preference_pairs = kept_pairs + new_pairs
+                # 如果有旧数据，继续使用
+                if len(self.old_pairs_buffer) > 0:
+                    print(f"📦 使用上一轮的 {len(self.old_pairs_buffer)} 个偏好对继续训练")
+                    self.preference_pairs = self.old_pairs_buffer.copy()
+                else:
+                    # 没有任何偏好对，本epoch将使用标准训练而非DPO
+                    print(f"⚠️  无可用偏好对，本epoch将跳过DPO训练，仅进行标准扩散训练")
+                    self.preference_pairs = []
+                
+                print(f"{'='*60}\n")
             else:
-                self.preference_pairs = new_pairs
-            
-            # 7. 更新旧数据缓存
-            self.old_pairs_buffer = new_pairs.copy()
+                # 6. 数据重用策略：保留50%旧数据
+                if len(self.old_pairs_buffer) > 0:
+                    keep_ratio = 0.5
+                    n_keep = int(len(self.old_pairs_buffer) * keep_ratio)
+                    kept_pairs = self.old_pairs_buffer[:n_keep]
+                    print(f"保留了 {len(kept_pairs)} 个旧偏好对")
+                    
+                    # 合并新旧数据
+                    self.preference_pairs = kept_pairs + new_pairs
+                else:
+                    self.preference_pairs = new_pairs
+                
+                # 7. 更新旧数据缓存
+                self.old_pairs_buffer = new_pairs.copy()
             
             # 8. 更新训练器的DataLoader
-            if hasattr(trainer, 'train_dataloader') and hasattr(trainer.train_dataloader, 'update_dpo_dataset'):
-                trainer.train_dataloader.update_dpo_dataset(self.preference_pairs)
-                print(f"已更新DataLoader，当前共有 {len(self.preference_pairs)} 个偏好对")
+            if len(self.preference_pairs) > 0:
+                if hasattr(trainer, 'train_dataloader') and hasattr(trainer.train_dataloader, 'update_dpo_dataset'):
+                    trainer.train_dataloader.update_dpo_dataset(self.preference_pairs)
+                    print(f"已更新DataLoader，当前共有 {len(self.preference_pairs)} 个偏好对")
+            else:
+                print(f"⚠️  无偏好对可用，本epoch的DataLoader将为空（仅标准训练）")
         
         # 9. 同步所有进程（在DDP环境下等待rank 0完成采样）
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -168,39 +197,56 @@ class OnlineSamplingCallback(Callback):
         # 9. 统计信息
         elapsed_time = time.time() - start_time
         
-        if len(new_pairs) > 0:
-            # 从score_dict中提取total_score
-            scores_winner = [pair[2]['total_score'] for pair in new_pairs]
-            scores_loser = [pair[3]['total_score'] for pair in new_pairs]
+        if is_main_process:
+            if len(new_pairs) > 0:
+                # 从score_dict中提取total_score
+                scores_winner = [pair[2]['total_score'] for pair in new_pairs]
+                scores_loser = [pair[3]['total_score'] for pair in new_pairs]
+                
+                self.sampling_stats = {
+                    'n_samples': len(seed_indices),
+                    'n_valid_pairs': len(new_pairs),
+                    'avg_score_winner': np.mean(scores_winner),
+                    'avg_score_loser': np.mean(scores_loser),
+                    'score_gap': np.mean([w - l for w, l in zip(scores_winner, scores_loser)]),
+                    'sampling_time': elapsed_time,
+                    'valid_pair_ratio': len(new_pairs) / len(seed_indices) if len(seed_indices) > 0 else 0.0,
+                }
+                
+                # 记录到logger
+                pl_module.log('dpo_sampling/n_valid_pairs', len(new_pairs))
+                pl_module.log('dpo_sampling/avg_score_winner', self.sampling_stats['avg_score_winner'])
+                pl_module.log('dpo_sampling/avg_score_loser', self.sampling_stats['avg_score_loser'])
+                pl_module.log('dpo_sampling/score_gap', self.sampling_stats['score_gap'])
+                pl_module.log('dpo_sampling/sampling_time', elapsed_time)
+                pl_module.log('dpo_sampling/valid_pair_ratio', self.sampling_stats['valid_pair_ratio'])
+            else:
+                # 采样失败的情况
+                self.sampling_stats = {
+                    'n_samples': len(seed_indices) if 'seed_indices' in locals() else 0,
+                    'n_valid_pairs': 0,
+                    'avg_score_winner': 0.0,
+                    'avg_score_loser': 0.0,
+                    'score_gap': 0.0,
+                    'sampling_time': elapsed_time,
+                    'valid_pair_ratio': 0.0,
+                }
+                
+                # 记录失败情况
+                pl_module.log('dpo_sampling/n_valid_pairs', 0)
+                pl_module.log('dpo_sampling/sampling_time', elapsed_time)
+                pl_module.log('dpo_sampling/valid_pair_ratio', 0.0)
             
-            self.sampling_stats = {
-                'n_samples': len(seed_indices),
-                'n_valid_pairs': len(new_pairs),
-                'avg_score_winner': np.mean(scores_winner),
-                'avg_score_loser': np.mean(scores_loser),
-                'score_gap': np.mean([w - l for w, l in zip(scores_winner, scores_loser)]),
-                'sampling_time': elapsed_time,
-                'valid_pair_ratio': len(new_pairs) / len(seed_indices),
-            }
-            
-            # 记录到logger
-            pl_module.log('dpo_sampling/n_valid_pairs', len(new_pairs))
-            pl_module.log('dpo_sampling/avg_score_winner', self.sampling_stats['avg_score_winner'])
-            pl_module.log('dpo_sampling/avg_score_loser', self.sampling_stats['avg_score_loser'])
-            pl_module.log('dpo_sampling/score_gap', self.sampling_stats['score_gap'])
-            pl_module.log('dpo_sampling/sampling_time', elapsed_time)
-            pl_module.log('dpo_sampling/valid_pair_ratio', self.sampling_stats['valid_pair_ratio'])
-        
-        print(f"\n{'='*60}")
-        print(f"采样完成！")
-        print(f"  - 采样时间: {elapsed_time:.2f}秒")
-        print(f"  - 生成偏好对: {len(new_pairs)}")
-        print(f"  - 总偏好对: {len(self.preference_pairs)}")
-        if len(new_pairs) > 0:
-            print(f"  - Winner平均分: {self.sampling_stats['avg_score_winner']:.4f}")
-            print(f"  - Loser平均分: {self.sampling_stats['avg_score_loser']:.4f}")
-            print(f"  - 平均分差: {self.sampling_stats['score_gap']:.4f}")
-        print(f"{'='*60}\n")
+            print(f"\n{'='*60}")
+            print(f"采样完成！")
+            print(f"  - 采样时间: {elapsed_time:.2f}秒")
+            print(f"  - 新生成偏好对: {len(new_pairs)}")
+            print(f"  - 当前总偏好对: {len(self.preference_pairs)}")
+            if len(new_pairs) > 0:
+                print(f"  - Winner平均分: {self.sampling_stats['avg_score_winner']:.4f}")
+                print(f"  - Loser平均分: {self.sampling_stats['avg_score_loser']:.4f}")
+                print(f"  - 平均分差: {self.sampling_stats['score_gap']:.4f}")
+            print(f"{'='*60}\n")
     
     def on_train_epoch_end(self, trainer, pl_module):
         """

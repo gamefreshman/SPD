@@ -126,11 +126,14 @@ class MixedDataLoader:
         """
         更新DPO数据集
         在每个epoch开始时调用
+        
+        Args:
+            new_preference_pairs: 新的偏好对列表（可以为空）
         """
         if self.dpo_dataset is not None:
             self.dpo_dataset.update_pairs(new_preference_pairs)
             
-            # 重新创建DPO loader
+            # 重新创建DPO loader（如果有数据）
             if len(new_preference_pairs) > 0:
                 self.dpo_loader = PyGDataLoader(
                     dataset=self.dpo_dataset,
@@ -139,6 +142,10 @@ class MixedDataLoader:
                     num_workers=self.num_workers // 2 if self.num_workers > 1 else 0,
                     collate_fn=collate_dpo_batch,
                 )
+            else:
+                # 🛡️ 鲁棒性：如果偏好对为空，清空dpo_loader
+                # 这样__iter__中会只产生标准批次
+                self.dpo_loader = None
 
 
 def create_mixed_dataloader(

@@ -119,7 +119,7 @@ def process_batch(batch, atom_types_x1, bond_types_x1, max_node_types_x4, params
     
     return batch_atom_counts, batch_bond_counts, batch_pharm_counts
 
-# --- 主函数，用于缓存、加载和并行计算 (修正版) ---
+# --- 主函数，用于缓存、加载和并行计算 ---
 def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached_marginals"):
     """
     计算或加载缓存的特征边际分布。
@@ -469,8 +469,9 @@ if __name__ == '__main__':
         
         devices = num_gpus_to_use  if cuda_available else "auto", # 
         
-        strategy = DDPStrategy(find_unused_parameters=True) if (params['training']['num_gpus'] > 1 and cuda_available) else 'auto',
-        # DDP：单机多卡分布式训练  find_unused_parameters=True增加开销
+        # DDP策略配置：如果是多GPU或DPO模式，都需要find_unused_parameters=True
+        strategy = DDPStrategy(find_unused_parameters=True) if ((params['training']['num_gpus'] > 1 and cuda_available) or params['training'].get('enable_dpo', False)) else 'auto',
+        # find_unused_parameters=True 允许ref_model等参数不参与每个batch的计算
         precision = 32, 
         
         detect_anomaly = True, # 出现异常时，会抛出带栈信息的错误  调试使用
