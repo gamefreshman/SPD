@@ -1,0 +1,26 @@
+{
+    "model": {
+        "checkpoint_path": "/home1/zhh/workspace/SPD/evaluation/ckpt/last_27epoch.ckpt",
+        "description": "训练好的Shepherd模型检查点路径"
+    },
+    "data": {
+        "molblocks_path": "/home1/zhh/workspace/SPD/data/conformers/np/molblock_charges_NPs.pkl",
+        "description": "天然产物分子数据文件路径"
+    },
+    "sampling": {
+        "n_atoms": 70,
+        "batch_size": 1,
+        "enable_parallel": true,
+        "description": "采样参数: 生成分子的原子数、批次大小和并行设置"
+    },
+    "evaluation": {
+        "samples_per_molecule": 20,
+        "num_surf_points": 400,
+        "description": "评估参数: 每个分子采样数量和表面点数"
+    },
+    "output": {
+        "data_dir": "evaluation/core/data",
+        "log_file": "evaluation/core/evaluation.log",
+        "description": "输出目录和日志文件路径"
+    }
+}

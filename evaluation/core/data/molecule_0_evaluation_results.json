@@ -1,0 +1,454 @@
+{
+  "molecule_index": 0,
+  "total_samples": 20,
+  "success_statistics": {
+    "rdkit_success": 16,
+    "conf_success": 16,
+    "conf_valid": 0,
+    "cond_success": 0
+  },
+  "success_rates": {
+    "rdkit_creation_rate": 0.8,
+    "conf_evaluation_rate": 0.8,
+    "conf_validity_rate": 0.0,
+    "cond_evaluation_rate": 0.0
+  },
+  "evaluation_results": [
+    {
+      "sample_id": 0,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 0.9925627722410013,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 1,
+      "source_mol_index": 0,
+      "rdkit_creation_success": false,
+      "conf_evaluation_success": false,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {},
+      "cond_results": {},
+      "error_messages": [
+        "RDKit分子创建失败"
+      ]
+    },
+    {
+      "sample_id": 2,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.06324647433199,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 3,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": true,
+        "is_graph_consistent": false,
+        "strain_energy": 1.0455882911389978,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 4,
+      "source_mol_index": 0,
+      "rdkit_creation_success": false,
+      "conf_evaluation_success": false,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {},
+      "cond_results": {},
+      "error_messages": [
+        "RDKit分子创建失败"
+      ]
+    },
+    {
+      "sample_id": 5,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.350312187516991,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 6,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.2067908799200069,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 7,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.4915104464150062,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 8,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.4016142701839982,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 9,
+      "source_mol_index": 0,
+      "rdkit_creation_success": false,
+      "conf_evaluation_success": false,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {},
+      "cond_results": {},
+      "error_messages": [
+        "RDKit分子创建失败"
+      ]
+    },
+    {
+      "sample_id": 10,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.2646567377219924,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 11,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.507041737728997,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 12,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.4154214024569995,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 13,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.317402309086006,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 14,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.2415951828510003,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 15,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.263962626641998,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 16,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.360337090870999,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 17,
+      "source_mol_index": 0,
+      "rdkit_creation_success": false,
+      "conf_evaluation_success": false,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {},
+      "cond_results": {},
+      "error_messages": [
+        "RDKit分子创建失败"
+      ]
+    },
+    {
+      "sample_id": 18,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.2120153448969972,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    },
+    {
+      "sample_id": 19,
+      "source_mol_index": 0,
+      "rdkit_creation_success": true,
+      "conf_evaluation_success": true,
+      "conf_is_valid": false,
+      "cond_evaluation_success": false,
+      "conf_results": {
+        "is_valid": false,
+        "is_valid_post_opt": false,
+        "is_graph_consistent": false,
+        "strain_energy": 1.178414563844001,
+        "rmsd": null,
+        "SA_score": null,
+        "QED": null,
+        "logP": null,
+        "fsp3": null,
+        "smiles": null
+      },
+      "cond_results": {},
+      "error_messages": [
+        "分子conf评估无效，跳过cond评估"
+      ]
+    }
+  ]
+}
