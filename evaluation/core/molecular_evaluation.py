@@ -108,6 +108,167 @@ class MolecularEvaluator:
         
         logger.info(f"初始化完成，主设备: {self.primary_device}")
 
+    def convert_for_json(self, obj):
+        """递归转换numpy数组和torch张量为Python列表"""
+        if isinstance(obj, dict):
+            return {k: self.convert_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self.convert_for_json(elem) for elem in obj]
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy().tolist()
+        return obj
+
+    def save_raw_samples_to_spd(self, mol_index: int, samples: List[Dict[str, Any]]):
+        """保存原始样本数据到data/SPD/目录"""
+        if not samples:
+            logger.warning(f"分子 {mol_index} 无样本数据，跳过保存")
+            return
+        
+        # 创建SPD目录
+        spd_dir = Path('data/SPD')
+        spd_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 获取目标分子信息用于元数据
+        target_mol = rdkit.Chem.MolFromMolBlock(
+            self.molblocks_and_charges[mol_index][0], 
+            removeHs=False
+        )
+        
+        # 准备样本数据，包含详细元数据
+        samples_data = {
+            'metadata': {
+                'molecule_index': mol_index,
+                'natural_product_id': f'NP_{mol_index}',  # 自然产物编号
+                'natural_product_name': f'Natural_Product_{mol_index}',  # 自然产物名称
+                'timestamp': pd.Timestamp.now().isoformat(),
+                'total_samples': len(samples),
+                'target_molecule_info': {
+                    'num_atoms': target_mol.GetNumAtoms(),
+                    'num_bonds': target_mol.GetNumBonds(),
+                    'molecular_formula': rdkit.Chem.rdMolDescriptors.CalcMolFormula(target_mol),
+                    'molecular_weight': rdkit.Chem.rdMolDescriptors.CalcExactMolWt(target_mol),
+                } if target_mol else None,
+                'sampling_config': {
+                    'n_atoms': self.config['sampling']['n_atoms'],
+                    'batch_size': self.config['sampling']['batch_size'],
+                    'enable_parallel': self.config['sampling']['enable_parallel'],
+                    'samples_per_molecule': self.config['evaluation']['samples_per_molecule'],
+                    'num_surf_points': self.config['evaluation']['num_surf_points']
+                },
+                'device_info': {
+                    'primary_device': str(self.primary_device),
+                    'available_devices': [str(d) for d in self.available_devices]
+                }
+            },
+            'raw_samples': [
+                {
+                    **sample,  # 保留原始样本数据
+                    'natural_product_info': {  # 添加天然产物信息
+                        'natural_product_id': f'NP_{mol_index}',
+                        'natural_product_name': f'Natural_Product_{mol_index}',
+                        'target_molecule_index': mol_index
+                    }
+                } 
+                for sample in samples
+            ]
+        }
+        
+        # 使用convert_for_json转换数据
+        logger.info(f"🔄 转换分子 {mol_index} 的 {len(samples)} 个样本为JSON格式...")
+        samples_data_json = self.convert_for_json(samples_data)
+        
+        # 保存到文件 - 使用更明确的天然产物标识
+        output_file = spd_dir / f'NP_{mol_index}_Natural_Product_{mol_index}_raw_samples.json'
+        
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(samples_data_json, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"✅ 天然产物 NP_{mol_index} 原始样本已保存到 {output_file}")
+            logger.info(f"   📊 数据统计:")
+            logger.info(f"     - 天然产物ID: NP_{mol_index}")
+            logger.info(f"     - 样本数量: {len(samples)}")
+            logger.info(f"     - 文件大小: {output_file.stat().st_size / (1024*1024):.2f} MB")
+            if target_mol:
+                logger.info(f"   🎯 天然产物分子信息:")
+                logger.info(f"     - 原子数: {target_mol.GetNumAtoms()}")
+                logger.info(f"     - 键数: {target_mol.GetNumBonds()}")
+                logger.info(f"     - 分子式: {rdkit.Chem.rdMolDescriptors.CalcMolFormula(target_mol)}")
+                logger.info(f"     - 分子量: {rdkit.Chem.rdMolDescriptors.CalcExactMolWt(target_mol):.4f}")
+            logger.info(f"   📁 JSON结构: metadata + raw_samples")
+            logger.info(f"   🔄 所有numpy/torch数据已转换为JSON兼容格式")
+            
+        except Exception as e:
+            logger.error(f"❌ 保存分子 {mol_index} 原始样本失败: {str(e)}")
+
+    def create_natural_product_mapping(self):
+        """创建天然产物映射表并保存到SPD目录"""
+        spd_dir = Path('data/SPD')
+        spd_dir.mkdir(parents=True, exist_ok=True)
+        
+        mapping_data = {
+            'metadata': {
+                'title': '天然产物映射表',
+                'description': '包含所有天然产物分子的索引和基本信息',
+                'timestamp': pd.Timestamp.now().isoformat(),
+                'total_natural_products': len(self.molblocks_and_charges)
+            },
+            'natural_products': []
+        }
+        
+        for mol_index in range(len(self.molblocks_and_charges)):
+            try:
+                target_mol = rdkit.Chem.MolFromMolBlock(
+                    self.molblocks_and_charges[mol_index][0], 
+                    removeHs=False
+                )
+                
+                if target_mol:
+                    product_info = {
+                        'molecule_index': mol_index,
+                        'natural_product_id': f'NP_{mol_index}',
+                        'natural_product_name': f'Natural_Product_{mol_index}',
+                        'molecular_info': {
+                            'num_atoms': target_mol.GetNumAtoms(),
+                            'num_bonds': target_mol.GetNumBonds(),
+                            'molecular_formula': rdkit.Chem.rdMolDescriptors.CalcMolFormula(target_mol),
+                            'molecular_weight': rdkit.Chem.rdMolDescriptors.CalcExactMolWt(target_mol),
+                            'heavy_atoms': target_mol.GetNumHeavyAtoms()
+                        },
+                        'sampling_files': {
+                            'raw_samples_file': f'NP_{mol_index}_Natural_Product_{mol_index}_raw_samples.json',
+                            'evaluation_results_file': f'molecule_{mol_index}_evaluation_results.json'
+                        }
+                    }
+                else:
+                    product_info = {
+                        'molecule_index': mol_index,
+                        'natural_product_id': f'NP_{mol_index}',
+                        'natural_product_name': f'Natural_Product_{mol_index}',
+                        'molecular_info': None,
+                        'error': 'Failed to create RDKit molecule from molblock'
+                    }
+                
+                mapping_data['natural_products'].append(product_info)
+                
+            except Exception as e:
+                logger.warning(f"创建天然产物 {mol_index} 映射信息失败: {str(e)}")
+        
+        # 保存映射表
+        mapping_file = spd_dir / 'natural_products_mapping.json'
+        
+        try:
+            with open(mapping_file, 'w', encoding='utf-8') as f:
+                json.dump(mapping_data, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"✅ 天然产物映射表已保存到 {mapping_file}")
+            logger.info(f"   📋 包含 {len(mapping_data['natural_products'])} 个天然产物的详细信息")
+            
+        except Exception as e:
+            logger.error(f"❌ 保存天然产物映射表失败: {str(e)}")
+
     def load_model_and_data(self):
         """加载模型和天然产物数据"""
         logger.info("加载模型...")
@@ -128,6 +289,10 @@ class MolecularEvaluator:
         
         # 创建参考分子对象
         self._create_reference_molecules()
+        
+        # 创建天然产物映射表
+        logger.info("创建天然产物映射表...")
+        self.create_natural_product_mapping()
 
     def _create_reference_molecules(self):
         """创建参考分子对象用于conditional评估"""
@@ -217,6 +382,92 @@ class MolecularEvaluator:
         
         logger.info("边际分布计算完成")
 
+    def compute_marginal_distributions_for_single_molecule(self, mol_index: int):
+        """为单个目标分子计算其专属的边际分布"""
+        logger.info(f"🧮 为分子 {mol_index} 计算专属边际分布...")
+        
+        # 特征类型定义
+        atom_types_x1 = [None, 'H', 'C', 'N', 'O', 'F', 'Cl', 'Br', 'I', 'S', 'P', 'Si']
+        bond_types_x1 = [None, 'SINGLE', 'DOUBLE', 'TRIPLE', 'AROMATIC']
+        max_node_types_x4 = 10
+        
+        # 初始化计数器
+        atom_counts = torch.zeros(len(atom_types_x1), dtype=torch.float)
+        bond_counts = torch.zeros(len(bond_types_x1), dtype=torch.float)
+        pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
+        
+        def get_bond_type_str(bond):
+            return str(bond.GetBondType())
+        
+        try:
+            # 只对单个目标分子进行统计
+            mol_block, _ = self.molblocks_and_charges[mol_index]
+            mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
+            
+            if not mol:
+                logger.warning(f"无法创建分子 {mol_index}，使用全局边际分布")
+                return self.atom_marginals_x1, self.bond_marginals_x1, self.pharm_marginals_x4
+            
+            # 统计原子类型
+            for atom in mol.GetAtoms():
+                symbol = atom.GetSymbol()
+                if symbol in atom_types_x1:
+                    atom_counts[atom_types_x1.index(symbol)] += 1
+            
+            # 统计键类型
+            for bond in mol.GetBonds():
+                bond_str = get_bond_type_str(bond)
+                if bond_str in bond_types_x1:
+                    bond_counts[bond_types_x1.index(bond_str)] += 1
+            
+            # 统计药效团类型
+            try:
+                pharm_types_temp, _, _ = get_pharmacophores(
+                    mol, 
+                    multi_vector=False,
+                    check_access=False
+                )
+                for p_type in (pharm_types_temp + 1):
+                    if p_type < max_node_types_x4:
+                        pharm_counts[p_type] += 1
+            except Exception:
+                logger.warning(f"分子 {mol_index} 药效团计算失败")
+            
+            # 归一化为概率分布
+            atom_marginals = (atom_counts / atom_counts.sum()) if atom_counts.sum() > 0 else torch.ones_like(atom_counts) / len(atom_counts)
+            bond_marginals = (bond_counts / bond_counts.sum()) if bond_counts.sum() > 0 else torch.ones_like(bond_counts) / len(bond_counts)
+            pharm_marginals = (pharm_counts / pharm_counts.sum()) if pharm_counts.sum() > 0 else torch.ones_like(pharm_counts) / len(pharm_counts)
+            
+            # 打印统计信息
+            logger.info(f"✅ 分子 {mol_index} 边际分布统计:")
+            logger.info(f"  - 原子类型数: {(atom_counts > 0).sum().item()}")
+            logger.info(f"  - 键类型数: {(bond_counts > 0).sum().item()}")  
+            logger.info(f"  - 药效团类型数: {(pharm_counts > 0).sum().item()}")
+            
+            # 显示主要原子类型及其比例
+            main_atoms = []
+            for i, count in enumerate(atom_counts):
+                if count > 0 and i < len(atom_types_x1) and atom_types_x1[i] is not None:
+                    ratio = atom_marginals[i].item()
+                    main_atoms.append(f"{atom_types_x1[i]}:{count.item():.0f}({ratio:.2f})")
+            logger.info(f"  - 主要原子分布: {', '.join(main_atoms[:5])}")
+            
+            # 显示键类型分布
+            main_bonds = []
+            for i, count in enumerate(bond_counts):
+                if count > 0 and i < len(bond_types_x1) and bond_types_x1[i] is not None:
+                    ratio = bond_marginals[i].item()
+                    main_bonds.append(f"{bond_types_x1[i]}:{count.item():.0f}({ratio:.2f})")
+            if main_bonds:
+                logger.info(f"  - 主要键分布: {', '.join(main_bonds[:3])}")
+            
+            return atom_marginals, bond_marginals, pharm_marginals
+            
+        except Exception as e:
+            logger.error(f"❌ 分子 {mol_index} 边际分布计算失败: {str(e)}")
+            logger.info("回退到全局边际分布")
+            return self.atom_marginals_x1, self.bond_marginals_x1, self.pharm_marginals_x4
+
     def sample_molecules_for_target(self, mol_index: int, num_samples: int) -> List[Dict[str, Any]]:
         """为指定目标分子采样生成分子"""
         logger.info(f"🔧 [单GPU模式] 开始为分子 {mol_index} 采样 {num_samples} 个样本...")
@@ -277,6 +528,9 @@ class MolecularEvaluator:
         
         logger.info(f"采样配置: {n_atoms}个原子, batch_size={batch_size}, {num_iterations}次迭代")
         
+        # 🧮 为该分子计算专属边际分布
+        mol_atom_marginals, mol_bond_marginals, mol_pharm_marginals = self.compute_marginal_distributions_for_single_molecule(mol_index)
+        
         # 循环采样
         all_samples = []
         for iteration in range(num_iterations):
@@ -328,9 +582,9 @@ class MolecularEvaluator:
                     pharm_pos=pharm_pos,
                     pharm_direction=pharm_direction,
                     
-                    # 边际分布
-                    atom_marginals=self.atom_marginals_x1,
-                    bond_marginals=self.bond_marginals_x1,
+                    # 边际分布 - 使用该分子专属的边际分布
+                    atom_marginals=mol_atom_marginals,
+                    bond_marginals=mol_bond_marginals,
                 )
                 
                 # 添加分子索引信息
@@ -415,6 +669,11 @@ class MolecularEvaluator:
         
         logger.info(f"并行采样配置: {num_gpus}个GPU, 每GPU~{samples_per_gpu}样本, batch_size={batch_size}")
         
+        # 🧮 为该分子计算专属边际分布
+        print(f"🔧 DEBUG: 开始计算分子 {mol_index} 的专属边际分布...")
+        mol_atom_marginals, mol_bond_marginals, mol_pharm_marginals = self.compute_marginal_distributions_for_single_molecule(mol_index)
+        print(f"🔧 DEBUG: 分子 {mol_index} 边际分布计算完成")
+        
         # 创建采样任务列表
         sampling_tasks = []
         for i, device in enumerate(self.available_devices):
@@ -434,6 +693,10 @@ class MolecularEvaluator:
                     'pharm_types': pharm_types,
                     'pharm_pos': pharm_pos,
                     'pharm_direction': pharm_direction,
+                    # 🧮 传递该分子专属的边际分布
+                    'atom_marginals': mol_atom_marginals,
+                    'bond_marginals': mol_bond_marginals,
+                    'pharm_marginals': mol_pharm_marginals,
                 })
         
         print(f"🔧 DEBUG: 创建了 {len(sampling_tasks)} 个采样任务")
@@ -534,9 +797,9 @@ class MolecularEvaluator:
                             pharm_pos=task['pharm_pos'],
                             pharm_direction=task['pharm_direction'],
                             
-                            # 边际分布
-                            atom_marginals=self.atom_marginals_x1,
-                            bond_marginals=self.bond_marginals_x1,
+                            # 边际分布 - 使用该分子专属的边际分布
+                            atom_marginals=task['atom_marginals'],
+                            bond_marginals=task['bond_marginals'],
                         )
                         
                         logger.info(f"✅ GPU {gpu_id} 迭代 {iteration+1} 推理完成，生成 {len(generated_samples)} 个样本")
@@ -682,24 +945,32 @@ class MolecularEvaluator:
                     # 执行评估
                     cond_pipeline.evaluate(verbose=False)
                     
-                    # 获取结果
-                    properties_df, global_attrs = cond_pipeline.to_pandas()
+                    # 获取结果 - 注意：to_pandas()返回(pd.Series, pd.DataFrame)
+                    global_attrs, properties_df = cond_pipeline.to_pandas()
                     
                     result['cond_evaluation_success'] = True
                     
                     # 保存cond评估结果
                     if len(properties_df) > 0:
                         row = properties_df.iloc[0]  # 取第一行结果
+                        
+                        # 安全获取值的helper函数
+                        def safe_get(obj, key, default=np.nan):
+                            if hasattr(obj, 'get'):
+                                return obj.get(key, default)
+                            else:
+                                return obj[key] if key in obj else default
+                        
                         result['cond_results'] = {
-                            'sim_surf_target': float(row.get('sims_surf_target', np.nan)),
-                            'sim_esp_target': float(row.get('sims_esp_target', np.nan)),
-                            'sim_pharm_target': float(row.get('sims_pharm_target', np.nan)),
-                            'sim_surf_target_relax_optimal': float(row.get('sims_surf_target_relax_optimal', np.nan)),
-                            'sim_esp_target_relax_optimal': float(row.get('sims_esp_target_relax_optimal', np.nan)),
-                            'sim_pharm_target_relax_optimal': float(row.get('sims_pharm_target_relax_optimal', np.nan)),
-                            'graph_similarities': float(row.get('graph_similarities', np.nan)),
-                            'frac_valid': float(global_attrs.get('frac_valid', np.nan)),
-                            'frac_valid_post_opt': float(global_attrs.get('frac_valid_post_opt', np.nan)),
+                            'sim_surf_target': float(safe_get(row, 'sims_surf_target')),
+                            'sim_esp_target': float(safe_get(row, 'sims_esp_target')),
+                            'sim_pharm_target': float(safe_get(row, 'sims_pharm_target')),
+                            'sim_surf_target_relax_optimal': float(safe_get(row, 'sims_surf_target_relax_optimal')),
+                            'sim_esp_target_relax_optimal': float(safe_get(row, 'sims_esp_target_relax_optimal')),
+                            'sim_pharm_target_relax_optimal': float(safe_get(row, 'sims_pharm_target_relax_optimal')),
+                            'graph_similarities': float(safe_get(row, 'graph_similarities')),
+                            'frac_valid': float(safe_get(global_attrs, 'frac_valid')),
+                            'frac_valid_post_opt': float(safe_get(global_attrs, 'frac_valid_post_opt')),
                         }
                     
                 except Exception as e:
@@ -752,6 +1023,10 @@ class MolecularEvaluator:
             return
         
         logger.info(f"✅ 分子 {mol_index} 采样成功，共获得 {len(samples)} 个样本")
+        
+        # 💾 保存原始样本数据到data/SPD/目录
+        logger.info(f"💾 保存分子 {mol_index} 的原始样本数据...")
+        self.save_raw_samples_to_spd(mol_index, samples)
         
         # 评估每个样本
         results = []

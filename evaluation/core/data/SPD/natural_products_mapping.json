@@ -1,0 +1,58 @@
+{
+  "metadata": {
+    "title": "天然产物映射表",
+    "description": "包含所有天然产物分子的索引和基本信息",
+    "timestamp": "2025-11-08T09:16:23.626755",
+    "total_natural_products": 3
+  },
+  "natural_products": [
+    {
+      "molecule_index": 0,
+      "natural_product_id": "NP_0",
+      "natural_product_name": "Natural_Product_0",
+      "molecular_info": {
+        "num_atoms": 78,
+        "num_bonds": 81,
+        "molecular_formula": "C31H37NO9",
+        "molecular_weight": 567.2468317640011,
+        "heavy_atoms": 41
+      },
+      "sampling_files": {
+        "raw_samples_file": "NP_0_Natural_Product_0_raw_samples.json",
+        "evaluation_results_file": "molecule_0_evaluation_results.json"
+      }
+    },
+    {
+      "molecule_index": 1,
+      "natural_product_id": "NP_1",
+      "natural_product_name": "Natural_Product_1",
+      "molecular_info": {
+        "num_atoms": 50,
+        "num_bonds": 53,
+        "molecular_formula": "C19H24O7",
+        "molecular_weight": 364.1522031080006,
+        "heavy_atoms": 26
+      },
+      "sampling_files": {
+        "raw_samples_file": "NP_1_Natural_Product_1_raw_samples.json",
+        "evaluation_results_file": "molecule_1_evaluation_results.json"
+      }
+    },
+    {
+      "molecule_index": 2,
+      "natural_product_id": "NP_2",
+      "natural_product_name": "Natural_Product_2",
+      "molecular_info": {
+        "num_atoms": 85,
+        "num_bonds": 90,
+        "molecular_formula": "C34H40O11",
+        "molecular_weight": 624.257062100001,
+        "heavy_atoms": 45
+      },
+      "sampling_files": {
+        "raw_samples_file": "NP_2_Natural_Product_2_raw_samples.json",
+        "evaluation_results_file": "molecule_2_evaluation_results.json"
+      }
+    }
+  ]
+}

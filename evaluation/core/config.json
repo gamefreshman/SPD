@@ -9,7 +9,7 @@
     },
     "sampling": {
         "n_atoms": 70,
-        "batch_size": 1,
+        "batch_size": 2,
         "enable_parallel": true,
         "description": "采样参数: 生成分子的原子数、批次大小和并行设置"
     },

@@ -1,0 +1,1076 @@
+正在评估第 1/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH      2.98833823      1.41810215      1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f482fac25f0>
+smiles                      C[C@@H]([C-]1CCCC1)N(C(=O)[O-])C(=O)NCC1(N(C)C...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                            -103.666975
+partial_charges             [0.00697022, 0.03286378, 0.05037515, -0.076840...
+solvent                                                                 water
+charge                                                                     -2
+xyz_block_post_opt          70\n\nH            1.15077887468400        1.2...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f482fac2350>
+smiles_post_opt             C[C@@H]([C-]1CCCC1)N(C(=O)[O-])C(=O)NCC1(N(C)C...
+molblock_post_opt           \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy_post_opt                                                   -103.745257
+partial_charges_post_opt    [-0.01541521, 0.0451992, 0.04573146, -0.082601...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             5.860881
+QED                                                                  0.427713
+logP                                                                 -1.12481
+fsp3                                                                 0.782609
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    5.860881
+QED_post_opt                                                         0.427713
+logP_post_opt                                                        -1.12481
+fsp3_post_opt                                                        0.782609
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.078282
+rmsd                                                                 1.517347
+dtype: object
+  ✓ 第 1 个结构评估完成 
+
+
+
+
+正在评估第 2/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC     -5.33093786     -0.30939457      0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f482fac2eb0>
+smiles                      [CH2+]CCNC(=O)N(CN(C)C)C(=O)C(=O)NC[C@H](CCNCC...
+molblock                    \n     RDKit          3D\n\n 70 69  0  0  0  0...
+energy                                                            -100.097819
+partial_charges             [-0.0824476, 0.04283545, -0.14676672, -0.02324...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nC           -4.15766687740258       -0.4...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f482fac2a50>
+smiles_post_opt             [CH2+]CCNC(=O)N(CN(C)C)C(=O)C(=O)NC[C@H](CCNCC...
+molblock_post_opt           \n     RDKit          3D\n\n 70 69  0  0  0  0...
+energy_post_opt                                                   -100.223675
+partial_charges_post_opt    [-0.07803153, 0.03726693, -0.16347636, -0.2538...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             5.386033
+QED                                                                  0.061175
+logP                                                                 -3.59651
+fsp3                                                                     0.75
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    4.942868
+QED_post_opt                                                         0.075704
+logP_post_opt                                                        -1.04511
+fsp3_post_opt                                                            0.75
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.125856
+rmsd                                                                     None
+dtype: object
+  ✓ 第 2 个结构评估完成 
+
+
+
+
+正在评估第 3/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH      1.00504088     -4.98924398     -1...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                             -97.746567
+partial_charges             [0.08852529, -0.03094568, 0.05220306, 0.027784...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nH            1.36583640767798       -4.7...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f482fac2c80>
+smiles_post_opt             CN(CCNC(=O)[C@H]1O[C@H]2C[C@@H]3CCN[C@H]2[C@@]...
+molblock_post_opt           \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy_post_opt                                                    -98.027567
+partial_charges_post_opt    [0.10201159, -0.03187434, 0.0566766, 0.0166722...
+is_valid                                                                False
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                     5.50406
+QED_post_opt                                                         0.486123
+logP_post_opt                                                          0.5944
+fsp3_post_opt                                                        0.863636
+morgan_fp_post_opt          [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, ...
+strain_energy                                                           0.281
+rmsd                                                                     None
+dtype: object
+  ✓ 第 3 个结构评估完成 
+
+
+
+
+正在评估第 4/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH     -0.14867646      2.24701428     -0...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                            -107.377649
+partial_charges             [0.05117551, 0.05168483, 0.19997718, 0.0257961...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nH            1.57934694160369        2.2...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                   -107.469771
+partial_charges_post_opt    [0.05722765, 0.04327317, 0.1949543, 0.02614504...
+is_valid                                                                False
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.092122
+rmsd                                                                     None
+dtype: object
+  ✓ 第 4 个结构评估完成 
+
+
+
+
+正在评估第 5/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC      2.67418671     -1.42896140      0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f482fac2b30>
+smiles                      [H]/N=C(/C)[C@@H](CN1C[CH+]CCN([S@@H](C)#[O+])...
+molblock                    \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy                                                              -99.20508
+partial_charges             [0.3099316, 0.08878027, 0.02822526, 0.12296227...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nC            1.78560600422747       -0.7...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f482fac2820>
+smiles_post_opt             [H]/N=C(/C)[C@@H](CN1C[CH+]CCN([S@@H](C)#[O+])...
+molblock_post_opt           \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy_post_opt                                                    -99.344561
+partial_charges_post_opt    [0.23789594, 0.08050231, 0.02328691, 0.1243257...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             6.167506
+QED                                                                  0.135177
+logP                                                                 -0.36974
+fsp3                                                                     0.85
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    6.167506
+QED_post_opt                                                         0.135177
+logP_post_opt                                                        -0.36974
+fsp3_post_opt                                                            0.85
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.139481
+rmsd                                                                 1.529983
+dtype: object
+  ✓ 第 5 个结构评估完成 
+
+
+
+
+正在评估第 6/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC     -5.46967173     -1.35615361     -0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f482fac2e40>
+smiles                      [CH2+][C@@H]1N[C@@H]1[C@]([CH2+])(CC)NC(=O)NC[...
+molblock                    \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy                                                            -100.369598
+partial_charges             [-0.07013226, 0.21437141, 0.0500935, 0.2388024...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nC           -4.14184373854280       -1.7...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f482fac2f90>
+smiles_post_opt             C=C[C@H](/N=C(\[O-])[C@H](CNC(=O)N[C@@]1([C@H]...
+molblock_post_opt           \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy_post_opt                                                   -100.711124
+partial_charges_post_opt    [-0.09553397, 0.20401856, 0.07270806, 0.058039...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             6.426011
+QED                                                                   0.12511
+logP                                                                 -2.71793
+fsp3                                                                 0.714286
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    6.405834
+QED_post_opt                                                         0.073314
+logP_post_opt                                                         -3.3812
+fsp3_post_opt                                                        0.714286
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.341526
+rmsd                                                                     None
+dtype: object
+  ✓ 第 6 个结构评估完成 
+
+
+
+
+正在评估第 7/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC      5.88458252      1.45701468     -0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f482fac2c10>
+smiles                      CC[C@@H]1OCCC[C@@H]1OC(=O)/[N+](=C\[C@]1(NC(=O...
+molblock                    \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy                                                            -100.115551
+partial_charges             [0.14329576, 0.07435006, -0.05852133, 0.045594...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nC            6.16784125289561        0.2...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f482fac2cf0>
+smiles_post_opt             CC[C@@H]1OCCC[C@@H]1OC(=O)N(C[C@@H](C)CCO)[C@@...
+molblock_post_opt           \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy_post_opt                                                   -100.293204
+partial_charges_post_opt    [0.14574097, 0.08401697, -0.06690491, 0.048230...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             5.287705
+QED                                                                  0.187877
+logP                                                                  1.94849
+fsp3                                                                 0.818182
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    4.897747
+QED_post_opt                                                         0.406129
+logP_post_opt                                                          1.9613
+fsp3_post_opt                                                        0.909091
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.177653
+rmsd                                                                     None
+dtype: object
+  ✓ 第 7 个结构评估完成 
+
+
+
+
+正在评估第 8/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC      1.48893976      3.44769692      0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e85f0>
+smiles                      CCC(=O)N1[C@H](CC)CC[C@]1(C)C(=O)N[C@@]1(NC(=O...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                            -104.277034
+partial_charges             [-0.06025456, -0.09590752, 0.03139276, 0.29885...
+solvent                                                                 water
+charge                                                                     -1
+xyz_block_post_opt          70\n\nC           -0.12668698446789        3.1...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f482fac2ba0>
+smiles_post_opt             CCC(=O)N1[C@H](CC)CC[C@]1(C)C(=O)N[C@@]1(NC(=O...
+molblock_post_opt           \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy_post_opt                                                   -104.362288
+partial_charges_post_opt    [-0.04888528, -0.07821386, 0.0508474, 0.269481...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             5.333512
+QED                                                                  0.497997
+logP                                                                   0.2515
+fsp3                                                                 0.818182
+morgan_fp                   [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    5.333512
+QED_post_opt                                                         0.497997
+logP_post_opt                                                          0.2515
+fsp3_post_opt                                                        0.818182
+morgan_fp_post_opt          [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.085254
+rmsd                                                                 1.378226
+dtype: object
+  ✓ 第 8 个结构评估完成 
+
+
+
+
+正在评估第 9/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC     -6.28087282     -0.34420490     -0...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                             -95.183035
+partial_charges             [-0.00450321, -0.15650066, 0.23926765, 0.04993...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nC           -5.51760363106346        0.6...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                    -95.308709
+partial_charges_post_opt    [-0.00227216, -0.13078151, 0.22951695, 0.02651...
+is_valid                                                                False
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.125674
+rmsd                                                                     None
+dtype: object
+  ✓ 第 9 个结构评估完成 
+
+
+
+
+正在评估第 10/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH     -2.97511840      1.00524783      3...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8ac0>
+smiles                      C[CH-]CN1CC[C@H](N2CCC[C@H](NC(=O)N(CC)C[C@]3(...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                              -95.07071
+partial_charges             [0.31929398, -0.18822856, 0.03650493, 0.322196...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nH           -3.33767363569763        1.1...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                    -95.156592
+partial_charges_post_opt    [0.31934259, -0.21854547, 0.04041601, 0.316142...
+is_valid                                                                 True
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                             4.957986
+QED                                                                  0.520261
+logP                                                                  0.58659
+fsp3                                                                 0.857143
+morgan_fp                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.085882
+rmsd                                                                     None
+dtype: object
+  ✓ 第 10 个结构评估完成 
+
+
+
+
+正在评估第 11/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC      3.44656253      4.10310936     -1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8890>
+smiles                      [CH2+][C@H](C)[C@H]1C(=O)N(C[C@H]([O-])C(=O)N2...
+molblock                    \n     RDKit          3D\n\n 70 73  0  0  0  0...
+energy                                                            -105.220054
+partial_charges             [-0.07189573, 0.08421441, -0.00218396, -0.5327...
+solvent                                                                 water
+charge                                                                     -1
+xyz_block_post_opt          70\n\nC            5.51870261816221        4.3...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e84a0>
+smiles_post_opt             C[C@H]1CN(C[C@H]2CCCC(=O)O2)C(=O)[C@@H]2CCN(C[...
+molblock_post_opt           \n     RDKit          3D\n\n 70 74  0  0  0  0...
+energy_post_opt                                                   -105.554139
+partial_charges_post_opt    [-0.08476116, 0.06433243, 0.00839825, -0.54214...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             6.605263
+QED                                                                  0.362872
+logP                                                                 -1.21512
+fsp3                                                                      0.8
+morgan_fp                   [1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    5.547032
+QED_post_opt                                                         0.530202
+logP_post_opt                                                          0.2975
+fsp3_post_opt                                                            0.84
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.334085
+rmsd                                                                     None
+dtype: object
+  ✓ 第 11 个结构评估完成 
+
+
+
+
+正在评估第 12/30 个生成结构...
+评估结果是： xyz_block                   70\n\nN     -0.79651302     -1.47033119     -1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8dd0>
+smiles                      CCCNS(=O)(=O)N1C[C@H]2CCC[C@H]2CC[C@@H]1CNC(=O...
+molblock                    \n     RDKit          3D\n\n 70 73  0  0  0  0...
+energy                                                              -94.76622
+partial_charges             [-0.23769249, 0.06885996, 0.0509983, 0.0558114...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nN           -0.89839693784177       -1.6...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e82e0>
+smiles_post_opt             CCCNS(=O)(=O)N1C[C@H]2CCC[C@H]2CC[C@@H]1CNC(=O...
+molblock_post_opt           \n     RDKit          3D\n\n 70 73  0  0  0  0...
+energy_post_opt                                                    -94.811572
+partial_charges_post_opt    [-0.27286568, 0.07220749, 0.05865534, 0.046565...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             4.559993
+QED                                                                  0.665882
+logP                                                                   3.0856
+fsp3                                                                 0.954545
+morgan_fp                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    4.559993
+QED_post_opt                                                         0.665882
+logP_post_opt                                                          3.0856
+fsp3_post_opt                                                        0.954545
+morgan_fp_post_opt          [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.045351
+rmsd                                                                 0.416334
+dtype: object
+  ✓ 第 12 个结构评估完成 
+
+
+
+
+正在评估第 13/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH     -4.79756165     -1.11746740     -1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8660>
+smiles                      CC[C@@H]1CCCCN1/C=C(\C#N)[C@H](N)C(=O)N(C)C[C@...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                             -90.080217
+partial_charges             [0.05679335, 0.04309173, 0.08213381, -0.057090...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nH           -4.83138025782185       -0.9...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8970>
+smiles_post_opt             CC[C@@H]1CCCCN1/C=C(\C#N)[C@H](N)C(=O)N(C)C[C@...
+molblock_post_opt           \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy_post_opt                                                    -90.138177
+partial_charges_post_opt    [0.1006424, 0.05800655, 0.08553456, -0.0399204...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             5.080936
+QED                                                                  0.511962
+logP                                                                  2.91287
+fsp3                                                                 0.791667
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    5.080936
+QED_post_opt                                                         0.511962
+logP_post_opt                                                         2.91287
+fsp3_post_opt                                                        0.791667
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                         0.05796
+rmsd                                                                 1.109122
+dtype: object
+  ✓ 第 13 个结构评估完成 
+
+
+
+
+正在评估第 14/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC     -2.79773068     -2.18425202      1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8b30>
+smiles                      CC[C@]12C[C@@H]3C[C@H]1CCN(C(=O)N1C(=O)[C@H]4C...
+molblock                    \n     RDKit          3D\n\n 70 74  0  0  0  0...
+energy                                                            -102.637059
+partial_charges             [-0.06379123, 0.04502016, 0.04707247, 0.055644...
+solvent                                                                 water
+charge                                                                     -1
+xyz_block_post_opt          70\n\nC           -2.68866563190159       -2.0...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8f20>
+smiles_post_opt             CC[C@]12C[C@@H]3C[C@H]1CCN(C(=O)N1C(=O)[C@H]4C...
+molblock_post_opt           \n     RDKit          3D\n\n 70 74  0  0  0  0...
+energy_post_opt                                                   -102.763967
+partial_charges_post_opt    [-0.05936829, 0.05601663, 0.05237749, 0.056654...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             6.184839
+QED                                                                  0.612307
+logP                                                                   0.6475
+fsp3                                                                    0.875
+morgan_fp                   [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    6.184839
+QED_post_opt                                                         0.612307
+logP_post_opt                                                          0.6475
+fsp3_post_opt                                                           0.875
+morgan_fp_post_opt          [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.126908
+rmsd                                                                 1.154898
+dtype: object
+  ✓ 第 14 个结构评估完成 
+
+
+
+
+正在评估第 15/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH      1.93714511     -0.81242985      0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8e40>
+smiles                      [CH2+][C@@H]1CCN2CCCCN[C@H]2[C@]1(C)C(=O)N(CCC...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                             -89.637233
+partial_charges             [0.12268767, 0.04457283, 0.13673635, 0.0319054...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nH            1.71421639963269       -0.2...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8d60>
+smiles_post_opt             CCCN(CC(=O)NC1CCCCC1)C(=O)[C@]1(C)[C@H]2CC[N@+...
+molblock_post_opt           \n     RDKit          3D\n\n 70 73  0  0  0  0...
+energy_post_opt                                                     -89.77892
+partial_charges_post_opt    [0.07927423, 0.04673824, 0.11093374, 0.0210444...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             4.173287
+QED                                                                  0.666801
+logP                                                                  2.54569
+fsp3                                                                 0.869565
+morgan_fp                   [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    5.594939
+QED_post_opt                                                         0.666473
+logP_post_opt                                                            2.24
+fsp3_post_opt                                                        0.913043
+morgan_fp_post_opt          [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.141687
+rmsd                                                                     None
+dtype: object
+  ✓ 第 15 个结构评估完成 
+
+
+
+
+正在评估第 16/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH      2.57683635      4.32564354      0...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                             -97.007137
+partial_charges             [0.03110395, 0.03685294, -0.50072034, -0.08311...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nH            3.64339390084387        4.5...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                     -97.17407
+partial_charges_post_opt    [0.06312175, 0.0204014, -0.53264587, -0.171448...
+is_valid                                                                False
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.166933
+rmsd                                                                     None
+dtype: object
+  ✓ 第 16 个结构评估完成 
+
+
+
+
+正在评估第 17/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH     -0.63500953     -0.18841420     -0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8a50>
+smiles                      [CH2-]CCN(C(C)=O)[C@H](CC)[C@H](C)CN[OH+]CC(=O...
+molblock                    \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy                                                             -90.806262
+partial_charges             [0.04528993, 0.03542339, 0.03648637, 0.0311754...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nH            0.40997121816016        0.0...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8820>
+smiles_post_opt             [CH2-]CCN(C(C)=O)[C@H](CC)[C@H](C)CN[OH+]CC(=O...
+molblock_post_opt           \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy_post_opt                                                     -90.90693
+partial_charges_post_opt    [0.07086983, 0.04135577, 0.037852, 0.0406245, ...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             7.010362
+QED                                                                    0.1573
+logP                                                                  1.01148
+fsp3                                                                 0.782609
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    7.010362
+QED_post_opt                                                           0.1573
+logP_post_opt                                                         1.01148
+fsp3_post_opt                                                        0.782609
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.100667
+rmsd                                                                 0.686837
+dtype: object
+  ✓ 第 17 个结构评估完成 
+
+
+
+
+正在评估第 18/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC     -5.39855909      0.22586028     -0...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                            -101.025606
+partial_charges             [-0.06807236, -0.054859, -0.08688241, -0.00882...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nC           -5.89802163664363       -0.6...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                   -101.281388
+partial_charges_post_opt    [-0.06480005, -0.06757581, -0.07373535, -0.027...
+is_valid                                                                False
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.255782
+rmsd                                                                     None
+dtype: object
+  ✓ 第 18 个结构评估完成 
+
+
+
+
+正在评估第 19/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH     -4.14315462     -1.53677189     -1...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                             -98.857054
+partial_charges             [0.23019718, 0.06203148, -0.52333062, 0.063427...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nH           -2.98273540453889       -1.3...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8c80>
+smiles_post_opt             C[C@@H]1CC[C@@H]2C[C@H]3CN([C@@H](O)C(=O)N(CCC...
+molblock_post_opt           \n     RDKit          3D\n\n 70 75  0  0  0  0...
+energy_post_opt                                                    -99.141879
+partial_charges_post_opt    [0.03931398, 0.05183017, -0.48695975, 0.057671...
+is_valid                                                                False
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                    7.080396
+QED_post_opt                                                         0.632943
+logP_post_opt                                                          2.7747
+fsp3_post_opt                                                            0.88
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.284825
+rmsd                                                                     None
+dtype: object
+  ✓ 第 19 个结构评估完成 
+
+
+
+
+正在评估第 20/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC      2.87361884     -1.68268669      1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8430>
+smiles                      C=C[C@@]1(C)C[CH+]CC[C@@H]1NC(=O)C[N@H+](C(=O)...
+molblock                    \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy                                                              -92.24978
+partial_charges             [-0.12971869, 0.04539418, 0.05288449, 0.120739...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nC            3.09321971041790       -1.0...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446e8040>
+smiles_post_opt             C=C[C@@]1(C)C[CH+]CC[C@@H]1NC(=O)C[N@H+](C(=O)...
+molblock_post_opt           \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy_post_opt                                                    -92.297802
+partial_charges_post_opt    [-0.12556948, 0.04100922, 0.02571387, 0.129426...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             5.824749
+QED                                                                  0.413499
+logP                                                                  1.62988
+fsp3                                                                 0.708333
+morgan_fp                   [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    5.824749
+QED_post_opt                                                         0.413499
+logP_post_opt                                                         1.62988
+fsp3_post_opt                                                        0.708333
+morgan_fp_post_opt          [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.048022
+rmsd                                                                 1.101001
+dtype: object
+  ✓ 第 20 个结构评估完成 
+
+
+
+
+正在评估第 21/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC     -5.31546736     -4.31851721     -0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9200>
+smiles                      [CH2+][C@H]1CN(C(=O)/[N+](=C\[C@@H](C[O-])N(C)...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                            -103.636466
+partial_charges             [-0.08893419, 0.06582246, 0.08907663, 0.067282...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nC           -6.24247716890442       -3.9...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                   -103.863726
+partial_charges_post_opt    [-0.08761233, 0.0592237, 0.07635007, 0.0887160...
+is_valid                                                                 True
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                             5.640537
+QED                                                                   0.31902
+logP                                                                  0.47379
+fsp3                                                                 0.782609
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, ...
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.227259
+rmsd                                                                     None
+dtype: object
+  ✓ 第 21 个结构评估完成 
+
+
+
+
+正在评估第 22/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC     -3.88076639     -5.19816160     -0...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9350>
+smiles                      CNC(=O)[C@H]1CN(C(=O)N(C)C[C@@](C)(O)OC(C)C)C[...
+molblock                    \n     RDKit          3D\n\n 70 70  0  0  0  0...
+energy                                                             -99.356272
+partial_charges             [-0.13040045, 0.0022081, 0.27060908, -0.180464...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nC           -5.26855864205797       -4.8...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446b95f0>
+smiles_post_opt             CNC(=O)[C@H]1CN(C(=O)N(C)C[C@@](C)(O)OC(C)C)C[...
+molblock_post_opt           \n     RDKit          3D\n\n 70 70  0  0  0  0...
+energy_post_opt                                                    -99.404826
+partial_charges_post_opt    [-0.12859617, -0.0014369, 0.26727091, -0.17005...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             4.464703
+QED                                                                  0.492633
+logP                                                                  -0.0462
+fsp3                                                                      0.9
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, ...
+SA_score_post_opt                                                    4.464703
+QED_post_opt                                                         0.492633
+logP_post_opt                                                         -0.0462
+fsp3_post_opt                                                             0.9
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, ...
+strain_energy                                                        0.048553
+rmsd                                                                 0.946207
+dtype: object
+  ✓ 第 22 个结构评估完成 
+
+
+
+
+正在评估第 23/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC      5.16539097      1.67846382     -1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446b99e0>
+smiles                      [CH2+]C(C)(C)/[NH+]=C(\[O-])N[C@@H](CC[O-])[C@...
+molblock                    \n     RDKit          3D\n\n 70 70  0  0  0  0...
+energy                                                            -103.434288
+partial_charges             [-0.1249801, 0.29715145, 0.0588894, 0.03821805...
+solvent                                                                 water
+charge                                                                     -1
+xyz_block_post_opt          70\n\nC            4.75201470034056        1.8...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9a50>
+smiles_post_opt             CC/C(C)=[NH+]/C([O-])=N/[C@@H](CCO)[C@@H](C)O/...
+molblock_post_opt           \n     RDKit          3D\n\n 70 70  0  0  0  0...
+energy_post_opt                                                   -103.667072
+partial_charges_post_opt    [-0.11752063, 0.28166053, 0.08492666, 0.044578...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             6.380676
+QED                                                                  0.289035
+logP                                                                 -0.41791
+fsp3                                                                 0.818182
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    6.168201
+QED_post_opt                                                         0.359997
+logP_post_opt                                                         -0.8947
+fsp3_post_opt                                                        0.818182
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.232784
+rmsd                                                                     None
+dtype: object
+  ✓ 第 23 个结构评估完成 
+
+
+
+
+正在评估第 24/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH     -4.40523529      1.73043120      1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9eb0>
+smiles                      CC(C)N([O-])C(=O)[NH2+]N1CCCN(C(=O)N[C@@]23CC(...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                            -107.693469
+partial_charges             [0.09374967, 0.05816635, -0.0037655, 0.0911362...
+solvent                                                                 water
+charge                                                                      1
+xyz_block_post_opt          70\n\nH           -4.26903886663746        2.1...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9580>
+smiles_post_opt             CC(C)N(O)C(=O)/[NH+]=N\CCCN(CN=C=O)C(=O)N[C@@]...
+molblock_post_opt           \n     RDKit          3D\n\n 70 71  0  0  0  0...
+energy_post_opt                                                   -107.889866
+partial_charges_post_opt    [0.09395533, 0.06633467, -0.010636, -0.1789704...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             6.600286
+QED                                                                  0.240042
+logP                                                                  -0.3485
+fsp3                                                                 0.809524
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, ...
+SA_score_post_opt                                                    6.411715
+QED_post_opt                                                         0.083866
+logP_post_opt                                                          0.0533
+fsp3_post_opt                                                        0.809524
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.196397
+rmsd                                                                     None
+dtype: object
+  ✓ 第 24 个结构评估完成 
+
+
+
+
+正在评估第 25/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH     -1.86485243     -3.90326619     -1...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446b92e0>
+smiles                      COC(=O)C[C@H](O)C/[N+](=[NH+]\[C@@]12CC[C@@](C...
+molblock                    \n     RDKit          3D\n\n 70 72  0  0  0  0...
+energy                                                            -106.160256
+partial_charges             [0.03197893, 0.07559623, 0.04853546, 0.1055328...
+solvent                                                                 water
+charge                                                                     -1
+xyz_block_post_opt          70\n\nH           -0.78161759124619       -3.1...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9cf0>
+smiles_post_opt             COC(=O)C[C@H](O)CN1N[C@@]23CC[C@@](C)(CN(C)C2)...
+molblock_post_opt           \n     RDKit          3D\n\n 70 73  0  0  0  0...
+energy_post_opt                                                   -106.526688
+partial_charges_post_opt    [0.02851796, 0.04299826, 0.05243637, 0.1152589...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                     False
+SA_score                                                             6.988802
+QED                                                                  0.160253
+logP                                                                 -3.82121
+fsp3                                                                 0.863636
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, ...
+SA_score_post_opt                                                     6.25986
+QED_post_opt                                                         0.385051
+logP_post_opt                                                         -2.0124
+fsp3_post_opt                                                        0.909091
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.366432
+rmsd                                                                     None
+dtype: object
+  ✓ 第 25 个结构评估完成 
+
+
+
+
+正在评估第 26/30 个生成结构...
+评估结果是： xyz_block                   70\n\nN     -1.97080672     -0.13813014      1...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                            -105.306545
+partial_charges             [-0.32264488, 0.08700861, -0.6342294, -0.21213...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nN           -2.74155230111846       -0.1...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                   -105.627049
+partial_charges_post_opt    [-0.32760318, 0.06644854, -0.45631504, -0.1664...
+is_valid                                                                False
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.320504
+rmsd                                                                     None
+dtype: object
+  ✓ 第 26 个结构评估完成 
+
+
+
+
+正在评估第 27/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH      0.09138810      5.26988506     -2...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9c80>
+smiles                      COC(=O)[C@@H](C)N(C)[C@@H](C(=O)NCOC(C)C)C(=O)...
+molblock                    \n     RDKit          3D\n\n 70 70  0  0  0  0...
+energy                                                            -108.432582
+partial_charges             [0.08121426, 0.15230568, -0.23127136, 0.095386...
+solvent                                                                 water
+charge                                                                     -1
+xyz_block_post_opt          70\n\nH            1.56765991377935        4.5...
+mol_post_opt                 <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9900>
+smiles_post_opt             COC(=O)[C@@H](C)N(C)[C@@H](C(=O)NCOC(C)C)C(=O)...
+molblock_post_opt           \n     RDKit          3D\n\n 70 70  0  0  0  0...
+energy_post_opt                                                   -108.485717
+partial_charges_post_opt    [0.07410504, 0.14477459, -0.20294153, 0.096391...
+is_valid                                                                 True
+is_valid_post_opt                                                        True
+is_graph_consistent                                                      True
+SA_score                                                             4.851786
+QED                                                                  0.193661
+logP                                                                  -1.6194
+fsp3                                                                 0.809524
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                    4.851786
+QED_post_opt                                                         0.193661
+logP_post_opt                                                         -1.6194
+fsp3_post_opt                                                        0.809524
+morgan_fp_post_opt          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+strain_energy                                                        0.053135
+rmsd                                                                  1.19371
+dtype: object
+  ✓ 第 27 个结构评估完成 
+
+
+
+
+正在评估第 28/30 个生成结构...
+评估结果是： xyz_block                   70\n\nN     -0.25226131      0.27470684      0...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                            -104.177476
+partial_charges             [-0.10279468, 0.0368391, -0.23452976, -0.28081...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nN            0.08058927715368        0.8...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                   -104.294405
+partial_charges_post_opt    [-0.07836146, 0.00020198, -0.18579135, -0.2686...
+is_valid                                                                False
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.116929
+rmsd                                                                     None
+dtype: object
+  ✓ 第 28 个结构评估完成 
+
+
+
+
+正在评估第 29/30 个生成结构...
+评估结果是： xyz_block                   70\n\nH      5.71318579      1.35148871     -2...
+mol                          <rdkit.Chem.rdchem.Mol object at 0x7f4a446b9040>
+smiles                      [H]/[O+]=C1\C[CH-]CC[C@@H](C)[C@H]1N(C)/C=[NH+...
+molblock                    \n     RDKit          3D\n\n 70 70  0  0  0  0...
+energy                                                             -99.480256
+partial_charges             [0.05955498, 0.04689522, 0.02354018, 0.0195836...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nH            6.32416978202919        0.9...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                    -99.900995
+partial_charges_post_opt    [0.04753973, 0.05192241, 0.03183589, 0.0158311...
+is_valid                                                                 True
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                             6.671176
+QED                                                                  0.034632
+logP                                                                 -2.33941
+fsp3                                                                 0.761905
+morgan_fp                   [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.420739
+rmsd                                                                     None
+dtype: object
+  ✓ 第 29 个结构评估完成 
+
+
+
+
+正在评估第 30/30 个生成结构...
+评估结果是： xyz_block                   70\n\nC      3.33172655      1.29356384      0...
+mol                                                                      None
+smiles                                                                   None
+molblock                                                                 None
+energy                                                            -100.293616
+partial_charges             [0.11322206, 0.05534552, 0.04219102, 0.0634594...
+solvent                                                                 water
+charge                                                                      0
+xyz_block_post_opt          70\n\nC            2.88006352711726        1.3...
+mol_post_opt                                                             None
+smiles_post_opt                                                          None
+molblock_post_opt                                                        None
+energy_post_opt                                                   -100.546745
+partial_charges_post_opt    [0.10629967, 0.06237433, 0.03724102, 0.1420392...
+is_valid                                                                False
+is_valid_post_opt                                                       False
+is_graph_consistent                                                     False
+SA_score                                                                 None
+QED                                                                      None
+logP                                                                     None
+fsp3                                                                     None
+morgan_fp                                                                None
+SA_score_post_opt                                                        None
+QED_post_opt                                                             None
+logP_post_opt                                                            None
+fsp3_post_opt                                                            None
+morgan_fp_post_opt                                                       None
+strain_energy                                                        0.253128
+rmsd                                                                     None
+dtype: object
+  ✓ 第 30 个结构评估完成 

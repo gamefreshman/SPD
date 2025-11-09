@@ -5,6 +5,6 @@ source .venv/bin/activate
 cd training
 
 # 运行 Python 训练脚本
-CUDA_VISIBLE_DEVICES="0,1"
+CUDA_VISIBLE_DEVICES="0"
 
 python new_train.py params_x1x3x4_dpo_finetune_nps 0
