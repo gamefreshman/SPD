@@ -22,8 +22,8 @@ from shepherd.shepherd_score_utils.generate_point_cloud import (
 )
 from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
 from shepherd.inference import inference_sample
-from shepherd.extract import create_rdkit_molecule
-
+# from shepherd.extract import create_rdkit_molecule
+from shepherd.extract_shepherd import create_rdkit_molecule
 
 class ShepherdScorer:
     """
@@ -342,7 +342,10 @@ class OnlineSampler:
             
             # 4. 使用inference_sample生成新分子
             print("    🔁 使用inference_sample生成新分子")
-            n_atoms = len(seed_mol.GetAtoms())
+            # 修复：使用固定的原子数而不是种子分子的原子数
+            # n_atoms = len(seed_mol.GetAtoms())  # 原代码：可能只有15-30个原子
+            n_atoms = self.params.get('sampling', {}).get('fixed_n_atoms', 70)  # 从配置读取，默认70
+            print(f"    📌 使用固定原子数: {n_atoms} (种子分子实际原子数: {len(seed_mol.GetAtoms())})")
             num_pharmacophores = len(pharm_types)
             
             # inference_sample期望numpy数组输入，内部会转换为GPU tensor

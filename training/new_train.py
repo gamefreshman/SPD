@@ -1,95 +1,111 @@
-from gc import callbacks
+#!/usr/bin/env python3
+"""
+SPD (Shepherd) 分子生成模型训练脚本
+支持标准扩散训练和DPO（Direct Preference Optimization）微调
+"""
+
+# ==================== 系统配置 ====================
 import resource
+# 提高文件描述符限制，防止多进程数据加载时文件句柄耗尽
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, rlimit[1]))
 
-#  **功能**: 提高系统允许打开的文件数量上限。
-#  **讲解**: 
-# 在数据加载时，尤其是使用多个工作进程 (`num_workers > 0`) 时，每个进程都可能打开数据文件。
-# 操作系统对单个进程能打开的文件描述符数量有限制。
-# 这几行代码获取当前的限制 (`getrlimit`)，然后将其下限提高到 2048 (`setrlimit`)，以防止因打开文件过多而导致程序崩溃。
-
-# 过滤pydantic警告
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, message=".*UnsupportedFieldAttributeWarning.*")
-warnings.filterwarnings("ignore", message=".*'repr' attribute.*")
-warnings.filterwarnings("ignore", message=".*'frozen' attribute.*")
-
-import rdkit
-import numpy as np
-import matplotlib.pyplot as plt
-
-import torch
-import torch_geometric
-from torch_geometric.nn import radius_graph
-import torch_scatter
-
-import pickle
-from copy import deepcopy
+# ==================== 导入依赖 ====================
+# 标准库
 import os
 import shutil
 import datetime
+import pickle
+import warnings
+import argparse
+import importlib
 import multiprocessing
-from tqdm import tqdm
+from functools import partial
+from copy import deepcopy
 
+# 第三方库
+import numpy as np
+import torch
+import torch.multiprocessing
+import torch_geometric
+from torch_geometric.data import HeteroData
+from torch_geometric.loader import DataLoader
+from tqdm import tqdm
+import rdkit
+import rdkit.Chem
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger, WandbLogger
+from pytorch_lightning.strategies.ddp import DDPStrategy
+from lightning_fabric.utilities.seed import seed_everything
 
-from torch_geometric.data import HeteroData
-
+# 项目模块
 from shepherd.model.model import Model
 from shepherd.lightning_module import LightningModule
-
-from shepherd.new_datasets import HeteroDataset # NEW (adjust path as needed)
-
-# DPO相关导入
+from shepherd.new_datasets import HeteroDataset
 from shepherd.dpo_dataset import DPODataset
 from shepherd.mixed_dataloader import create_mixed_dataloader
 from shepherd.callbacks import OnlineSamplingCallback, DPOMetricsCallback
 from shepherd.dpo_utils import OnlineSampler, ShepherdScorer
+from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
 
-from lightning_fabric.utilities.seed import seed_everything # 这么酷的名字
+# ==================== 警告过滤 ====================
+warnings.filterwarnings("ignore", category=UserWarning, message=".*UnsupportedFieldAttributeWarning.*")
+warnings.filterwarnings("ignore", message=".*'repr' attribute.*")
+warnings.filterwarnings("ignore", message=".*'frozen' attribute.*")
 
-import importlib
+# ==================== 全局配置 ====================
+# PyTorch多进程共享策略
+SHARING_STRATEGY = "file_system"
+torch.multiprocessing.set_sharing_strategy(SHARING_STRATEGY)
 
-import os
-import torch
-import rdkit
-from tqdm import tqdm
-import multiprocessing
-from functools import partial
+# 性能优化
+torch.set_float32_matmul_precision('medium')  # 利用Tensor Cores
+torch.backends.cudnn.benchmark = True  # 优化cudnn性能
 
-# --- 并行计算的工作函数 ---
+
+# ==================== 辅助函数 ====================
+def set_worker_sharing_strategy(worker_id: int) -> None:
+    """DataLoader worker初始化函数"""
+    torch.multiprocessing.set_sharing_strategy(SHARING_STRATEGY)
+
+
+def get_bond_type_str(bond):
+    """将RDKit键类型转换为字符串"""
+    return str(bond.GetBondType())
+
+
 def process_batch(batch, atom_types_x1, bond_types_x1, max_node_types_x4, params):
     """
-    处理一小批分子数据，并返回该批次中各种特征的计数结果。
-    这是并行化的核心部分。
+    并行处理分子批次，统计特征分布
+    
+    Args:
+        batch: 分子数据批次
+        atom_types_x1: 原子类型列表
+        bond_types_x1: 键类型列表
+        max_node_types_x4: 最大药效团类型数
+        params: 参数字典
+        
+    Returns:
+        tuple: (原子计数, 键计数, 药效团计数)
     """
-    # 初始化当前批次的计数器
+    # 初始化计数器
     batch_atom_counts = torch.zeros(len(atom_types_x1), dtype=torch.float)
     batch_bond_counts = torch.zeros(len(bond_types_x1), dtype=torch.float)
     batch_pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
 
-    # 辅助函数：将 RDKit 键类型对象映射到参数中使用的字符串表示形式
-    def get_bond_type_str(bond):
-        return str(bond.GetBondType())
-
-    # 导入 get_pharmacophores 函数
-    from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
-
-    # 迭代处理批次中的每个分子
+    # 处理每个分子
     for mol_block, _ in batch:
         mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
         if not mol:
             continue
 
-        # --- 1. 统计原子和键的类型 (for x1) ---
+        # 统计原子类型 (x1)
         if params['dataset']['compute_x1']:
             if params['dataset']['x1']['add_virtual_node']:
                 batch_atom_counts[atom_types_x1.index(None)] += 1
             
-            for atom in mol.GetAtoms(): # 遍历rdkit分子中的每个原子
+            for atom in mol.GetAtoms():
                 symbol = atom.GetSymbol()
                 if symbol in atom_types_x1:
                     batch_atom_counts[atom_types_x1.index(symbol)] += 1
@@ -99,31 +115,37 @@ def process_batch(batch, atom_types_x1, bond_types_x1, max_node_types_x4, params
                 if bond_str in bond_types_x1:
                     batch_bond_counts[bond_types_x1.index(bond_str)] += 1
 
-        # --- 2. 统计药效团类型 (for x4) ---
+        # 统计药效团类型 (x4)
         if params['dataset']['compute_x4']:
             if params['dataset']['x4']['add_virtual_node']:
                 batch_pharm_counts[0] += 1
             
-            try: # 返回三个值（类型、位置和方向）
+            try:
                 pharm_types, _, _ = get_pharmacophores(
                     mol, 
-                    multi_vector=params['dataset']['x4']['multivectors'],  # 是否使用多向量
-                    check_access=params['dataset']['x4']['check_accessibility'] # 是否检查 accessibility
+                    multi_vector=params['dataset']['x4']['multivectors'],
+                    check_access=params['dataset']['x4']['check_accessibility']
                 )
                 for p_type in (pharm_types + 1):
                     if p_type < max_node_types_x4:
                         batch_pharm_counts[p_type] += 1
             except Exception:
-                # 忽略无法处理的分子
-                pass
+                pass  # 忽略无法处理的分子
     
     return batch_atom_counts, batch_bond_counts, batch_pharm_counts
 
-# --- 主函数，用于缓存、加载和并行计算 ---
+
 def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached_marginals"):
     """
-    计算或加载缓存的特征边际分布。
-    如果缓存文件存在，则直接加载；否则，并行计算特征，保存结果，然后返回。
+    计算或加载缓存的特征边际分布
+    
+    Args:
+        params: 参数字典
+        molblocks_and_charges: 分子数据列表
+        cache_dir: 缓存目录
+        
+    Returns:
+        tuple: (原子边际分布, 键边际分布, 药效团边际分布)
     """
     # 确保缓存目录存在
     os.makedirs(cache_dir, exist_ok=True)
@@ -134,10 +156,10 @@ def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached
     bond_marginals_file = os.path.join(cache_dir, f"{dataset_name}_bond_marginals.pt")
     pharm_marginals_file = os.path.join(cache_dir, f"{dataset_name}_pharm_marginals.pt")
 
-    # --- 1. 检查并加载缓存 ---
-    if os.path.exists(atom_marginals_file) and \
-       os.path.exists(bond_marginals_file) and \
-       os.path.exists(pharm_marginals_file):
+    # 尝试加载缓存
+    if (os.path.exists(atom_marginals_file) and 
+        os.path.exists(bond_marginals_file) and 
+        os.path.exists(pharm_marginals_file)):
         
         print(f"--- 从 '{cache_dir}' 加载已缓存的边际分布 ---")
         atom_marginals_x1 = torch.load(atom_marginals_file, weights_only=True)
@@ -146,7 +168,7 @@ def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached
         print("--- 边际分布加载完毕 ---\n")
         return atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4
 
-    # --- 2. 如果没有缓存，则进行并行计算 ---
+    # 如果没有缓存，进行并行计算
     print("--- 未找到缓存，开始并行计算特征边际分布 ---")
     
     atom_types_x1 = params['dataset']['x1']['atom_types']
@@ -159,43 +181,46 @@ def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached
     total_pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
     
     # 设置并行计算参数
-    num_processes = multiprocessing.cpu_count()  # 使用所有可用的CPU核心
+    num_processes = multiprocessing.cpu_count()
+    batch_size_for_processing = 1000
+    batches = [molblocks_and_charges[i:i + batch_size_for_processing] 
+               for i in range(0, len(molblocks_and_charges), batch_size_for_processing)]
     
-    # 【修正点 1】定义一个合理的批次大小，并创建 batches 列表
-    # 这个值决定了每个“工作包裹”的大小
-    batch_size_for_processing = 1000   # 一直写死吗
-    batches = [molblocks_and_charges[i:i + batch_size_for_processing] for i in range(0, len(molblocks_and_charges), batch_size_for_processing)]
-    
-    # 创建一个偏函数 (partial function) 来固定 process_batch 的参数
+    # 创建偏函数
     worker_fn = partial(process_batch, 
                         atom_types_x1=atom_types_x1, 
                         bond_types_x1=bond_types_x1, 
                         max_node_types_x4=max_node_types_x4,
                         params=params)
 
-    # 【修正点 2】使用进程池并行处理我们创建好的 batches
+    # 并行处理
     with multiprocessing.Pool(processes=num_processes) as pool:
-        # 使用 tqdm 显示进度条。imap 现在迭代的是 batches 列表。
-        # chunksize=1 表示每次给一个工作进程分配一个 batch，这对于已经分好块的任务是高效的。
-        results = list(tqdm(pool.imap(worker_fn, batches, chunksize=1), total=len(batches), desc="并行统计特征"))
+        results = list(tqdm(pool.imap(worker_fn, batches, chunksize=1), 
+                           total=len(batches), desc="并行统计特征"))
 
-    # 汇总所有进程的结果
+    # 汇总结果
     for res in results:
         total_atom_counts += res[0]
         total_bond_counts += res[1]
         total_pharm_counts += res[2]
 
-    # --- 3. 计算边际分布 ---
-    atom_marginals_x1 = (total_atom_counts / total_atom_counts.sum()) if total_atom_counts.sum() > 0 else torch.ones_like(total_atom_counts) / len(total_atom_counts)
-    bond_marginals_x1 = (total_bond_counts / total_bond_counts.sum()) if total_bond_counts.sum() > 0 else torch.ones_like(total_bond_counts) / len(total_bond_counts)
-    pharm_marginals_x4 = (total_pharm_counts / total_pharm_counts.sum()) if total_pharm_counts.sum() > 0 else torch.ones_like(total_pharm_counts) / len(total_pharm_counts)
+    # 计算边际分布
+    atom_marginals_x1 = (total_atom_counts / total_atom_counts.sum() 
+                         if total_atom_counts.sum() > 0 
+                         else torch.ones_like(total_atom_counts) / len(total_atom_counts))
+    bond_marginals_x1 = (total_bond_counts / total_bond_counts.sum() 
+                         if total_bond_counts.sum() > 0 
+                         else torch.ones_like(total_bond_counts) / len(total_bond_counts))
+    pharm_marginals_x4 = (total_pharm_counts / total_pharm_counts.sum() 
+                          if total_pharm_counts.sum() > 0 
+                          else torch.ones_like(total_pharm_counts) / len(total_pharm_counts))
     
-    print("\n--- 边际分布 计算完毕 ---")
+    print("\n--- 边际分布计算完毕 ---")
     print(f"Atom Marginals (x1): {atom_marginals_x1}")
     print(f"Bond Marginals (x1): {bond_marginals_x1}")
     print(f"Pharmacophore Marginals (x4): {pharm_marginals_x4}")
     
-    # --- 4. 保存结果以备后用 ---
+    # 保存结果
     print(f"--- 将计算结果缓存到 '{cache_dir}' ---")
     torch.save(atom_marginals_x1, atom_marginals_file)
     torch.save(bond_marginals_x1, bond_marginals_file)
@@ -204,167 +229,132 @@ def compute_and_cache_marginals(params, molblocks_and_charges, cache_dir="cached
 
     return atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4
 
-# PyTorch 的 DataLoader 在使用多进程时，需要在主进程和工作进程之间共享数据。
-# 默认的共享策略是 "file_descriptor"，它有时会因为文件描述符耗尽而出错（与上面的 resource 设置相关）。
-# "file_system" 是一种更稳定、更通用的策略，它通过在共享内存中创建文件来实现数据共享。
 
-sharing_strategy = "file_system"
-torch.multiprocessing.set_sharing_strategy(sharing_strategy)
-
-torch.set_float32_matmul_precision('medium')  # 利用Tensor Cores
-torch.backends.cudnn.benchmark = True  # 优化cudnn性能
-
-def set_worker_sharing_strategy(worker_id: int) -> None:
-    torch.multiprocessing.set_sharing_strategy(sharing_strategy)
-
-if __name__ == '__main__':
+def load_dataset(params):
     """
-    This repository includes only a small subset of the training data so that the repository is self-contained.
-    After downloading the full training datasets (see README), change the corresponding lines of code below.
-    """
+    根据参数加载数据集
     
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("model_name", type=str)
-    parser.add_argument("seed", type=int)
-    args = parser.parse_args()
-    
-    # workers=True 确保 DataLoader 的工作进程也是可复现的。
-    seed_everything(seed = args.seed, workers = True)
-
-    # 它根据命令行传入的 model_name 动态地导入位于 parameters/ 目录下的对应 Python 文件（例如 parameters/my_model_config.py），并从中获取名为 params 的字典。
-    params = importlib.import_module(f'parameters.{args.model_name}').params
-    
-    # CHANGE ME ONCE FULL DATASETS ARE DOWNLOADED
-    if params['data'] == 'GDB17':
-        # sample data
-        molblocks_and_charges = []
-        with open(f'../data/conformers/gdb/example_molblock_charges.pkl', 'rb') as f:
-            molblocks_and_charges = pickle.load(f)
-
-        output_file = "GDB17"
-
-        """
-        # full dataset
-        molblocks_and_charges = []
-        for i in [0,1,2]:
-            with open(f'conformers/gdb/molblock_charges_{i}.pkl', 'rb') as f:
-                molblocks_and_charges_ = pickle.load(f) 
-            molblocks_and_charges += molblocks_and_charges_
+    Args:
+        params: 参数字典
         
-        # removing randomly-chosen test-set molecules prior to training
-        test_indices = np.load('conformers/gdb/random_split_test_indices.npy')
-        for index in tqdm(sorted(test_indices)[::-1]): # removing from end of list
-            if index < len(molblocks_and_charges):
-                molblocks_and_charges.pop(index)
-        """
+    Returns:
+        tuple: (分子数据列表, 输出文件名)
+    """
+    molblocks_and_charges = []
+    output_file = ""
     
-    # CHANGE ME ONCE FULL DATASETS ARE DOWNLOADED
-    if params['data'] == 'MOSES_aq':
-
-        # full dataset (注释掉用于调试)
-        # molblocks_and_charges = []
-        # for i in [0,1,2,3,4]:
-        #     with open(f'../data/molblock_charges_{i}.pkl', 'rb') as f:
-        #         molblocks_and_charges_ = pickle.load(f) 
-        #     molblocks_and_charges += molblocks_and_charges_
-
-        # sample data - 用于调试
-        molblocks_and_charges = []
-        with open(f'../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
+    if params['data'] == 'GDB17':
+        # 示例数据
+        with open('../data/conformers/gdb/example_molblock_charges.pkl', 'rb') as f:
             molblocks_and_charges = pickle.load(f)
-
+        output_file = "GDB17"
+        
+    elif params['data'] == 'MOSES_aq':
+        # 示例数据
+        with open('../data/conformers/moses_aq/example_molblock_charges.pkl', 'rb') as f:
+            molblocks_and_charges = pickle.load(f)
         output_file = "MOSES_aq"
     
-    # NPs数据集 - 用于DPO微调（3个天然产物分子）
-    if params['data'] == 'NPs':
-        molblocks_and_charges = []
-        with open(f'../data/conformers/np/molblock_charges_NPs.pkl', 'rb') as f:
+    elif params['data'] == 'NPs':
+        # NPs数据集 - 用于DPO微调（3个天然产物分子）
+        with open('../data/conformers/np/molblock_charges_NPs.pkl', 'rb') as f:
             molblocks_and_charges = pickle.load(f)
-        
         print(f"\n✅ 加载NPs数据集: {len(molblocks_and_charges)} 个分子（用于DPO微调）")
         output_file = "NPs"
+    
+    return molblocks_and_charges, output_file
 
-    #  pharmacophore 用于计算分子的药效团特征
-    atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4 = compute_and_cache_marginals(
-        params=params, 
-        molblocks_and_charges=molblocks_and_charges
-    )
 
-    print("✅ 计算完边际分布！")
-
-    dataset = HeteroDataset(
-        molblocks_and_charges = molblocks_and_charges, 
+def create_dataset(params, molblocks_and_charges, marginals):
+    """
+    创建HeteroDataset
+    
+    Args:
+        params: 参数字典
+        molblocks_and_charges: 分子数据
+        marginals: 边际分布元组
         
-        noise_schedule_dict = params['noise_schedules'],
-
+    Returns:
+        HeteroDataset: 数据集对象
+    """
+    atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4 = marginals
+    
+    dataset = HeteroDataset(
+        molblocks_and_charges=molblocks_and_charges,
+        noise_schedule_dict=params['noise_schedules'],
+        
+        # 边际分布
         atom_marginals_x1=atom_marginals_x1,
         bond_marginals_x1=bond_marginals_x1,
         pharm_marginals_x4=pharm_marginals_x4,
         
-        explicit_hydrogens = params['dataset']['explicit_hydrogens'],
-        use_MMFF94_charges = params['dataset']['use_MMFF94_charges'],
+        # 数据集配置
+        explicit_hydrogens=params['dataset']['explicit_hydrogens'],
+        use_MMFF94_charges=params['dataset']['use_MMFF94_charges'],
+        formal_charge_diffusion=False,  # 不进行形式电荷的扩散
         
-        # formal_charge_diffusion = params['x1_formal_charge_diffusion'], # 不进行形式电荷的扩散
-        formal_charge_diffusion = False ,
-
-        x1 = params['dataset']['compute_x1'],
-        x2 = params['dataset']['compute_x2'],
-        x3 = params['dataset']['compute_x3'],
-        x4 = params['dataset']['compute_x4'],
+        # 模态开关
+        x1=params['dataset']['compute_x1'],
+        x2=params['dataset']['compute_x2'],
+        x3=params['dataset']['compute_x3'],
+        x4=params['dataset']['compute_x4'],
         
-        recenter_x1 = params['dataset']['x1']['recenter'], 
-        add_virtual_node_x1 = params['dataset']['x1']['add_virtual_node'],
-        remove_noise_COM_x1 = params['dataset']['x1']['remove_noise_COM'],
-        atom_types_x1 = params['dataset']['x1']['atom_types'],
-        charge_types_x1 = params['dataset']['x1']['charge_types'],
-        bond_types_x1 = params['dataset']['x1']['bond_types'],
-        scale_atom_features_x1 = params['dataset']['x1']['scale_atom_features'],
-        scale_bond_features_x1 = params['dataset']['x1']['scale_bond_features'],
-
-        independent_timesteps_x2 = params['dataset']['x2']['independent_timesteps'],
-        recenter_x2 = params['dataset']['x2']['recenter'],
-        add_virtual_node_x2 = params['dataset']['x2']['add_virtual_node'],
-        remove_noise_COM_x2 = params['dataset']['x2']['remove_noise_COM'],
-        num_points_x2 = params['dataset']['x2']['num_points'],
+        # x1配置
+        recenter_x1=params['dataset']['x1']['recenter'],
+        add_virtual_node_x1=params['dataset']['x1']['add_virtual_node'],
+        remove_noise_COM_x1=params['dataset']['x1']['remove_noise_COM'],
+        atom_types_x1=params['dataset']['x1']['atom_types'],
+        charge_types_x1=params['dataset']['x1']['charge_types'],
+        bond_types_x1=params['dataset']['x1']['bond_types'],
+        scale_atom_features_x1=params['dataset']['x1']['scale_atom_features'],
+        scale_bond_features_x1=params['dataset']['x1']['scale_bond_features'],
         
-        independent_timesteps_x3 = params['dataset']['x3']['independent_timesteps'],
-        recenter_x3 = params['dataset']['x3']['recenter'],
-        add_virtual_node_x3 = params['dataset']['x3']['add_virtual_node'],
-        remove_noise_COM_x3 = params['dataset']['x3']['remove_noise_COM'],
-        num_points_x3 = params['dataset']['x3']['num_points'],
-        scale_node_features_x3 = params['dataset']['x3']['scale_node_features'],        
+        # x2配置
+        independent_timesteps_x2=params['dataset']['x2']['independent_timesteps'],
+        recenter_x2=params['dataset']['x2']['recenter'],
+        add_virtual_node_x2=params['dataset']['x2']['add_virtual_node'],
+        remove_noise_COM_x2=params['dataset']['x2']['remove_noise_COM'],
+        num_points_x2=params['dataset']['x2']['num_points'],
         
-        independent_timesteps_x4 = params['dataset']['x4']['independent_timesteps'],
-        recenter_x4 = params['dataset']['x4']['recenter'],
-        add_virtual_node_x4 = params['dataset']['x4']['add_virtual_node'],
-        remove_noise_COM_x4 = params['dataset']['x4']['remove_noise_COM'],
-        max_node_types_x4 = params['dataset']['x4']['max_node_types'],
-        scale_node_features_x4 = params['dataset']['x4']['scale_node_features'],
-        scale_vector_features_x4 = params['dataset']['x4']['scale_vector_features'],
-        multivectors = params['dataset']['x4']['multivectors'],
-        check_accessibility = params['dataset']['x4']['check_accessibility'],
+        # x3配置
+        independent_timesteps_x3=params['dataset']['x3']['independent_timesteps'],
+        recenter_x3=params['dataset']['x3']['recenter'],
+        add_virtual_node_x3=params['dataset']['x3']['add_virtual_node'],
+        remove_noise_COM_x3=params['dataset']['x3']['remove_noise_COM'],
+        num_points_x3=params['dataset']['x3']['num_points'],
+        scale_node_features_x3=params['dataset']['x3']['scale_node_features'],
         
-        probe_radius = params['dataset']['probe_radius'], # for x2 and x3   
+        # x4配置
+        independent_timesteps_x4=params['dataset']['x4']['independent_timesteps'],
+        recenter_x4=params['dataset']['x4']['recenter'],
+        add_virtual_node_x4=params['dataset']['x4']['add_virtual_node'],
+        remove_noise_COM_x4=params['dataset']['x4']['remove_noise_COM'],
+        max_node_types_x4=params['dataset']['x4']['max_node_types'],
+        scale_node_features_x4=params['dataset']['x4']['scale_node_features'],
+        scale_vector_features_x4=params['dataset']['x4']['scale_vector_features'],
+        multivectors=params['dataset']['x4']['multivectors'],
+        check_accessibility=params['dataset']['x4']['check_accessibility'],
+        
+        probe_radius=params['dataset']['probe_radius'],
     )
+    
+    return dataset
 
-    print("配置普通数据集完成")
+
+def create_dataloader(params, dataset, dpo_dataset=None):
+    """
+    创建DataLoader（标准或混合模式）
     
-    # 创建DPO数据集（如果启用）
-    dpo_dataset = None
-    if params['training'].get('enable_dpo', False):
-        print("\n初始化DPO数据集...")
-        dpo_dataset = DPODataset(
-            preference_pairs=[],  # 初始为空，会在第一个epoch后填充
-            base_dataset=dataset,
-            noise_schedule_dict=params['noise_schedules'],
-            params=params,
-        )
-    
-    # 创建DataLoader（标准或混合模式）
+    Args:
+        params: 参数字典
+        dataset: 标准数据集
+        dpo_dataset: DPO数据集（可选）
+        
+    Returns:
+        DataLoader: 数据加载器
+    """
     if params['training'].get('enable_dpo', False) and dpo_dataset is not None:
         print("创建混合DataLoader（标准 + DPO）...")
-        # 混合DataLoader
         train_loader = create_mixed_dataloader(
             standard_dataset=dataset,
             dpo_dataset=dpo_dataset,
@@ -373,224 +363,274 @@ if __name__ == '__main__':
             dpo_ratio=params['training'].get('dpo_batch_ratio', 0.3),
             shuffle=True,
             params=params,
-            multiprocessing_context=multiprocessing.get_context("spawn") if params['training']['multiprocessing_spawn'] else None,
+            multiprocessing_context=multiprocessing.get_context("spawn") 
+                if params['training']['multiprocessing_spawn'] else None,
             worker_init_fn=set_worker_sharing_strategy,
             persistent_workers=True,
         )
     else:
         print("创建标准DataLoader...")
-        # 标准DataLoader
-        if params['training']['multiprocessing_spawn']:
-            train_loader = torch_geometric.loader.DataLoader(
-                dataset = dataset,
-                num_workers = params['training']['num_workers'],     # 多进程       
-                batch_size = params['training']['batch_size'],
-                shuffle = True,
-                multiprocessing_context = multiprocessing.get_context("spawn"),
-                worker_init_fn=set_worker_sharing_strategy,
-                persistent_workers=True,
-            )
-        else:
-            train_loader = torch_geometric.loader.DataLoader(
-                dataset = dataset,
-                num_workers = params['training']['num_workers'],
-                batch_size = params['training']['batch_size'],
-                shuffle = True,
-                worker_init_fn=set_worker_sharing_strategy,
-                persistent_workers=True,
-            )
+        train_loader = torch_geometric.loader.DataLoader(
+            dataset=dataset,
+            num_workers=params['training']['num_workers'],
+            batch_size=params['training']['batch_size'],
+            shuffle=True,
+            multiprocessing_context=multiprocessing.get_context("spawn") 
+                if params['training']['multiprocessing_spawn'] else None,
+            worker_init_fn=set_worker_sharing_strategy,
+            persistent_workers=True,
+        )
     
+    return train_loader
+
+
+def setup_callbacks(params, dataset, molblocks_and_charges, output_dir, args):
+    """
+    设置训练回调
     
-    output_dir = f"jobs/{params['training']['output_dir']}"
-    try: os.mkdir(f"jobs/")
-    except: pass
-    try: os.mkdir(output_dir)
-    except: pass
-    
-    checkpoint_callback = ModelCheckpoint( # 保存训练过程中模型
-        save_top_k = 0,
-        save_last = True,
+    Args:
+        params: 参数字典
+        dataset: 数据集
+        molblocks_and_charges: 分子数据
+        output_dir: 输出目录
+        args: 命令行参数
+        
+    Returns:
+        list: 回调列表
+    """
+    # 基础回调
+    checkpoint_callback = ModelCheckpoint(
+        save_top_k=0,
+        save_last=True,
         monitor="train_loss",
         mode="min",
-        dirpath = output_dir,
+        dirpath=output_dir,
         filename="best-{step:09d}",
-        every_n_train_steps = params['training']['log_every_n_steps'],
-    )
-    csv_logger = CSVLogger( # 
-        save_dir = output_dir,
-        name = 'csv_logger',
-    )
-    wandb_logger = WandbLogger(
-        name=f"{args.model_name}-seed_{args.seed}-bs_{params['training']['batch_size']}",
-        entity="SPD_PaperParty",
-        project="SPD_Molecule_Generation",
-        save_dir=output_dir,
-        log_model="all", 
+        every_n_train_steps=params['training']['log_every_n_steps'],
     )
     
-    gradient_clip_val = params['training']['gradient_clip_val'] # 梯度裁剪阈值
-    accumulate_grad_batches = params['training']['accumulate_grad_batches'] # 累积多少个batch才更新
-    
-    from pytorch_lightning.strategies.ddp import DDPStrategy
-    
-    cuda_available = torch.cuda.is_available()
-    num_gpus_to_use = torch.cuda.device_count()
-
-    # 准备回调列表
     callbacks = [checkpoint_callback]
     
-    # 添加DPO回调
+    # DPO回调
     if params['training'].get('enable_dpo', False):
         print("\n添加DPO在线采样回调...")
         sampling_callback = OnlineSamplingCallback(
             params=params,
-            dataset=dataset, 
+            dataset=dataset,
             molblocks_and_charges=molblocks_and_charges
         )
         dpo_metrics_callback = DPOMetricsCallback()
         callbacks.extend([sampling_callback, dpo_metrics_callback])
         print("DPO回调已添加")
     
-    trainer = pl.Trainer(
-        callbacks = callbacks,
-        logger = [csv_logger, wandb_logger], # 可以挂多个
+    return callbacks
+
+
+def setup_loggers(output_dir, args, params):
+    """
+    设置日志记录器
+    
+    Args:
+        output_dir: 输出目录
+        args: 命令行参数
+        params: 参数字典
         
-        default_root_dir = output_dir,
-        accelerator = "gpu" if (params['training']['num_gpus'] >= 1 and cuda_available) else 'cpu', 
-        
-        max_epochs = 10000,
-        
-        gradient_clip_val = gradient_clip_val, # 在 optimizer.step() 前自动应用裁剪，防止梯度爆炸
-        accumulate_grad_batches = accumulate_grad_batches, # 梯度累积步数
-        
-        log_every_n_steps = params['training']['log_every_n_steps'], # 临时调整    多少step输出一次
-            
-        reload_dataloaders_every_n_epochs = 1, # re-shuffle training data after each epoch
-        
-        devices = num_gpus_to_use  if cuda_available else "auto", # 
-        
-        # DDP策略配置：如果是多GPU或DPO模式，都需要find_unused_parameters=True
-        strategy = DDPStrategy(find_unused_parameters=True) if ((params['training']['num_gpus'] > 1 and cuda_available) or params['training'].get('enable_dpo', False)) else 'auto',
-        # find_unused_parameters=True 允许ref_model等参数不参与每个batch的计算
-        precision = 32, 
-        
-        detect_anomaly = True, # 出现异常时，会抛出带栈信息的错误  调试使用
+    Returns:
+        list: 日志记录器列表
+    """
+    csv_logger = CSVLogger(
+        save_dir=output_dir,
+        name='csv_logger',
     )
     
-    model_pl = LightningModule(params)
-
-    wandb_logger.watch(model_pl, log="all", log_freq=500) # wandb 开始跟踪模型参数和梯度
-
-
-    print(sum(p.numel() for p in model_pl.parameters() if p.requires_grad))
+    wandb_logger = WandbLogger(
+        name=f"{args.model_name}-seed_{args.seed}-bs_{params['training']['batch_size']}",
+        entity="SPD_PaperParty",
+        project="SPD_Molecule_Generation",
+        save_dir=output_dir,
+        log_model="all",
+    )
     
-    resume_from_checkpoint = True
+    return [csv_logger, wandb_logger]
 
+
+def handle_checkpoint_loading(params, output_dir, model_pl):
+    """
+    处理checkpoint加载逻辑
+    
+    Args:
+        params: 参数字典
+        output_dir: 输出目录
+        model_pl: PyTorch Lightning模型
+        
+    Returns:
+        str or None: checkpoint路径
+    """
+    resume_from_checkpoint = True
     ckpt_path = f"{output_dir}/last.ckpt"
     
-    # 如果启用DPO且模型结构变化，处理checkpoint加载
-    if params['training'].get('enable_dpo', False):
-        # 优先检查是否配置了预训练模型路径
-        pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
-        if pretrained_path is not None:
-            # 构建完整路径
-            pretrained_ckpt_path = f"jobs/{pretrained_path}"
-            if os.path.exists(pretrained_ckpt_path):
-                print(f"\n🔄 DPO微调：从预训练模型加载权重")
-                print(f"   预训练checkpoint: {pretrained_ckpt_path}")
-                try:
-                    # 只加载模型权重（不加载optimizer等训练状态）
-                    checkpoint = torch.load(pretrained_ckpt_path, map_location='cpu')
-                    model_state_dict = checkpoint['state_dict']
-                    
-                    # 过滤出model的权重（排除ref_model）
-                    model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
-                    
-                    # 加载到当前模型
-                    missing, unexpected = model_pl.model.load_state_dict(model_weights, strict=False)
-                    
-                    # 同步权重到ref_model（DPO的参考模型）
-                    if hasattr(model_pl, 'ref_model'):
-                        model_pl.ref_model.load_state_dict(model_weights, strict=False)
-                        print(f"   ✅ 已同步权重到参考模型（ref_model）")
-                    
-                    print(f"   ✅ 成功加载预训练权重")
-                    if len(missing) > 0:
-                        print(f"   ⚠️  缺失的键: {len(missing)} 个")
-                    if len(unexpected) > 0:
-                        print(f"   ⚠️  未预期的键: {len(unexpected)} 个")
-                    
-                    # 检查是否有当前任务的checkpoint可以继续训练
-                    if os.path.exists(ckpt_path) and resume_from_checkpoint:
-                        print(f"\n   发现当前任务的checkpoint: {ckpt_path}")
-                        print(f"   将继续当前任务的训练（而不是从预训练重新开始）")
-                        # 保持ckpt_path，让trainer恢复训练状态
-                    else:
-                        print(f"\n   未找到当前任务的checkpoint，将从预训练模型开始新的DPO微调")
-                        ckpt_path = None  # 从预训练开始，不恢复训练状态
-                    
-                except Exception as e:
-                    print(f"   ❌ 加载预训练权重失败: {e}")
-                    print(f"   将从头开始训练")
-                    ckpt_path = None
-            else:
-                print(f"\n⚠️  预训练checkpoint不存在: {pretrained_ckpt_path}")
-                print(f"   将检查当前任务的checkpoint")
-                
-                # 降级到检查当前目录的checkpoint
-                if os.path.exists(ckpt_path) and resume_from_checkpoint:
-                    load_weights_only = params['training'].get('dpo_load_weights_only', True)
-                    if load_weights_only:
-                        print("\n✅ DPO模式：加载当前checkpoint的模型权重")
-                        try:
-                            checkpoint = torch.load(ckpt_path, map_location='cpu')
-                            model_state_dict = checkpoint['state_dict']
-                            model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
-                            model_pl.model.load_state_dict(model_weights, strict=False)
-                            if hasattr(model_pl, 'ref_model'):
-                                model_pl.ref_model.load_state_dict(model_weights, strict=False)
-                            print(f"   已从 {ckpt_path} 加载模型权重")
-                            ckpt_path = None
-                        except Exception as e:
-                            print(f"   ⚠️ 加载权重失败: {e}")
-                            ckpt_path = None
-                else:
-                    print("\n📝 DPO模式：未找到任何checkpoint，从头开始训练")
-                    ckpt_path = None
-        else:
-            # 没有配置预训练路径，按原有逻辑处理
-            if os.path.exists(ckpt_path) and resume_from_checkpoint:
-                load_weights_only = params['training'].get('dpo_load_weights_only', True)
-                
-                if load_weights_only:
-                    print("\n✅ DPO模式：加载旧checkpoint的模型权重（不加载optimizer状态）")
-                    try:
-                        checkpoint = torch.load(ckpt_path, map_location='cpu')
-                        model_state_dict = checkpoint['state_dict']
-                        model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
-                        model_pl.model.load_state_dict(model_weights, strict=False)
-                        if hasattr(model_pl, 'ref_model'):
-                            model_pl.ref_model.load_state_dict(model_weights, strict=False)
-                        print(f"   已从 {ckpt_path} 加载模型权重")
-                        ckpt_path = None
-                    except Exception as e:
-                        print(f"   ⚠️ 加载权重失败: {e}")
-                        print("   将从头开始训练")
-                        ckpt_path = None
-                else:
-                    print("\n⚠️  DPO模式：尝试完整恢复checkpoint（可能因optimizer不匹配而失败）")
-            else:
-                print("\n📝 DPO模式：未找到checkpoint，从头开始训练")
-                ckpt_path = None
-    else:
-        ckpt_path = ckpt_path if (os.path.exists(ckpt_path) & resume_from_checkpoint) else None
+    if not params['training'].get('enable_dpo', False):
+        # 标准模式
+        return ckpt_path if (os.path.exists(ckpt_path) and resume_from_checkpoint) else None
     
-    # avoid overwriting previous "last.ckpt"    trainer.global_rank保证只有主进程进行拷贝
+    # DPO模式的复杂加载逻辑
+    pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
+    
+    if pretrained_path is not None:
+        # 优先使用预训练模型
+        pretrained_ckpt_path = f"jobs/{pretrained_path}"
+        if os.path.exists(pretrained_ckpt_path):
+            print(f"\n🔄 DPO微调：从预训练模型加载权重")
+            print(f"   预训练checkpoint: {pretrained_ckpt_path}")
+            
+            try:
+                checkpoint = torch.load(pretrained_ckpt_path, map_location='cpu')
+                model_state_dict = checkpoint['state_dict']
+                model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
+                
+                missing, unexpected = model_pl.model.load_state_dict(model_weights, strict=False)
+                
+                if hasattr(model_pl, 'ref_model'):
+                    model_pl.ref_model.load_state_dict(model_weights, strict=False)
+                    print(f"   ✅ 已同步权重到参考模型（ref_model）")
+                
+                print(f"   ✅ 成功加载预训练权重")
+                if len(missing) > 0:
+                    print(f"   ⚠️  缺失的键: {len(missing)} 个")
+                if len(unexpected) > 0:
+                    print(f"   ⚠️  未预期的键: {len(unexpected)} 个")
+                
+                # 检查是否继续之前的训练
+                if os.path.exists(ckpt_path) and resume_from_checkpoint:
+                    print(f"\n   发现当前任务的checkpoint: {ckpt_path}")
+                    print(f"   将继续当前任务的训练")
+                    return ckpt_path
+                else:
+                    print(f"\n   未找到当前任务的checkpoint，将从预训练模型开始新的DPO微调")
+                    return None
+                    
+            except Exception as e:
+                print(f"   ❌ 加载预训练权重失败: {e}")
+                print(f"   将从头开始训练")
+                return None
+        else:
+            print(f"\n⚠️  预训练checkpoint不存在: {pretrained_ckpt_path}")
+    
+    # 检查当前目录的checkpoint
+    if os.path.exists(ckpt_path) and resume_from_checkpoint:
+        load_weights_only = params['training'].get('dpo_load_weights_only', True)
+        if load_weights_only:
+            print("\n✅ DPO模式：加载当前checkpoint的模型权重")
+            try:
+                checkpoint = torch.load(ckpt_path, map_location='cpu')
+                model_state_dict = checkpoint['state_dict']
+                model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
+                model_pl.model.load_state_dict(model_weights, strict=False)
+                if hasattr(model_pl, 'ref_model'):
+                    model_pl.ref_model.load_state_dict(model_weights, strict=False)
+                print(f"   已从 {ckpt_path} 加载模型权重")
+                return None  # 只加载权重，不恢复训练状态
+            except Exception as e:
+                print(f"   ⚠️ 加载权重失败: {e}")
+                return None
+    
+    print("\n📝 DPO模式：未找到任何checkpoint，从头开始训练")
+    return None
+
+
+# ==================== 主函数 ====================
+def main():
+    """主训练函数"""
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="SPD分子生成模型训练")
+    parser.add_argument("model_name", type=str, help="模型配置名称")
+    parser.add_argument("seed", type=int, help="随机种子")
+    args = parser.parse_args()
+    
+    # 设置随机种子
+    seed_everything(seed=args.seed, workers=True)
+    
+    # 加载参数
+    params = importlib.import_module(f'parameters.{args.model_name}').params
+    
+    # 加载数据集
+    molblocks_and_charges, output_file = load_dataset(params)
+    
+    # 计算边际分布
+    print("计算特征边际分布...")
+    marginals = compute_and_cache_marginals(params, molblocks_and_charges)
+    print("✅ 计算完边际分布！")
+    
+    # 创建数据集
+    dataset = create_dataset(params, molblocks_and_charges, marginals)
+    print("✅ 配置普通数据集完成")
+    
+    # 创建DPO数据集（如果启用）
+    dpo_dataset = None
+    if params['training'].get('enable_dpo', False):
+        print("\n初始化DPO数据集...")
+        dpo_dataset = DPODataset(
+            preference_pairs=[],
+            base_dataset=dataset,
+            noise_schedule_dict=params['noise_schedules'],
+            params=params,
+        )
+    
+    # 创建DataLoader
+    train_loader = create_dataloader(params, dataset, dpo_dataset)
+    
+    # 设置输出目录
+    output_dir = f"jobs/{params['training']['output_dir']}"
+    os.makedirs("jobs/", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 设置回调和日志
+    callbacks = setup_callbacks(params, dataset, molblocks_and_charges, output_dir, args)
+    loggers = setup_loggers(output_dir, args, params)
+    
+    # 设置训练器
+    cuda_available = torch.cuda.is_available()
+    num_gpus_to_use = torch.cuda.device_count()
+    
+    trainer = pl.Trainer(
+        callbacks=callbacks,
+        logger=loggers,
+        default_root_dir=output_dir,
+        accelerator="gpu" if (params['training']['num_gpus'] >= 1 and cuda_available) else 'cpu',
+        max_epochs=10000,
+        gradient_clip_val=params['training']['gradient_clip_val'],
+        accumulate_grad_batches=params['training']['accumulate_grad_batches'],
+        log_every_n_steps=params['training']['log_every_n_steps'],
+        reload_dataloaders_every_n_epochs=1,
+        devices=num_gpus_to_use if cuda_available else "auto",
+        strategy=DDPStrategy(find_unused_parameters=True) 
+            if ((params['training']['num_gpus'] > 1 and cuda_available) or 
+                params['training'].get('enable_dpo', False)) else 'auto',
+        precision=32,
+        detect_anomaly=True,
+    )
+    
+    # 创建模型
+    model_pl = LightningModule(params)
+    
+    # 设置wandb监控
+    loggers[1].watch(model_pl, log="all", log_freq=500)
+    
+    print(f"模型参数总数: {sum(p.numel() for p in model_pl.parameters() if p.requires_grad)}")
+    
+    # 处理checkpoint加载
+    ckpt_path = handle_checkpoint_loading(params, output_dir, model_pl)
+    
+    # 备份当前checkpoint
     if (ckpt_path is not None) and (trainer.global_rank == 0):
         date = datetime.datetime.now()
-        timestamp = str(date.year) + '_' + str(date.month).zfill(2) + '_' + str(date.day).zfill(2) + '_' + str(date.hour).zfill(2) + '_' + str(date.minute).zfill(2)
+        timestamp = date.strftime("%Y_%m_%d_%H_%M")
         shutil.copyfile(ckpt_path, f"{output_dir}/last_{timestamp}.ckpt")
     
-    
-    print('beginning to train...')
-    trainer.fit(model_pl, train_loader, ckpt_path = ckpt_path)
+    # 开始训练
+    print('开始训练...')
+    trainer.fit(model_pl, train_loader, ckpt_path=ckpt_path)
+
+
+if __name__ == '__main__':
+    main()

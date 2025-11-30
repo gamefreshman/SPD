@@ -44,9 +44,9 @@ params = {
         'train_x4_denoising': True,
         
         # 调整批次大小（因为只有3个分子）
-        'batch_size': 1,  # 小批次，适合3个分子的微调
+        'batch_size': 3,  # 小批次，适合3个分子的微调
         'accumulate_grad_batches': 1,  # 不累积梯度
-        'num_gpus': 1,  # 单GPU
+        'num_gpus': 3,  # 单GPU
         
         'lr': 0.0001,  # 较小的学习率用于微调
         'min_lr': 0.00001,
@@ -54,7 +54,7 @@ params = {
         
         'gradient_clip_val': 5.0,
         
-        'num_workers': 2,  # 减少worker数量
+        'num_workers': 4,  # 减少worker数量
         
         'output_dir': 'x1x3x4_dpo_finetune_nps/',  # 专门的输出目录
         
@@ -83,7 +83,7 @@ params = {
         'dpo_load_weights_only': True,  # 从旧checkpoint只加载权重
         
         # 预训练模型路径（从MOSES_aq模型开始微调）
-        'pretrained_checkpoint_path': 'x1x3x4_diffusion_mosesaq_20240824/last.ckpt',
+        'pretrained_checkpoint_path': 'x1x3x4_diffusion_mosesaq_20240824/last_27epoch.ckpt',
         
         # 其他选项
         'save_preference_pairs': True,  # 保存偏好对用于分析
@@ -92,7 +92,8 @@ params = {
     # ==================== DPO采样配置 ====================
     'sampling': {
         'timesteps': 400,  # 采样步数（与训练T一致）
-        'num_samples_per_molecule': 2,  # 每个种子分子生成2个样本（快速调试）
+        'num_samples_per_molecule': 3,  # 每个种子分子生成2个样本（快速调试）
+        'fixed_n_atoms': 70,  # 固定生成的原子数（与预训练模型一致）
     },
     
     # ==================== DPO评分权重 ====================

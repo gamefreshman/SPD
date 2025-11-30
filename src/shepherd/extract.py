@@ -354,6 +354,7 @@ def create_rdkit_molecule(sample):
     
     # 使用预测的键数据
     print("使用模型预测的键数据构建分子...")
+    
     mol_final = build_3d_mol_from_arrays(
         atom_type_array=np.array(valid_atoms),
         bond_adjacent_array=bond_adjacent_array,

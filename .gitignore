@@ -548,3 +548,5 @@ training/MOSES_aq
 DiffusionDPO
 training/jobs/x1x3x4_dpo_finetune_nps/csv_logger
 training/jobs/x1x3x4_diffusion_mosesaq_20240824/csv_logger/
+xtb-dist
+training/jobs

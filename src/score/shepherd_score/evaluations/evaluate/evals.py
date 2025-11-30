@@ -51,7 +51,8 @@ class ConfEval:
                  atoms: np.ndarray,
                  positions: np.ndarray,
                  solvent: Optional[str] = None,
-                 num_processes: int = 1):
+                 num_processes: int = 1,
+                 bonds: Optional[np.ndarray] = None):
         """
         Base class for evaluation of a single generated conformer.
 
@@ -68,6 +69,7 @@ class ConfEval:
         solvent : str solvent type for xtb relaxation
         num_processes : int (default = 1) number of processors to use for xtb relaxation and RDKit
             RMSD alignment.
+        bonds : Optional np.ndarray of bond types (edge list format). If provided, will use build_3d_mol_from_arrays.
         """
         self.xyz_block = None
         self.mol = None
@@ -109,7 +111,13 @@ class ConfEval:
 
         # 1. Converts coords + atom_ids -> xyz block
         # 2. Get mol from xyz block
-        self.mol, self.charge, self.xyz_block = get_mol_from_atom_pos(atoms=atoms, positions=positions)
+        print("atoms", atoms.shape)
+        print("positions", positions.shape)
+        print("STATR")
+
+        self.mol, self.charge, self.xyz_block = get_mol_from_atom_pos(atoms=atoms, positions=positions, bonds=bonds)
+
+        print("get mol xyz block`")
 
         # 3. Get xtb energy and charges of initial conformation
         # try:
@@ -118,6 +126,9 @@ class ConfEval:
                                                                         charge=self.charge,
                                                                         num_cores=num_processes,
                                                                         temp_dir=TMPDIR)
+
+        print("get xtb energy and charges")
+
         self.partial_charges = np.array(self.partial_charges)
         # except Exception as e:
             # pass
@@ -219,7 +230,8 @@ class ConsistencyEval(ConfEval):
                  pharm_multi_vector: Optional[bool] = None,
                  solvent: Optional[str] = None,
                  probe_radius: float = 1.2,
-                 num_processes: int = 1):
+                 num_processes: int = 1,
+                 bonds: Optional[np.ndarray] = None):
         """
         Consistency evaluation class for jointly generated molecule and features
         using 3D similarity scoring functions. Inherits from ConfEval so that it
@@ -255,7 +267,7 @@ class ConsistencyEval(ConfEval):
         if not (isinstance(atoms, np.ndarray) or isinstance(positions, np.ndarray)):
             raise ValueError(f"Must provide `atoms` and `positions` as np.ndarrays. Instead {type(atoms)} and {type(positions)} were given.")
 
-        super().__init__(atoms=atoms, positions=positions, solvent=solvent, num_processes=num_processes)
+        super().__init__(atoms=atoms, positions=positions, solvent=solvent, num_processes=num_processes, bonds=bonds)
 
         self.molec = None
         self.probe_radius = probe_radius
@@ -470,7 +482,8 @@ class ConditionalEval(ConfEval):
                  num_surf_points: int = 400,
                  pharm_multi_vector: Optional[bool] = None,
                  solvent: Optional[str] = None,
-                 num_processes: int = 1):
+                 num_processes: int = 1,
+                 bonds: Optional[np.ndarray] = None):
         """
         Evaluation pipeline for conditionally-generated molecules.
         Inherits from ConfEval so that it can first run a conformer evaluation on the generated
@@ -511,7 +524,8 @@ class ConditionalEval(ConfEval):
         super().__init__(atoms=atoms,
                          positions=positions,
                          solvent=solvent,
-                         num_processes=num_processes)
+                         num_processes=num_processes,
+                         bonds=bonds)
 
         self.sim_surf_target = None
         self.sim_esp_target = None

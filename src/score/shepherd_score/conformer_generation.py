@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import time
+import json
 from pathlib import Path
 from tqdm import tqdm
 import uuid
@@ -291,20 +292,30 @@ def optimize_conformer_with_xtb(conformer: rdkit.Chem.Mol,
             input_file = 'input_mol.xyz'
             rdkit.Chem.rdmolfiles.MolToXYZFile(mol, str(out_dir/input_file))
 
-            if solvent is not None:
-                subprocess.check_call(
-                    ['xtb', input_file, '--opt', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
-                )
-            else:
-                subprocess.check_call(
-                    ['xtb', input_file, '--opt', '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
-                )
+            try:
+                if solvent is not None:
+                    subprocess.check_call(
+                        ['xtb', input_file, '--opt', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+                else:
+                    subprocess.check_call(
+                        ['xtb', input_file, '--opt', '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+            except subprocess.CalledProcessError as e:
+                print(f"\n❌ XTB优化失败 (退出码 {e.returncode}):")
+                print(f"   命令: {' '.join(e.cmd)}")
+                # 尝试读取xtb的日志文件
+                log_file = out_dir / 'xtb.out'
+                if log_file.exists():
+                    with open(log_file, 'r') as f:
+                        print(f"   XTB日志:\n{f.read()}")
+                raise
 
             xtb_coords_list, xtb_elements_list = read_multi_xyz_file(out_dir/'xtbopt.xyz')
             xtb_coords = xtb_coords_list[0]
@@ -368,20 +379,30 @@ def optimize_conformer_with_xtb_from_xyz_block(xyz_block: str,
             with open(out_dir/input_file, 'w') as f:
                 f.write(xyz_block)
 
-            if solvent is not None:
-                subprocess.check_call(
-                    ['xtb', input_file, '--opt', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
-                )
-            else:
-                subprocess.check_call(
-                    ['xtb', input_file, '--opt', '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
-                )
+            try:
+                if solvent is not None:
+                    subprocess.check_call(
+                        ['xtb', input_file, '--opt', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+                else:
+                    subprocess.check_call(
+                        ['xtb', input_file, '--opt', '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+            except subprocess.CalledProcessError as e:
+                print(f"\n❌ XTB优化失败 (退出码 {e.returncode}):")
+                print(f"   命令: {' '.join(e.cmd)}")
+                # 尝试读取xtb的日志文件
+                log_file = out_dir / 'xtb.out'
+                if log_file.exists():
+                    with open(log_file, 'r') as f:
+                        print(f"   XTB日志:\n{f.read()}")
+                raise
             
             opt_xyz_path = out_dir/'xtbopt.xyz'
             if opt_xyz_path.is_file():
@@ -449,20 +470,30 @@ def charges_from_single_point_conformer_with_xtb(conformer: rdkit.Chem.Mol,
             input_file = 'input_mol.xyz'
             rdkit.Chem.rdmolfiles.MolToXYZFile(mol, str(out_dir/input_file))
 
-            if solvent is not None:
-                subprocess.check_call(
-                    ['xtb', input_file, '--scc', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
-                )
-            else:
-                subprocess.check_call(
-                    ['xtb', input_file, '--scc', '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.STDOUT,
-                )
+            try:
+                if solvent is not None:
+                    subprocess.check_call(
+                        ['xtb', input_file, '--scc', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+                else:
+                    subprocess.check_call(
+                        ['xtb', input_file, '--scc', '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.STDOUT,
+                    )
+            except subprocess.CalledProcessError as e:
+                print(f"\n❌ XTB电荷计算失败 (退出码 {e.returncode}):")
+                print(f"   命令: {' '.join(e.cmd)}")
+                # 尝试读取xtb的日志文件
+                log_file = out_dir / 'xtb.out'
+                if log_file.exists():
+                    with open(log_file, 'r') as f:
+                        print(f"   XTB日志:\n{f.read()}")
+                raise
 
             with open(out_dir/'charges', 'r') as file:
                 lines = file.readlines()
@@ -512,24 +543,54 @@ def single_point_xtb_from_xyz(xyz_block: str,
             with open(out_dir/input_file, 'w') as f:
                 f.write(xyz_block)
 
-            if solvent is not None:
-                output = subprocess.check_output(
-                    ['xtb', input_file, '--scc', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    stderr=subprocess.STDOUT,
-                )
-            else:
-                output = subprocess.check_output(
-                    ['xtb', input_file, '--scc', '--parallel', str(num_cores), '--chrg', str(charge)],
-                    cwd = out_dir,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    stderr=subprocess.STDOUT,
-                )
+            ## 保存所有输入参数用于调试到持久化目录
+            debug_dir = Path('/home1/zhh/workspace/SPD/training/data/xtb_data')
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            
+            debug_data = {
+                'xyz_block': xyz_block,
+                'solvent': solvent,
+                'num_cores': num_cores,
+                'charge': charge,
+                'temp_dir': str(temp_dir),
+                'out_dir': str(out_dir),
+                'input_file': input_file,
+                'xyz_file_exists': (out_dir/input_file).exists(),
+                'xyz_file_size': (out_dir/input_file).stat().st_size if (out_dir/input_file).exists() else 0,
+                'timestamp': time.time(),
+            }
+            debug_file = debug_dir / f'xtb_input_debug_{rand}.json'
+            with open(debug_file, 'w', encoding='utf-8') as f:
+                json.dump(debug_data, f, indent=2, ensure_ascii=False)
+            print(f"📝 调试信息已保存到: {debug_file}")
+
+            ## 现在这块代码的出错概率很高？？？？？？
+            
+            try:                                                                                                                   
+                if solvent is not None:
+                    output = subprocess.check_output(
+                        ['xtb', input_file, '--scc', '--alpb', solvent, '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        stderr=subprocess.STDOUT,
+                    )
+                else:
+                    output = subprocess.check_output(
+                        ['xtb', input_file, '--scc', '--parallel', str(num_cores), '--chrg', str(charge)],
+                        cwd = out_dir,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        stderr=subprocess.STDOUT,
+                    )
+            except subprocess.CalledProcessError as e:
+                print(f"\n❌ XTB计算失败 (退出码 {e.returncode}):")
+                print(f"   命令: {' '.join(e.cmd)}")
+                if e.output:
+                    print(f"   XTB输出:\n{e.output}")
+                raise
 
             output = output.split('\n')
             for line in output[::-1]:
