@@ -5,6 +5,6 @@ source .venv/bin/activate
 cd training
 
 # 运行 Python 训练脚本
-export CUDA_VISIBLE_DEVICES="1,2"
+export CUDA_VISIBLE_DEVICES="0"
 
 nohup python dpo_trainer.py params_x1x3x4_dpo_finetune_nps 0 &

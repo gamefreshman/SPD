@@ -57,15 +57,14 @@ from shepherd.shepherd_score_utils.generate_point_cloud import (
 from shepherd_score.evaluations.evaluate import ConfEval, ConditionalEvalPipeline
 from shepherd_score.container import Molecule
 
-# ==================== 警告过滤 ====================
-warnings.filterwarnings("ignore", category=UserWarning, message=".*UnsupportedFieldAttributeWarning.*")
-warnings.filterwarnings("ignore", message=".*'repr' attribute.*")
-warnings.filterwarnings("ignore", message=".*'frozen' attribute.*")
+# ==================== 日志配置 ====================
+
+os.environ["WANDB_MODE"] = "offline"
 
 # ==================== 全局配置 ====================
 SHARING_STRATEGY = "file_system"
 torch.multiprocessing.set_sharing_strategy(SHARING_STRATEGY)
-torch.set_float32_matmul_precision('medium')
+# torch.set_float32_matmul_precision('medium')
 torch.backends.cudnn.benchmark = True
 
 
@@ -333,11 +332,27 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     print("🧬 开始在线采样和评估")
     print("="*80)
     
-    model_pl.eval()
-    
+    model_pl.eval() # 切换评估模式
+    # dropout 等层是关闭的
+    # batch normalization 使用的是统计值
+     
     # 获取边际分布（从dataset）
     atom_marginals = dataset.x1_atom_diffuser.transition_model.marginals.to(device)
     bond_marginals = dataset.x1_bond_diffuser.transition_model.marginals.to(device)
+    
+    # ========================================================================
+    # 【修正】强制将虚拟节点（Index 0）的边际概率设为0，以避免生成无效原子
+    # 这一步是为了对齐 test_sample.py 的行为，已被证实能提高生成质量
+    # ========================================================================
+    if len(atom_marginals) > 0:
+        print(f"🔧 修正前 atom_marginals[0] = {atom_marginals[0]:.6f}")
+        atom_marginals[0] = 0.0
+        atom_marginals = atom_marginals / atom_marginals.sum()
+        print(f"🔧 修正后 atom_marginals[0] = {atom_marginals[0]:.6f}")
+    # ========================================================================
+
+    print("atom_marginals: ", atom_marginals)
+    print("bond_marginals: ", bond_marginals)
     
     # 存储所有生成的样本
     all_generated_samples = []
@@ -396,55 +411,71 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
         mol_samples = []
         for i in range(num_samples_per_mol):
             try:
+                # 准备inference_sample参数字典以便记录
+                inference_kwargs = {
+                    "batch_size": 1,
+                    "N_x1": n_atoms,
+                    "N_x4": num_pharmacophores,
+                    "unconditional": False,
+                    
+                    # 噪声控制
+                    "prior_noise_scale": 1.0,
+                    "denoising_noise_scale": 1.0,
+                    "inject_noise_at_ts": [],
+                    "inject_noise_scales": [],
+                    
+                    # 谐波化
+                    "harmonize": False,
+                    "harmonize_ts": [],
+                    "harmonize_jumps": [],
+                    
+                    # 条件修复
+                    "inpaint_x2_pos": False,
+                    "inpaint_x3_pos": False,
+                    "inpaint_x3_x": False,
+                    "inpaint_x4_pos": True,
+                    "inpaint_x4_direction": True,
+                    "inpaint_x4_type": True,
+                    
+                    # 修复控制
+                    "stop_inpainting_at_time_x2": 0.0,
+                    "add_noise_to_inpainted_x2_pos": 0.0,
+                    "stop_inpainting_at_time_x3": 0.0,
+                    "add_noise_to_inpainted_x3_pos": 0.0,
+                    "add_noise_to_inpainted_x3_x": 0.0,
+                    "stop_inpainting_at_time_x4": 0.0,
+                    "add_noise_to_inpainted_x4_pos": 0.0,
+                    "add_noise_to_inpainted_x4_direction": 0.0,
+                    "add_noise_to_inpainted_x4_type": 0.0,
+                    
+                    # 条件输入
+                    "center_of_mass": np.zeros(3),
+                    "surface": surface,
+                    "electrostatics": electrostatics,
+                    "pharm_types": pharm_types,
+                    "pharm_pos": pharm_pos,
+                    "pharm_direction": pharm_direction,
+                    
+                    # 边际分布
+                    "atom_marginals": atom_marginals,
+                    "bond_marginals": bond_marginals,
+                }
+
+                # 记录参数到JSON文件
+                try:
+                    debug_params_dir = "debug_inference_params"
+                    os.makedirs(debug_params_dir, exist_ok=True)
+                    debug_params_file = f"{debug_params_dir}/mol_{mol_index}_sample_{i}.json"
+                    with open(debug_params_file, 'w') as f:
+                        json.dump(convert_for_json(inference_kwargs), f, indent=4, default=str)
+                    print(f"    💾 参数已记录: {debug_params_file}")
+                except Exception as e:
+                    print(f"    ⚠️  无法记录参数: {e}")
+
                 # 调用inference_sample
                 generated_samples = inference_sample(
                     model_pl,
-                    batch_size=1,
-                    N_x1=n_atoms,
-                    N_x4=num_pharmacophores,
-                    unconditional=False,
-                    
-                    # 噪声控制
-                    prior_noise_scale=1.0,
-                    denoising_noise_scale=1.0,
-                    inject_noise_at_ts=[],
-                    inject_noise_scales=[],
-                    
-                    # 谐波化
-                    harmonize=False,
-                    harmonize_ts=[],
-                    harmonize_jumps=[],
-                    
-                    # 条件修复
-                    inpaint_x2_pos=False,
-                    inpaint_x3_pos=False,
-                    inpaint_x3_x=False,
-                    inpaint_x4_pos=True,
-                    inpaint_x4_direction=True,
-                    inpaint_x4_type=True,
-                    
-                    # 修复控制
-                    stop_inpainting_at_time_x2=0.0,
-                    add_noise_to_inpainted_x2_pos=0.0,
-                    stop_inpainting_at_time_x3=0.0,
-                    add_noise_to_inpainted_x3_pos=0.0,
-                    add_noise_to_inpainted_x3_x=0.0,
-                    stop_inpainting_at_time_x4=0.0,
-                    add_noise_to_inpainted_x4_pos=0.0,
-                    add_noise_to_inpainted_x4_direction=0.0,
-                    add_noise_to_inpainted_x4_type=0.0,
-                    
-                    # 条件输入
-                    center_of_mass=np.zeros(3),
-                    surface=surface,
-                    electrostatics=electrostatics,
-                    pharm_types=pharm_types,
-                    pharm_pos=pharm_pos,
-                    pharm_direction=pharm_direction,
-                    
-                    # 边际分布
-                    atom_marginals=atom_marginals,
-                    bond_marginals=bond_marginals,
+                    **inference_kwargs
                 )
                 
                 # 处理生成的样本
@@ -460,6 +491,8 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
                             atom_count_0 = list(atom_types).count(0)
                             print(f"       ⚠️  包含无效原子(0): {atom_count_0} 个")
                     
+                    # 设置样本所属的源分子索引，用于后续分组构建偏好对
+                    sample['source_mol_index'] = mol_index
                     mol_samples.append(sample)
                 else:
                     print(f"    ⚠️  样本 {i+1}/{num_samples_per_mol}: inference_sample未生成任何输出")
@@ -555,46 +588,50 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             num_invalid = len(atoms) - num_valid
             
             if num_invalid > 0:
-                print(f"  🔬 样本 {i+1}: {len(atoms)} 个原子 (⚠️  {num_invalid} 个无效原子，原子序数范围: [{atoms.min():.0f}, {atoms.max():.0f}])")
                 if num_valid == 0:
-                    print(f"     ✗ 所有原子都无效，跳过此样本")
+                    print(f"  🔬 样本 {i+1}: ✗ 所有 {len(atoms)} 个原子都无效，跳过")
                     continue
-            else:
-                print(f"  🔬 样本 {i+1}: {len(atoms)} 个原子")
-            
-            # 检查键信息
-            if bonds is not None:
-                print(f"     ✓ 包含键信息: {len(bonds)} 条边")
-            else:
-                print(f"     ⚠️  缺少键信息")
+                # 有无效原子但仍可继续
+                pass
             
             conf_scores = None
             
             # 尝试使用ConfEval评估（依赖xtb）
             try:
                 conf_eval = ConfEval(atoms, positions, solvent='water', bonds=bonds)
+                
+                # 检查分子是否有效，无效则跳过
+                if not conf_eval.is_valid:
+                    print(f"  🔬 样本 {i+1}: ✗ 分子无效")
+                    continue
+                
                 eval_df = conf_eval.to_pandas()
                 
-                # 提取关键指标
+                # 提取关键指标，处理可能的None值
+                # 注意：ConfEval.to_pandas() 返回的是 Series，键名是属性名（QED, SA_score等，没有's'）
+                qed_val = eval_df.get('QED', None)
+                logp_val = eval_df.get('logP', None)
+                strain_val = eval_df.get('strain_energy', None)
+                sa_val = eval_df.get('SA_score', None)
+                
+                # 检查关键指标是否为None或nan
+                if qed_val is None or sa_val is None or (isinstance(qed_val, float) and np.isnan(qed_val)):
+                    print(f"  🔬 样本 {i+1}: ✗ 指标无效 (QED={qed_val}, SA={sa_val})")
+                    continue
+                
                 conf_scores = {
-                    'qed': float(eval_df['QEDs'].iloc[0]) if 'QEDs' in eval_df else 0.0,
-                    'logp': float(eval_df['logPs'].iloc[0]) if 'logPs' in eval_df else 0.0,
-                    'strain_energy': float(eval_df['strain_energies'].iloc[0]) if 'strain_energies' in eval_df else 0.0,
-                    'sa_score': float(eval_df['SA_scores'].iloc[0]) if 'SA_scores' in eval_df else 5.0,
+                    'qed': float(qed_val) if qed_val is not None else 0.0,
+                    'logp': float(logp_val) if logp_val is not None else 0.0,
+                    'strain_energy': float(strain_val) if strain_val is not None else 0.0,
+                    'sa_score': float(sa_val) if sa_val is not None else 5.0,
                 }
-                print(f"     ✓ ConfEval完成: QED={conf_scores['qed']:.3f}, LogP={conf_scores['logp']:.2f}")
+                # 简洁日志：只打印关键指标
+                print(f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}, Strain={strain_val:.3f}" if strain_val else f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}")
                 
             except Exception as e:
-                print(f"     ⚠️  ConfEval失败，完整错误信息：")
-                print(f"     错误类型: {type(e).__name__}")
-                print(f"     错误消息: {str(e)}")
-                print(f"     完整堆栈：")
-                traceback.print_exc()
-                print(f"     跳过此样本")
+                print(f"  🔬 样本 {i+1}: ✗ ConfEval失败 ({type(e).__name__}: {str(e)[:50]})")
             
             if conf_scores is None:
-                # 完全失败，跳过此样本
-                print(f"     ✗ 所有评估方法都失败，跳过此样本")
                 continue
             
             evaluated_samples.append({
@@ -602,10 +639,11 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 'conf_scores': conf_scores,
                 'atoms': atoms,
                 'positions': positions,
+                'bonds': bonds,  # 添加键信息
             })
             
         if len(evaluated_samples) < 2:
-            print(f"  ⚠️  有效样本不足2个，跳过该组")
+            print(f"  ❌ 组 {source_idx} 偏好对构建失败: 有效样本不足2个 ({len(evaluated_samples)}/{len(samples)})")
             continue
         
         # 2. 使用ConditionalEvalPipeline计算相似性
@@ -619,19 +657,21 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 pharm_multi_vector=False
             )
             
-            # 准备生成分子列表
-            generated_mols_list = [(item['atoms'], item['positions']) for item in evaluated_samples]
+            # 准备生成分子列表（包含键信息）
+            generated_mols_list = [(item['atoms'], item['positions'], item['bonds']) for item in evaluated_samples]
             
             # ConditionalEvalPipeline评估
-            cond_pipe = ConditionalEvalPipeline(
-                ref_molec,
-                generated_mols=generated_mols_list,
-                condition='all',
-                num_surf_points=200,
-                pharm_multi_vector=False,
-                solvent=None
-            )
-            cond_pipe.evaluate(verbose=False)
+            # 注意：对齐优化需要梯度计算，确保在enable_grad上下文中运行
+            with torch.enable_grad():
+                cond_pipe = ConditionalEvalPipeline(
+                    ref_molec,
+                    generated_mols=generated_mols_list,
+                    condition='all',
+                    num_surf_points=200,
+                    pharm_multi_vector=False,
+                    solvent=None
+                )
+                cond_pipe.evaluate(verbose=False)
             
             # 获取条件评估结果
             properties_series, global_attr = cond_pipe.to_pandas()
@@ -684,6 +724,12 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         # 按分数排序
         evaluated_samples.sort(key=lambda x: x['total_score'], reverse=True)
         
+        # 打印组内所有有效样本的得分
+        print(f"  📊 组 {source_idx} 得分排名 ({len(evaluated_samples)}/{len(samples)} 有效):")
+        for rank, item in enumerate(evaluated_samples):
+            marker = "🥇" if rank == 0 else ("🥈" if rank == len(evaluated_samples)-1 else "  ")
+            print(f"      {marker} #{rank+1}: total={item['total_score']:.3f} (QED={item['conf_scores']['qed']:.3f}, SA={item['conf_scores']['sa_score']:.2f})")
+        
         # 构建偏好对 (最高分 vs 最低分)
         winner = evaluated_samples[0]
         loser = evaluated_samples[-1]
@@ -692,68 +738,28 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         min_gap = params.get('dpo', {}).get('min_score_gap', 0.3)
         
         if score_gap >= min_gap:
-            pair = (
-                winner['sample'],  # winner数据
-                loser['sample'],   # loser数据
-                {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner['total_score']},
-                {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser['total_score']},
-            )
-            all_preference_pairs.append(pair)
-            print(f"  ✅ 构建偏好对: Winner={winner['total_score']:.3f}, Loser={loser['total_score']:.3f}, Gap={score_gap:.3f}")
-        else:
-            print(f"  ⚠️  分差不足({score_gap:.3f} < {min_gap})，跳过")
-    
-    print(f"\n✅ 总共构建了 {len(all_preference_pairs)} 个偏好对")
-    return all_preference_pairs
-
-
-def handle_checkpoint_loading(params, output_dir, model_pl):
-    """处理checkpoint加载（DPO模式）"""
-    ckpt_path = f"{output_dir}/last.ckpt"
-    pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
-    
-    if pretrained_path is not None:
-        # 从预训练模型加载权重
-        pretrained_ckpt_path = f"jobs/{pretrained_path}"
-        if os.path.exists(pretrained_ckpt_path):
-            print(f"\n🔄 DPO微调：从预训练模型加载权重")
-            print(f"   预训练checkpoint: {pretrained_ckpt_path}")
+            # 将样本转换为RDKit分子对象，供DPO Dataset使用
+            winner_mol = create_rdkit_molecule(winner['sample'])
+            loser_mol = create_rdkit_molecule(loser['sample'])
             
-            try:
-                checkpoint = torch.load(pretrained_ckpt_path, map_location='cpu')
-                model_state_dict = checkpoint['state_dict']
-                model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
-                
-                missing, unexpected = model_pl.model.load_state_dict(model_weights, strict=False)
-                
-                if hasattr(model_pl, 'ref_model'):
-                    model_pl.ref_model.load_state_dict(model_weights, strict=False)
-                    print(f"   ✅ 已同步权重到参考模型（ref_model）")
-                
-                print(f"   ✅ 成功加载预训练权重")
-                
-                # 检查是否继续之前的训练
-                if os.path.exists(ckpt_path):
-                    print(f"\n   发现当前任务的checkpoint: {ckpt_path}")
-                    print(f"   将继续当前任务的训练")
-                    return ckpt_path
-                else:
-                    print(f"\n   从预训练模型开始新的DPO微调")
-                    return None
-                    
-            except Exception as e:
-                print(f"   ❌ 加载预训练权重失败: {e}")
-                return None
+            if winner_mol is not None and loser_mol is not None:
+                pair = (
+                    winner_mol,  # 传递RDKit对象而不是字典
+                    loser_mol,   # 传递RDKit对象而不是字典
+                    {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner['total_score']},
+                    {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser['total_score']},
+                )
+                all_preference_pairs.append(pair)
+                print(f"  ✅ 组 {source_idx} 偏好对构建成功: Winner={winner['total_score']:.3f}, Loser={loser['total_score']:.3f}, Gap={score_gap:.3f}")
+            else:
+                print(f"  ❌ 组 {source_idx} 偏好对构建失败: 分子重构失败 (Winner有效={winner_mol is not None}, Loser有效={loser_mol is not None})")
         else:
-            print(f"\n⚠️  预训练checkpoint不存在: {pretrained_ckpt_path}")
+            print(f"  ❌ 组 {source_idx} 偏好对构建失败: 分差不足 ({score_gap:.3f} < {min_gap})")
     
-    # 检查当前目录的checkpoint
-    if os.path.exists(ckpt_path):
-        print(f"\n✅ 发现当前checkpoint: {ckpt_path}")
-        return ckpt_path
-    
-    print("\n📝 从头开始DPO训练")
-    return None
+    print(f"\n{'='*50}")
+    print(f"✅ 偏好对构建汇总: {len(all_preference_pairs)}/{len(grouped_samples)} 组成功")
+    print(f"{'='*50}")
+    return all_preference_pairs
 
 
 def main():
@@ -782,6 +788,12 @@ def main():
         print("⚠️  警告：参数文件中enable_dpo=False，已自动设置为True")
         params['training']['enable_dpo'] = True
     
+    # 检查是否为DDP子进程
+    # PyTorch Lightning在使用DDP spawn/subprocess时会设置LOCAL_RANK
+    is_ddp_subprocess = os.environ.get("LOCAL_RANK") is not None
+    if is_ddp_subprocess:
+        print(f"🤖 检测到 DDP 子进程 (RANK {os.environ.get('LOCAL_RANK')})，将跳过预处理和首次采样...")
+
     # 加载数据集
     print("\n📂 加载数据集...")
     molblocks_and_charges, output_file = load_dataset(params)
@@ -795,7 +807,7 @@ def main():
     dataset = create_dataset(params, molblocks_and_charges, marginals)
     print(f"✅ 基础数据集创建完成: {len(dataset)} 个样本")
     
-    # 创建DPO数据集（初始为空） -- 这个数据集是否会修改sample出来的内容
+    # 创建DPO数据集（初始为空）
     print("\n🎯 初始化DPO数据集...")
     dpo_dataset = DPODataset(
         preference_pairs=[],  # 初始为空，通过采样回调动态填充
@@ -806,59 +818,91 @@ def main():
     print(f"✅ DPO数据集初始化完成（初始偏好对: {len(dpo_dataset.preference_pairs)}）")
     
     # 进行首次采样以生成初始偏好对
-    print("\n🔬 进行首次采样以生成初始偏好对...")
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    
-    # 创建临时模型用于首次采样
-    print("   创建模型用于首次采样...")
-    temp_model_pl = LightningModule(params)
-    
-    # 加载预训练权重（如果有）
-    pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
-    if pretrained_path is not None:
-        pretrained_ckpt_path = f"jobs/{pretrained_path}"
-        if os.path.exists(pretrained_ckpt_path):
-            print(f"   加载预训练权重: {pretrained_ckpt_path}")
-            checkpoint = torch.load(pretrained_ckpt_path, map_location='cpu')
-            model_state_dict = checkpoint['state_dict']
-            model_weights = {k: v for k, v in model_state_dict.items() if k.startswith('model.')}
-            temp_model_pl.model.load_state_dict(model_weights, strict=False)
-    
-    temp_model_pl.to(device)
-    temp_model_pl.eval()
-    
-    num_samples = params.get('sampling', {}).get('num_samples_per_molecule', 4)
-    
-    with torch.no_grad():
-        initial_pairs = sample_and_evaluate_molecules(
-            temp_model_pl,
-            params,
-            molblocks_and_charges,
-            dataset,
-            num_samples_per_mol=num_samples,
-            device=device
-        )
-    
-    # 释放临时模型
-    del temp_model_pl
-    torch.cuda.empty_cache()
-    
-    if len(initial_pairs) == 0:
-        print("   ⚠️  首次采样未生成任何偏好对，使用基础数据集进行训练")
-        # 如果没有偏好对，至少添加一个虚拟对以允许DataLoader创建
-        # 使用基础数据集的第一个样本作为虚拟偏好对
-        if len(dataset) > 0:
-            dummy_sample = dataset[0]
-            # 创建虚拟评分（全部为0）
-            dummy_scores = {
+    # 【修改】如果是DDP子进程，跳过此步骤，防止超时
+    initial_pairs = []
+    if not is_ddp_subprocess:
+        print("\n🔬 进行首次采样以生成初始偏好对...")
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        
+        # 创建临时模型用于首次采样
+        print("   创建模型用于首次采样...")
+        
+        pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
+        if pretrained_path is not None:
+            pretrained_ckpt_path = f"jobs/{pretrained_path}"
+            if os.path.exists(pretrained_ckpt_path):
+                print(f"   加载预训练权重: {pretrained_ckpt_path}")
+                # 使用 load_from_checkpoint 加载模型
+                try:
+                    temp_model_pl = LightningModule.load_from_checkpoint(
+                        pretrained_ckpt_path, 
+                        params=params, 
+                        strict=False
+                    )
+                    print("   ✅ 成功加载预训练权重 (load_from_checkpoint)")
+                except Exception as e:
+                    print(f"   ❌ 加载失败: {e}，尝试回退到原始初始化")
+                    temp_model_pl = LightningModule(params)
+            else:
+                print(f"   ⚠️ 预训练权重不存在: {pretrained_ckpt_path}")
+                temp_model_pl = LightningModule(params)
+        else:
+            temp_model_pl = LightningModule(params)
+        
+        temp_model_pl.to(device)
+        temp_model_pl.model.device = device
+        temp_model_pl.eval()
+        
+        num_samples = params.get('sampling', {}).get('num_samples_per_molecule', 4)
+        
+        # 【修改】循环采样直到生成有效的偏好对
+        sample_attempt = 0
+        while True:
+            sample_attempt += 1
+            if sample_attempt > 1:
+                print(f"\n🔄 第 {sample_attempt} 次尝试采样...")
+            
+            with torch.no_grad():
+                initial_pairs = sample_and_evaluate_molecules(
+                    temp_model_pl,
+                    params,
+                    molblocks_and_charges,
+                    dataset,
+                    num_samples_per_mol=num_samples,
+                    device=device
+                )
+            
+            if len(initial_pairs) > 0:
+                print(f"   ✅ 成功生成 {len(initial_pairs)} 个偏好对")
+                break
+            
+            print("   ⚠️  本次采样未生成任何有效偏好对，继续尝试...")
+        
+        # 释放临时模型
+        del temp_model_pl
+        torch.cuda.empty_cache()
+    else:
+        print("⏩ 子进程跳过首次采样步骤")
+        
+        # 子进程如果没有偏好对，使用虚拟对防止报错（仅子进程）
+        if len(initial_pairs) == 0 and len(dataset) > 0:
+             try:
+                mol_block = dataset.molblocks_and_charges[0][0]
+                dummy_mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
+             except:
+                dummy_mol = rdkit.Chem.MolFromSmiles("C")
+                rdkit.Chem.AddHs(dummy_mol)
+                
+             dummy_scores = {
                 'qed': 0.0, 'logp': 0.0, 'strain_energy': 0.0,
                 'sa_score': 0.0, 'rmsd': 0.0, 'sims_surf': 0.0,
                 'sims_esp': 0.0, 'total_score': 0.0
-            }
-            initial_pairs = [(dummy_sample, dummy_sample, dummy_scores, dummy_scores)]
-            print(f"   ⚠️  使用虚拟偏好对初始化DataLoader")
-    else:
-        print(f"   ✅ 首次采样成功：{len(initial_pairs)} 个偏好对")
+             }
+             initial_pairs = [(dummy_mol, dummy_mol, dummy_scores, dummy_scores)]
+
+    # 移除原有的通用虚拟填充逻辑，因为主进程现在保证有数据
+    if len(initial_pairs) > 0:
+        print(f"   ✅ 采样准备就绪：{len(initial_pairs)} 个偏好对")
     
     # 更新DPO数据集
     dpo_dataset.preference_pairs = initial_pairs
@@ -888,22 +932,28 @@ def main():
     
     # 自定义DPO采样回调（基于dpo_sample_and_evaluation.py）
     class DPOSamplingCallback(pl.Callback):
-        def __init__(self, params, dataset, molblocks_and_charges):
+        def __init__(self, params, dataset, dpo_dataset, molblocks_and_charges):
             super().__init__()
             self.params = params
             self.dataset = dataset
+            self.dpo_dataset = dpo_dataset  # 直接引用DPO数据集
             self.molblocks_and_charges = molblocks_and_charges
             self.preference_pairs = []
             self.epoch_counter = 0  # 用于追踪采样次数
             
-        def on_train_epoch_start(self, trainer, pl_module):
-            """每个epoch开始时进行采样和评估"""
+        def on_train_epoch_end(self, trainer, pl_module):
+            """每个epoch结束时进行采样和评估，为下一个epoch准备数据
+            
+            注意：必须在epoch_end而非epoch_start更新数据集，否则会导致
+            DistributedSampler的total_size与实际数据集大小不一致的断言错误。
+            reload_dataloaders_every_n_epochs=1会在下一个epoch开始时重建DataLoader。
+            """
             if trainer.current_epoch % params['training'].get('dpo_sampling_every_n_epochs', 1) != 0:
                 return
             
             if trainer.global_rank == 0:  # 只在主进程执行
                 self.epoch_counter += 1
-                print(f"\n🔄 Epoch {trainer.current_epoch}: 开始DPO采样 (第{self.epoch_counter}次)")
+                print(f"\n🔄 Epoch {trainer.current_epoch} 结束: 开始DPO采样 (第{self.epoch_counter}次)")
                 
                 num_samples = params.get('sampling', {}).get('num_samples_per_molecule', 4)
                 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -929,16 +979,16 @@ def main():
                     else:
                         self.preference_pairs = new_pairs
                     
-                    # 更新DPO数据集
-                    if hasattr(trainer, 'train_dataloader'):
-                        dataloader = trainer.train_dataloader
-                        if hasattr(dataloader, 'dataset'):
-                            dataloader.dataset.preference_pairs = self.preference_pairs
-                            print(f"✅ 更新DPO数据集: {len(self.preference_pairs)} 个偏好对")
-    
+                    # 直接更新DPO数据集的偏好对
+                    # 下一个epoch开始时，reload_dataloaders_every_n_epochs=1
+                    # 会重建DataLoader和DistributedSampler，使用更新后的数据集大小
+                    self.dpo_dataset.preference_pairs = self.preference_pairs
+                    print(f"✅ 更新DPO数据集: {len(self.preference_pairs)} 个偏好对 (将在下一epoch生效)")
+
     sampling_callback = DPOSamplingCallback(
         params=params,
         dataset=dataset,
+        dpo_dataset=dpo_dataset,
         molblocks_and_charges=molblocks_and_charges
     )
     
@@ -991,8 +1041,62 @@ def main():
     
     # 创建模型
     print("\n🧠 创建模型...")
-    model_pl = LightningModule(params)
     
+    # 逻辑更新：使用 load_from_checkpoint 加载
+    ckpt_path = f"{output_dir}/last.ckpt"
+    resume_ckpt_path = None
+    
+    # 1. 检查是否有断点需要恢复
+    if os.path.exists(ckpt_path):
+        print(f"\n✅ 发现当前任务checkpoint: {ckpt_path}")
+        print(f"   将继续当前任务的训练")
+        resume_ckpt_path = ckpt_path
+        # 恢复训练时，模型权重会被Trainer自动加载，这里只需初始化
+        model_pl = LightningModule(params)
+        
+        # 备份当前checkpoint (仅主进程)
+        if trainer.global_rank == 0:
+            date = datetime.datetime.now()
+            timestamp = date.strftime("%Y_%m_%d_%H_%M")
+            backup_path = f"{output_dir}/last_{timestamp}.ckpt"
+            try:
+                shutil.copyfile(ckpt_path, backup_path)
+                print(f"📦 已备份checkpoint到: {backup_path}")
+            except Exception as e:
+                print(f"⚠️ 备份checkpoint失败: {e}")
+
+    # 2. 如果没有断点，检查是否有预训练模型（DPO微调）
+    else:
+        pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
+        if pretrained_path is not None:
+            pretrained_ckpt_path = f"jobs/{pretrained_path}"
+            if os.path.exists(pretrained_ckpt_path):
+                print(f"\n🔄 DPO微调：从预训练模型加载权重: {pretrained_ckpt_path}")
+                try:
+                    model_pl = LightningModule.load_from_checkpoint(
+                        pretrained_ckpt_path, 
+                        params=params, 
+                        strict=False
+                    )
+                    print("   ✅ 成功加载预训练权重")
+                    
+                    # 同步到ref_model
+                    if hasattr(model_pl, 'ref_model'):
+                        model_pl.ref_model.load_state_dict(model_pl.model.state_dict())
+                        print(f"   ✅ 已同步权重到参考模型（ref_model）")
+                        
+                except Exception as e:
+                    print(f"   ❌ 加载预训练权重失败: {e}")
+                    print("   ⚠️ 使用随机初始化")
+                    model_pl = LightningModule(params)
+            else:
+                print(f"\n⚠️  预训练checkpoint不存在: {pretrained_ckpt_path}")
+                print("📝 从头开始DPO训练")
+                model_pl = LightningModule(params)
+        else:
+            print("\n📝 从头开始DPO训练 (无预训练路径)")
+            model_pl = LightningModule(params)
+
     # 统计参数量
     total_params = sum(p.numel() for p in model_pl.parameters() if p.requires_grad)
     print(f"✅ 模型创建完成")
@@ -1001,32 +1105,24 @@ def main():
     # 设置wandb监控
     wandb_logger.watch(model_pl, log="all", log_freq=500)
     
-    # 处理checkpoint加载
-    print("\n💾 检查checkpoint...")
-    ckpt_path = handle_checkpoint_loading(params, output_dir, model_pl)
-    
-    # 备份当前checkpoint
-    if (ckpt_path is not None) and (trainer.global_rank == 0):
-        date = datetime.datetime.now()
-        timestamp = date.strftime("%Y_%m_%d_%H_%M")
-        backup_path = f"{output_dir}/last_{timestamp}.ckpt"
-        shutil.copyfile(ckpt_path, backup_path)
-        print(f"📦 已备份checkpoint到: {backup_path}")
-    
     # 开始训练
     print("\n" + "="*80)
     print("🚀 开始DPO训练...")
     print("="*80)
-    print(f"📊 训练配置:")
-    print(f"   - 数据集: {params['data']} ({len(molblocks_and_charges)} 个分子)")
-    print(f"   - Batch size: {params['training']['batch_size']}")
-    print(f"   - 学习率: {params['training']['lr']}")
-    print(f"   - DPO beta: {params['training']['beta_dpo']}")
-    print(f"   - DPO权重: 0.0 -> {params['training']['dpo_max_weight']} (预热{params['training']['dpo_ramp_up_epochs']}轮)")
-    print(f"   - 采样比例: {params['training']['dpo_sampling_ratio']*100:.0f}%")
-    print("="*80 + "\n")
     
-    trainer.fit(model_pl, train_loader, ckpt_path=ckpt_path)
+    # DDP安全检查：确保偏好对数量 >= GPU数量
+    num_pairs = len(dpo_dataset.preference_pairs)
+    if num_gpus_to_use > 1 and num_pairs < num_gpus_to_use:
+        print(f"\n⚠️  警告: 偏好对数量({num_pairs}) < GPU数量({num_gpus_to_use})")
+        print(f"   在DDP模式下，部分GPU可能没有数据")
+        print(f"   建议增加采样数量或减少GPU数量")
+        # 复制样本以确保每个GPU至少有一个样本
+        while len(dpo_dataset.preference_pairs) < num_gpus_to_use:
+            dpo_dataset.preference_pairs = dpo_dataset.preference_pairs * 2
+        print(f"   已自动复制样本至 {len(dpo_dataset.preference_pairs)} 个偏好对")
+    
+    # 启动训练
+    trainer.fit(model_pl, train_dataloaders=train_loader, ckpt_path=resume_ckpt_path)
     
     print("\n" + "="*80)
     print("🎉 训练完成！")

@@ -66,7 +66,7 @@ class LightningModule(pl.LightningModule):
         # 调用父类（torch.nn.Module）的 load_state_dict 方法，但强制 strict=False
         # 这样可以加载所有匹配的权重，并静默地忽略不匹配的权重（例如 x3_decoder 的权重）。
         print("正在以非严格模式加载模型状态，将忽略检查点中不匹配的键...")
-        super().load_state_dict(state_dict, strict=False)
+        return super().load_state_dict(state_dict, strict=False)
     
     
     def configure_optimizers(self):
@@ -294,10 +294,19 @@ class LightningModule(pl.LightningModule):
 
         elif batch_type == 'dpo':
             
-            batch_winner = train_batch['winner']
-            batch_loser = train_batch['loser']
-            shared_noise = train_batch['shared_noise']
-            shared_timestep = train_batch['shared_timestep']
+            batch_winner = train_batch.get('winner')
+            batch_loser = train_batch.get('loser')
+            shared_noise = train_batch.get('shared_noise', {})
+            shared_timestep = train_batch.get('shared_timestep', 0.5)
+            
+            # DDP安全检查：验证批次数据有效性
+            if batch_winner is None or batch_loser is None:
+                # 某些rank可能没有数据，返回零损失以保持DDP同步
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+            
+            # 检查batch是否有有效的x1数据
+            if not hasattr(batch_winner, 'x1') or batch_winner['x1'] is None:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
 
             input_winner = self.get_training_input_dict(batch_winner)
             output_winner = self.forward_training(input_winner)
@@ -320,6 +329,10 @@ class LightningModule(pl.LightningModule):
             self.log('train_loss', loss)
             
             return loss
+
+        # DDP模式下的安全回退：如果batch_type未知或批次无效，返回零损失
+        # 这避免了在分布式训练中因返回None而导致的RuntimeError
+        return torch.tensor(0.0, device=self.device, requires_grad=True)
 
     def x1_denoising_loss(self, input_dict, output_dict):
         

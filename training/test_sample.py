@@ -1,6 +1,10 @@
 
+
+#######################
 # %%
 import torch
+from lightning_fabric.utilities.seed import seed_everything
+seed_everything(0)
 from shepherd.lightning_module import LightningModule
 
 import pickle
@@ -44,6 +48,8 @@ from shepherd_score.container import Molecule
 
 from shepherd.extract import create_rdkit_molecule_from_mol
 from shepherd_score.conformer_generation import embed_conformer_from_smiles
+
+#######################
 # %%
 # 配置
 
@@ -52,6 +58,7 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 model_pl = LightningModule.load_from_checkpoint(chkpt) #
 params = model_pl.params
 model_pl.to(device)
+model_pl.eval()
 model_pl.model.device = device
 
 
@@ -70,7 +77,7 @@ for idx in range(len(molblocks_and_charges)):
     mol = rdkit.Chem.MolFromMolBlock(molblocks_and_charges[idx][0], removeHs=False)
     print(f"  - 分子 {idx}: {mol.GetNumAtoms()} 个原子")
 
-
+#######################
 # %%
 # ==================== 计算边际分布（从原Cell 7移至此处） ====================
 # 必须在采样前计算，为扩散模型提供先验分布
@@ -90,44 +97,20 @@ pharm_counts = torch.zeros(max_node_types_x4, dtype=torch.float)
 def get_bond_type_str(bond):
     return str(bond.GetBondType())
 
-# 统计特征出现次数
-for mol_block, _ in tqdm(molblocks_and_charges, desc="计算边际分布"):
-    mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
-    if not mol:
-        print("Warning: Failed to create molecule from MolBlock")
-        continue
-    
-    # 统计原子类型
-    for atom in mol.GetAtoms():
-        symbol = atom.GetSymbol()
-        if symbol in atom_types_x1:
-            atom_counts[atom_types_x1.index(symbol)] += 1
-    
-    # 统计键类型
-    for bond in mol.GetBonds():
-        bond_str = get_bond_type_str(bond)
-        if bond_str in bond_types_x1:
-            bond_counts[bond_types_x1.index(bond_str)] += 1
-    
-    # 统计药效团类型
-    try:
-        pharm_types_temp, _, _ = get_pharmacophores(
-            mol, 
-            multi_vector=False,
-            check_access=False
-        )
-        for p_type in (pharm_types_temp + 1):
-            if p_type < max_node_types_x4:
-                pharm_counts[p_type] += 1
-    except Exception as e:
-        print(f"Warning: Could not get pharmacophores. Error: {e}")
+print("📦 加载预计算的MOSES数据集边际分布...")
+cache_dir = '/home1/zhh/workspace/SPD/training/cached_marginals'
 
-# 归一化为概率分布
-atom_marginals_x1 = (atom_counts / atom_counts.sum()) if atom_counts.sum() > 0 else torch.ones_like(atom_counts) / len(atom_counts)
-bond_marginals_x1 = (bond_counts / bond_counts.sum()) if bond_counts.sum() > 0 else torch.ones_like(bond_counts) / len(bond_counts)
-pharm_marginals_x4 = (pharm_counts / pharm_counts.sum()) if pharm_counts.sum() > 0 else torch.ones_like(pharm_counts) / len(pharm_counts)
+try:
+    atom_marginals_x1 = torch.load(f'{cache_dir}/MOSES_aq_atom_marginals.pt', map_location=device)
+    bond_marginals_x1 = torch.load(f'{cache_dir}/MOSES_aq_bond_marginals.pt', map_location=device)
+    pharm_marginals_x4 = torch.load(f'{cache_dir}/MOSES_aq_pharm_marginals.pt', map_location=device)
+    print("✅ 成功加载缓存的边际分布")
+except FileNotFoundError as e:
+    print(f"❌ 无法加载边际分布文件: {e}")
+    # 回退到简单的均匀分布或报错
+    raise e
 
-print("\n✅ 边际分布计算完成")
+print("\n✅ 边际分布加载完成")
 print(f"  - Atom Marginals: {atom_marginals_x1.shape}")
 print(f"  - Bond Marginals: {bond_marginals_x1.shape}")
 print(f"  - Pharmacophore Marginals: {pharm_marginals_x4.shape}")
@@ -136,11 +119,7 @@ print(f"  - Atom Marginals: {atom_marginals_x1}")
 print(f"  - Bond Marginals: {bond_marginals_x1}")
 print(f"  - Pharmacophore Marginals: {pharm_marginals_x4}")
 
-
-# %% [markdown]
-# # 对每个分子循环采样
-# 
-
+#######################
 # %%
 # ==================== 对每个分子循环采样（batch_size=5, 共20个样本/分子） ====================
 
@@ -171,7 +150,8 @@ for mol_index in range(len(molblocks_and_charges)):
     charges = np.array(molblocks_and_charges[mol_index][1])
     
     print(f"分子信息: {mol.GetNumAtoms()} 个原子")
-    display(mol)
+    # display(mol)  # 在非notebook环境中不可用
+
     
     # 分子坐标标准化
     mol_coordinates = np.array(mol.GetConformer().GetPositions())
@@ -207,7 +187,7 @@ for mol_index in range(len(molblocks_and_charges)):
     n_atoms = 70
     batch_size = 1
     num_pharmacophores = len(pharm_types)
-    num_iterations = 1  # 循环5次，每次2个，总共10个样本
+    num_iterations = 2  # 循环5次，每次2个，总共10个样本
     
     print(f"\n📊 采样配置:")
     print(f"  - 原子数: {n_atoms}")
@@ -221,55 +201,71 @@ for mol_index in range(len(molblocks_and_charges)):
     for iteration in range(num_iterations):
         print(f"\n🔄 迭代 {iteration + 1}/{num_iterations} (生成样本 {iteration*batch_size+1}-{(iteration+1)*batch_size})...")
         
+        # 准备inference_sample参数字典以便记录
+        inference_kwargs = {
+            "batch_size": batch_size,
+            "N_x1": n_atoms,
+            "N_x4": num_pharmacophores,
+            "unconditional": False,
+            
+            # 噪声控制
+            "prior_noise_scale": 1.0,
+            "denoising_noise_scale": 1.0,
+            "inject_noise_at_ts": [],
+            "inject_noise_scales": [],
+            
+            # 谐波化
+            "harmonize": False,
+            "harmonize_ts": [],
+            "harmonize_jumps": [],
+            
+            # 条件修复
+            "inpaint_x2_pos": False,
+            "inpaint_x3_pos": False,
+            "inpaint_x3_x": False,
+            "inpaint_x4_pos": True,
+            "inpaint_x4_direction": True,
+            "inpaint_x4_type": True,
+            
+            # 修复控制
+            "stop_inpainting_at_time_x2": 0.0,
+            "add_noise_to_inpainted_x2_pos": 0.0,
+            "stop_inpainting_at_time_x3": 0.0,
+            "add_noise_to_inpainted_x3_pos": 0.0,
+            "add_noise_to_inpainted_x3_x": 0.0,
+            "stop_inpainting_at_time_x4": 0.0,
+            "add_noise_to_inpainted_x4_pos": 0.0,
+            "add_noise_to_inpainted_x4_direction": 0.0,
+            "add_noise_to_inpainted_x4_type": 0.0,
+            
+            # 条件输入
+            "center_of_mass": np.zeros(3),
+            "surface": surface,
+            "electrostatics": electrostatics,
+            "pharm_types": pharm_types,
+            "pharm_pos": pharm_pos,
+            "pharm_direction": pharm_direction,
+            
+            # 边际分布（从Cell 5获取）
+            "atom_marginals": atom_marginals_x1,
+            "bond_marginals": bond_marginals_x1,
+        }
+
+        # 记录参数到JSON文件
+        try:
+            debug_params_dir = "debug_inference_params_test"
+            os.makedirs(debug_params_dir, exist_ok=True)
+            debug_params_file = f"{debug_params_dir}/mol_{mol_index}_iter_{iteration}.json"
+            with open(debug_params_file, 'w') as f:
+                json.dump(convert_for_json(inference_kwargs), f, indent=4, default=str)
+            print(f"    💾 参数已记录: {debug_params_file}")
+        except Exception as e:
+            print(f"    ⚠️  无法记录参数: {e}")
+
         # 调用推理采样
         generated_samples = inference_sample(
             model_pl,
-            batch_size=batch_size,
-            N_x1=n_atoms,
-            N_x4=num_pharmacophores,
-            unconditional=False,
-            
-            # 噪声控制
-            prior_noise_scale=1.0,
-            denoising_noise_scale=1.0,
-            inject_noise_at_ts=[],
-            inject_noise_scales=[],
-            
-            # 谐波化
-            harmonize=False,
-            harmonize_ts=[],
-            harmonize_jumps=[],
-            
-            # 条件修复
-            inpaint_x2_pos=False,
-            inpaint_x3_pos=False,
-            inpaint_x3_x=False,
-            inpaint_x4_pos=True,
-            inpaint_x4_direction=True,
-            inpaint_x4_type=True,
-            
-            # 修复控制
-            stop_inpainting_at_time_x2=0.0,
-            add_noise_to_inpainted_x2_pos=0.0,
-            stop_inpainting_at_time_x3=0.0,
-            add_noise_to_inpainted_x3_pos=0.0,
-            add_noise_to_inpainted_x3_x=0.0,
-            stop_inpainting_at_time_x4=0.0,
-            add_noise_to_inpainted_x4_pos=0.0,
-            add_noise_to_inpainted_x4_direction=0.0,
-            add_noise_to_inpainted_x4_type=0.0,
-            
-            # 条件输入
-            center_of_mass=np.zeros(3),
-            surface=surface,
-            electrostatics=electrostatics,
-            pharm_types=pharm_types,
-            pharm_pos=pharm_pos,
-            pharm_direction=pharm_direction,
-            
-            # 边际分布（从Cell 5获取）
-            atom_marginals=atom_marginals_x1,
-            bond_marginals=bond_marginals_x1,
+            **inference_kwargs
         )
         
         # 添加分子索引信息
@@ -296,6 +292,8 @@ with open('output_all_mols.json', 'w', encoding='utf-8') as f:
     json.dump(generated_samples_for_json, f, ensure_ascii=False, indent=4)
 print("\n💾 数据已保存到 output_all_mols.json")
 
+
+#######################
 # %%
 # 从新的 JSON 文件读取数据（批量采样结果
 try:
@@ -434,10 +432,10 @@ for i, structure in enumerate(reloaded_samples):
     print(f"正在评估第 {i+1}/{len(reloaded_samples)} 个生成结构...")
     
     try:
-
-        positions = structure['x1']['positions']  # 原子三维坐标位置
-
-        atoms = structure['x1']['atoms']  # 原子类型（原子序数）
+        # 提取原子、坐标和键信息
+        atoms = structure['x1']['atoms']
+        positions = structure['x1']['positions']
+        bonds = structure['x1'].get('bonds', None)  # 提取键信息
 
         if isinstance(atoms, np.ndarray):
             atoms = atoms.flatten()  # 展平为一维数组
@@ -447,16 +445,11 @@ for i, structure in enumerate(reloaded_samples):
                 print(f"警告：第 {i+1} 个结构的位置坐标维度不正确: {positions.shape}")
                 continue
         
-        if len(atoms) == 0:
-            print(f"警告：第 {i+1} 个结构没有有效原子，跳过评估")
-            continue
-        
-        # 使用 ConfEval 进行构象评估
-        conf_eval = ConfEval(atoms, positions, solvent='water')
+        # 使用 ConfEval 进行构象评估 (加入bonds参数)
+        conf_eval = ConfEval(atoms, positions, solvent='water', bonds=bonds)
         
         # 获取评估结果
         eval_df = conf_eval.to_pandas()
-
         print("评估结果是：", eval_df)
         
         # 存储评估结果
@@ -479,8 +472,6 @@ for i, structure in enumerate(reloaded_samples):
 
 print(f"\n总共成功评估了 {len(evaluation_results)} 个结构")
 
-# %% [markdown]
-# ## 使用ConditionalEvalPipeline进行评估
 
 # %%
 # ==================== 条件评估参考分子准备算法 ====================

@@ -495,8 +495,14 @@ class ConditionalEvalPipeline:
         if num_workers > 1:
             multiprocessing.set_start_method(mp_context, force=True)
             with set_thread_limits(num_processes):
-                inputs = [(i, self.ref_molec, self.condition, self.num_surf_points, self.pharm_multi_vector, atoms, positions, self.solvent, 1)
-                        for i, (atoms, positions) in enumerate(self.generated_mols)]
+                inputs = []
+                for i, gen_mol in enumerate(self.generated_mols):
+                    if len(gen_mol) == 3:
+                        atoms, positions, bonds = gen_mol
+                    else:
+                        atoms, positions = gen_mol
+                        bonds = None
+                    inputs.append((i, self.ref_molec, self.condition, self.num_surf_points, self.pharm_multi_vector, atoms, positions, bonds, self.solvent, 1))
                 with multiprocessing.Pool(num_workers) as pool:
                     if verbose:
                         pbar = tqdm(total=self.num_generated_mols, desc='Conditional Eval')
@@ -533,11 +539,15 @@ class ConditionalEvalPipeline:
                 pbar = enumerate(self.generated_mols)
 
             for i, gen_mol in pbar:
-                atoms, positions = gen_mol
+                if len(gen_mol) == 3:
+                    atoms, positions, bonds = gen_mol
+                else:
+                    atoms, positions = gen_mol
+                    bonds = None
 
                 res = _eval_conditional_single(
                     i, self.ref_molec, self.condition, self.num_surf_points,
-                    self.pharm_multi_vector, atoms, positions, self.solvent, num_processes
+                    self.pharm_multi_vector, atoms, positions, bonds, self.solvent, num_processes
                 )
                 self._process_single_result(res, i)
 

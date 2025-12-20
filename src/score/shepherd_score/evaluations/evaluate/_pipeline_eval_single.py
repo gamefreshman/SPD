@@ -309,6 +309,7 @@ def _eval_conditional_single(i: int,
                              pharm_multi_vector: Optional[bool],
                              atoms: np.ndarray,
                              positions: np.ndarray,
+                             bonds: Optional[np.ndarray],
                              solvent: Optional[str],
                              num_processes: int) -> Dict[str, Any]:
     """
@@ -332,7 +333,8 @@ def _eval_conditional_single(i: int,
             num_surf_points=num_surf_points,
             pharm_multi_vector=pharm_multi_vector,
             num_processes=num_processes,
-            solvent=solvent
+            solvent=solvent,
+            bonds=bonds
         )
         
         res = {

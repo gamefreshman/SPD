@@ -92,7 +92,7 @@ params = {
     # ==================== DPO采样配置 ====================
     'sampling': {
         'timesteps': 400,  # 采样步数（与训练T一致）
-        'num_samples_per_molecule': 3,  # 每个种子分子生成2个样本（快速调试）
+        'num_samples_per_molecule': 4,  # 每个种子分子生成2个样本（快速调试）
         'fixed_n_atoms': 70,  # 固定生成的原子数（与预训练模型一致）
     },
     

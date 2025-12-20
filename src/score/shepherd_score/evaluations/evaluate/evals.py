@@ -111,13 +111,7 @@ class ConfEval:
 
         # 1. Converts coords + atom_ids -> xyz block
         # 2. Get mol from xyz block
-        print("atoms", atoms.shape)
-        print("positions", positions.shape)
-        print("STATR")
-
         self.mol, self.charge, self.xyz_block = get_mol_from_atom_pos(atoms=atoms, positions=positions, bonds=bonds)
-
-        print("get mol xyz block`")
 
         # 3. Get xtb energy and charges of initial conformation
         # try:
@@ -127,12 +121,28 @@ class ConfEval:
                                                                         num_cores=num_processes,
                                                                         temp_dir=TMPDIR)
 
-        print("get xtb energy and charges")
-
         self.partial_charges = np.array(self.partial_charges)
+        
+        # 过滤partial_charges以匹配mol中的原子数（排除氢原子）
+        # build_3d_mol_from_arrays 跳过了氢原子(atomic_number == 1)，所以需要过滤charges
+        if self.partial_charges is not None and len(self.partial_charges) > 0:
+            # 获取原子序数数组
+            if len(atoms.shape) == 2:
+                atomic_nums = np.argmin(np.abs(atoms - 1.0), axis=-1)
+            else:
+                atomic_nums = atoms
+            
+            # 创建非氢原子的mask (排除atomic_number == 0 和 == 1)
+            non_h_mask = (atomic_nums > 1) & (atomic_nums <= 118)
+            
+            # 过滤partial_charges，只保留非氢原子的电荷
+            if len(self.partial_charges) == len(atomic_nums):
+                self.partial_charges = self.partial_charges[non_h_mask]
+        
         # except Exception as e:
             # pass
         self.is_valid = self.mol is not None and self.partial_charges is not None
+
         if self.is_valid:
             self.smiles = Chem.MolToSmiles(Chem.RemoveHs(self.mol))
             self.molblock = Chem.MolToMolBlock(self.mol)
@@ -144,14 +154,52 @@ class ConfEval:
                                                             num_cores=num_processes,
                                                             charge=self.charge,
                                                             temp_dir=TMPDIR)
+
+        if xtb_out is None:
+            self.is_valid_post_opt = False
+
         self.xyz_block_post_opt, self.energy_post_opt, self.partial_charges_post_opt = xtb_out
         self.partial_charges_post_opt = np.array(self.partial_charges_post_opt)
+        
+        # 过滤partial_charges_post_opt以匹配mol_post_opt中的原子数（排除氢原子）
+        if self.partial_charges_post_opt is not None and len(self.partial_charges_post_opt) > 0:
+            if len(atoms.shape) == 2:
+                atomic_nums_for_filter = np.argmin(np.abs(atoms - 1.0), axis=-1)
+            else:
+                atomic_nums_for_filter = atoms
+            non_h_mask_post = (atomic_nums_for_filter > 1) & (atomic_nums_for_filter <= 118)
+            if len(self.partial_charges_post_opt) == len(atomic_nums_for_filter):
+                self.partial_charges_post_opt = self.partial_charges_post_opt[non_h_mask_post]
 
         # 5. Check if relaxed_structure is valid
+        positions_post_opt = None
+        if self.xyz_block_post_opt:
+            try:
+                # Parse XYZ block manually to avoid RDKit dependency issues
+                lines = self.xyz_block_post_opt.strip().split('\n')
+                if len(lines) > 2:
+                    coords = []
+                    for line in lines[2:]:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                    positions_post_opt = np.array(coords)
+            except Exception:
+                pass
+
+        if len(atoms.shape) == 2:
+            atomic_nums = np.argmin(np.abs(atoms - 1.0), axis = -1)
+        else:
+            atomic_nums = atoms
+
         self.mol_post_opt = extract_mol_from_xyz_block(xyz_block=self.xyz_block_post_opt,
-                                                        charge=self.charge)
-        # except Exception as e:
-        #     pass
+                                                        charge=self.charge,
+                                                        atoms=atomic_nums,
+                                                        positions=positions_post_opt,
+                                                        bonds=bonds)
+
+        if self.mol_post_opt is None:
+            self.is_valid_post_opt = False
 
         self.is_valid_post_opt = self.mol_post_opt is not None and self.partial_charges_post_opt is not None
 
@@ -422,12 +470,14 @@ class ConsistencyEval(ConfEval):
         -------
         float : Surface similarity score of optimally aligned molecule.
         """
-        aligned_surf_points = mp_ref_and_relaxed.align_with_surf(
-            self.alpha,
-            num_repeats=1,
-            trans_init=False,
-            use_jax=False
-        )
+        import torch
+        with torch.enable_grad():
+            aligned_surf_points = mp_ref_and_relaxed.align_with_surf(
+                self.alpha,
+                num_repeats=1,
+                trans_init=False,
+                use_jax=False
+            )
         surf_similarity = mp_ref_and_relaxed.sim_aligned_surf
         return float(surf_similarity)
     
@@ -440,13 +490,15 @@ class ConsistencyEval(ConfEval):
         -------
         float : ESP similarity score of optimally aligned molecule.
         """
-        aligned_surf_points = mp_ref_and_relaxed.align_with_esp(
-            self.alpha,
-            lam=self.lam,
-            num_repeats=1,
-            trans_init=False,
-            use_jax=False
-        ) 
+        import torch
+        with torch.enable_grad():
+            aligned_surf_points = mp_ref_and_relaxed.align_with_esp(
+                self.alpha,
+                lam=self.lam,
+                num_repeats=1,
+                trans_init=False,
+                use_jax=False
+            ) 
         esp_similarity = mp_ref_and_relaxed.sim_aligned_esp
         return float(esp_similarity)
 
@@ -459,14 +511,16 @@ class ConsistencyEval(ConfEval):
         -------
         float : Pharmacophore similarity score of optimally aligned molecule.
         """
-        aligned_fit_anchors, aligned_vectors = mp_ref_and_relaxed.align_with_pharm(
-            similarity='tanimoto',
-            extended_points=False,
-            only_extended=False,
-            num_repeats=1,
-            trans_init=False,
-            use_jax=False
-        )
+        import torch
+        with torch.enable_grad():
+            aligned_fit_anchors, aligned_vectors = mp_ref_and_relaxed.align_with_pharm(
+                similarity='tanimoto',
+                extended_points=False,
+                only_extended=False,
+                num_repeats=1,
+                trans_init=False,
+                use_jax=False
+            )
         pharm_similarity = mp_ref_and_relaxed.sim_aligned_pharm
         return float(pharm_similarity)
 
@@ -669,12 +723,15 @@ class ConditionalEval(ConfEval):
         -------
         float : Surface similarity score of optimally aligned molecule.
         """
-        aligned_surf_points = mp_ref_and_relaxed.align_with_surf(
-            self.alpha,
-            num_repeats=1,
-            trans_init=False,
-            use_jax=False
-        )
+        import torch
+        # 确保在对齐优化期间启用梯度（可能在torch.no_grad()上下文中被调用）
+        with torch.enable_grad():
+            aligned_surf_points = mp_ref_and_relaxed.align_with_surf(
+                self.alpha,
+                num_repeats=1,
+                trans_init=False,
+                use_jax=False
+            )
 
         surf_similarity = mp_ref_and_relaxed.sim_aligned_surf
         return float(surf_similarity)
@@ -688,13 +745,15 @@ class ConditionalEval(ConfEval):
         -------
         float : ESP similarity score of optimally aligned molecule.
         """
-        aligned_surf_points = mp_ref_and_relaxed.align_with_esp(
-            self.alpha,
-            lam=self.lam,
-            num_repeats=1,
-            trans_init=False,
-            use_jax=False
-        ) 
+        import torch
+        with torch.enable_grad():
+            aligned_surf_points = mp_ref_and_relaxed.align_with_esp(
+                self.alpha,
+                lam=self.lam,
+                num_repeats=1,
+                trans_init=False,
+                use_jax=False
+            ) 
         esp_similarity = mp_ref_and_relaxed.sim_aligned_esp
         return float(esp_similarity)
 
@@ -707,13 +766,15 @@ class ConditionalEval(ConfEval):
         -------
         float : Pharmacophore similarity score of optimally aligned molecule.
         """
-        aligned_fit_anchors, aligned_vectors = mp_ref_and_relaxed.align_with_pharm(
-            similarity='tanimoto',
-            extended_points=False,
-            only_extended=False,
-            num_repeats=1,
-            trans_init=False,
-            use_jax=False
-        )
+        import torch
+        with torch.enable_grad():
+            aligned_fit_anchors, aligned_vectors = mp_ref_and_relaxed.align_with_pharm(
+                similarity='tanimoto',
+                extended_points=False,
+                only_extended=False,
+                num_repeats=1,
+                trans_init=False,
+                use_jax=False
+            )
         pharm_similarity = mp_ref_and_relaxed.sim_aligned_pharm
         return float(pharm_similarity)

@@ -125,9 +125,8 @@ def build_3d_mol_from_arrays(atom_type_array, bond_adjacent_array, positions_3d,
     # Sanitize molecule
     try:
         Chem.SanitizeMol(mol)
-    except Exception as e:
-        print(f"Warning: Could not sanitize molecule: {e}")
-        print("Returning unsanitized molecule.")
+    except Exception:
+        pass  # 返回未消毒的分子
     
     return mol
 
@@ -209,54 +208,26 @@ def create_rdkit_molecule(sample):
     Returns:
         rdkit.Chem.rdchem.Mol: RDKit molecule object or None if conversion fails.
     """
-    print("=" * 60)
-    print("🧪 开始创建RDKit分子对象")
-    print("=" * 60)
-    
-    # 阶段1: 检查输入数据
-    print("📋 阶段1/7: 检查输入数据...")
+    # 检查输入数据
     if 'x1' not in sample:
-        print("❌ 未找到原子数据(x1)")
         return None
-    print("✓ 输入数据检查通过")
 
-    # try:
-    # 阶段2: 提取原子、位置和键数据
-    print("\n📦 阶段2/7: 提取原子、位置和键数据...")
     atoms = sample['x1']['atoms']
     positions = sample['x1']['positions']
-    bonds = sample['x1'].get('bonds', None)  # 键类型数据（edge list格式）
-    print(f"✓ 提取到 {len(atoms)} 个原子, {len(positions)} 个坐标")
-    if bonds is not None:
-        print(f"✓ 提取到 {len(bonds)} 条键")
-    else:
-        print("⚠️  未找到键数据，将尝试使用备用方法")
+    bonds = sample['x1'].get('bonds', None)
     
-    # 阶段3: 检查数据完整性
-    print("\n🔍 阶段3/7: 检查数据完整性...")
-    if len(atoms) == 0 or len(positions) == 0:
-        print("❌ 原子或坐标数据为空")
+    if len(atoms) == 0 or len(positions) == 0 or len(atoms) != len(positions):
         return None
-        
-    if len(atoms) != len(positions):
-        print(f"❌ 原子数({len(atoms)})与坐标数({len(positions)})不匹配")
-        return None
-    print(f"✓ 数据完整性检查通过: {len(atoms)} 个原子")
 
-    # 阶段4: 先构建原始的邻接矩阵（基于所有原子）
-    print("\n📝 阶段4/7: 构建原始键邻接矩阵...")
+    # 构建原始键邻接矩阵
     original_bond_adjacent_array = None
     
     if bonds is not None:
         try:
-            # 根据inference.py的逻辑，bonds是基于所有原子的完全图上三角矩阵
             num_atoms_original = len(atoms)
             expected_edges = num_atoms_original * (num_atoms_original - 1) // 2
             
-            print(f"原始原子数: {num_atoms_original}, 期望边数: {expected_edges}, 实际bonds数: {len(bonds)}")
-            
             if len(bonds) == expected_edges:
-                # 创建上三角邻接矩阵的edge_index
                 edge_sources = []
                 edge_targets = []
                 for i in range(num_atoms_original):
@@ -266,70 +237,39 @@ def create_rdkit_molecule(sample):
                 
                 edge_index = np.array([edge_sources, edge_targets])
                 original_bond_adjacent_array = edge_list_to_adjacency_matrix(num_atoms_original, edge_index, bonds)
-                print(f"✓ 成功构建原始键邻接矩阵（{np.sum(original_bond_adjacent_array > 0)}条键）")
-            else:
-                print(f"⚠️ 键数据长度({len(bonds)})与期望边数({expected_edges})不匹配")
-        except Exception as e:
-            print(f"⚠️ 构建原始邻接矩阵失败: {e}")
+        except Exception:
+            pass
     
-    # 阶段5: 过滤有效的原子、位置和对应的键
-    print("\n🧹 阶段5/7: 过滤和验证原子数据...")
+    # 过滤有效原子
     valid_atoms = []
     valid_positions = []
-    valid_indices = []  # 记录有效原子在原始数组中的索引
-    invalid_count = 0
+    valid_indices = []
     
     for a in range(len(atoms)):
         try:
             atomic_number = int(atoms[a])
             position = positions[a]
             
-            # 检查原子序数是否有效
             if atomic_number <= 0 or atomic_number > 118:
-                print(f"Invalid atomic number: {atomic_number}")
-                invalid_count += 1
                 continue
-            
-            # 检查位置是否包含NaN或无穷值
             if np.any(np.isnan(position)) or np.any(np.isinf(position)):
-                print(f"Atom {a} has invalid position (NaN/Inf): {position}")
-                invalid_count += 1
                 continue
-            
-            # 检查位置坐标是否合理（不能过大）
             if np.any(np.abs(position) > 1000):
-                print(f"Atom {a} has unreasonable position: {position}")
-                invalid_count += 1
                 continue
             
             valid_atoms.append(atomic_number)
             valid_positions.append(position)
             valid_indices.append(a)
-            
-        except (ValueError, TypeError, IndexError) as e:
-            print(f"Error processing atom {a}: {e}")
-            invalid_count += 1
+        except (ValueError, TypeError, IndexError):
             continue
     
-    # 统计并打印无效原子信息
-    total_atoms = len(atoms)
-    valid_count = len(valid_atoms)
-    invalid_ratio = (invalid_count / total_atoms * 100) if total_atoms > 0 else 0
-    
-    if invalid_count > 0:
-        print(f"📊 原子统计: 总数={total_atoms}, 有效={valid_count}, 无效={invalid_count} ({invalid_ratio:.1f}%)")
-    else:
-        print(f"✓ 所有 {valid_count} 个原子均有效")
-    
     if len(valid_atoms) == 0:
-        print("❌ 过滤后没有有效原子")
         return None
     
-    # 从原始邻接矩阵中提取有效原子之间的键
+    # 提取有效原子之间的键
     bond_adjacent_array = None
     if original_bond_adjacent_array is not None:
         try:
-            print("提取有效原子之间的键...")
             num_valid = len(valid_atoms)
             bond_adjacent_array = np.zeros((num_valid, num_valid), dtype=int)
             
@@ -338,22 +278,11 @@ def create_rdkit_molecule(sample):
                     orig_i = valid_indices[i]
                     orig_j = valid_indices[j]
                     bond_adjacent_array[i, j] = original_bond_adjacent_array[orig_i, orig_j]
-            
-            num_bonds = np.sum(bond_adjacent_array > 0)
-            print(f"✓ 成功提取键邻接矩阵（{num_bonds}条键）")
-        except Exception as e:
-            print(f"⚠️ 提取键信息失败: {e}")
+        except Exception:
             bond_adjacent_array = None
     
-    # 阶段6: 使用build_3d_mol_from_arrays创建分子
-    print("\n🔬 阶段6/7: 使用build_3d_mol_from_arrays创建分子对象...")
-    
     if bond_adjacent_array is None:
-        print("❌ 键邻接矩阵不可用，跳过此分子")
         return None
-    
-    # 使用预测的键数据
-    print("使用模型预测的键数据构建分子...")
     
     mol_final = build_3d_mol_from_arrays(
         atom_type_array=np.array(valid_atoms),
@@ -361,42 +290,24 @@ def create_rdkit_molecule(sample):
         positions_3d=np.array(valid_positions)
     )
     if mol_final is None:
-        print("❌ 使用预测键数据创建分子失败，跳过此分子")
         return None
-    print(f"✓ 分子对象创建成功（{mol_final.GetNumAtoms()}个原子，{mol_final.GetNumBonds()}条键）")
     
-    # 阶段7: 验证分子
-    print("\n🔗 阶段7/7: 验证分子...")
-    
-    print("\n✅ 化学键确定成功，开始验证分子...")
-    # validate molecule
+    # 验证分子
     try:
         radical_electrons = sum([a.GetNumRadicalElectrons() for a in mol_final.GetAtoms()])
-        if radical_electrons > 0:
-            print(f"⚠️  分子包含 {radical_electrons} 个自由基电子")
-        
         mol_final.UpdatePropertyCache()
         Chem.GetSymmSSSR(mol_final)
-        print("✓ 分子验证成功")
-    except Exception as e:
-        print(f"❌ 分子验证失败: {e}")
+    except Exception:
         return None
 
-    # try to generate SMILES to verify molecule
-    print("\n🧬 生成SMILES并验证...")
     try:
         smiles = Chem.MolToSmiles(mol_final)
-        print(f"✓ SMILES: {smiles}")
-    except Exception as e:
-        print(f"❌ SMILES生成失败: {e}")
-
-    if '.' in smiles:
-        print("❌ 分子是片段（包含'.'），创建失败")
+    except Exception:
         return None
 
-    print("=" * 60)
-    print("🎉 分子创建成功！")
-    print("=" * 60)
+    if '.' in smiles:
+        return None
+
     return mol_final
         
 def create_rdkit_molecule_from_mol(atoms, positions, bonds=None):

@@ -180,6 +180,7 @@ class MoleculeJudge:
             try:
                 conf_eval = ConfEval(atoms, positions, solvent='water')
                 eval_df = conf_eval.to_pandas()
+                print("       完整评估结果:", eval_df)
                 
                 conf_scores = {
                     'qed': float(eval_df['QEDs'].iloc[0]) if 'QEDs' in eval_df else 0.0,
