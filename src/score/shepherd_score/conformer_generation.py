@@ -543,28 +543,6 @@ def single_point_xtb_from_xyz(xyz_block: str,
             with open(out_dir/input_file, 'w') as f:
                 f.write(xyz_block)
 
-            ## 保存所有输入参数用于调试到持久化目录
-            debug_dir = Path('/home1/zhh/workspace/SPD/training/data/xtb_data')
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            
-            debug_data = {
-                'xyz_block': xyz_block,
-                'solvent': solvent,
-                'num_cores': num_cores,
-                'charge': charge,
-                'temp_dir': str(temp_dir),
-                'out_dir': str(out_dir),
-                'input_file': input_file,
-                'xyz_file_exists': (out_dir/input_file).exists(),
-                'xyz_file_size': (out_dir/input_file).stat().st_size if (out_dir/input_file).exists() else 0,
-                'timestamp': time.time(),
-            }
-            debug_file = debug_dir / f'xtb_input_debug_{rand}.json'
-            with open(debug_file, 'w', encoding='utf-8') as f:
-                json.dump(debug_data, f, indent=2, ensure_ascii=False)
-            print(f"📝 调试信息已保存到: {debug_file}")
-
-            ## 现在这块代码的出错概率很高？？？？？？
             
             try:                                                                                                                   
                 if solvent is not None:
@@ -586,10 +564,11 @@ def single_point_xtb_from_xyz(xyz_block: str,
                         stderr=subprocess.STDOUT,
                     )
             except subprocess.CalledProcessError as e:
-                print(f"\n❌ XTB计算失败 (退出码 {e.returncode}):")
-                print(f"   命令: {' '.join(e.cmd)}")
+                print(f"\n❌ XTB计算失败 (退出码 {e.returncode})")
                 if e.output:
-                    print(f"   XTB输出:\n{e.output}")
+                    lines = e.output.strip().split('\n')
+                    error_lines = lines[-10:] if len(lines) > 10 else lines
+                    print(f"   最后{len(error_lines)}行: {' | '.join(line.strip() for line in error_lines if line.strip())}")
                 raise
 
             output = output.split('\n')

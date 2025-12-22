@@ -53,7 +53,7 @@ params = {
         
         'output_dir': 'x1x4_diffusion_gdb17_20240824/',
         
-        'log_every_n_steps': 1000,
+        'log_every_n_steps': 2,
         
         'multiprocessing_spawn': True,
     },

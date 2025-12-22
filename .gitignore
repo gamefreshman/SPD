@@ -553,3 +553,4 @@ training/jobs
 log
 training/data
 xtb_input_debug*
+nohup.out

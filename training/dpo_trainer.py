@@ -970,14 +970,8 @@ def main():
                 
                 # 更新偏好对
                 if len(new_pairs) > 0:
-                    # 保留50%旧数据
-                    if len(self.preference_pairs) > 0:
-                        keep_ratio = 0.5
-                        n_keep = int(len(self.preference_pairs) * keep_ratio)
-                        kept_pairs = self.preference_pairs[:n_keep]
-                        self.preference_pairs = kept_pairs + new_pairs
-                    else:
-                        self.preference_pairs = new_pairs
+                    # 保留所有旧数据，累积偏好对
+                    self.preference_pairs = self.preference_pairs + new_pairs
                     
                     # 直接更新DPO数据集的偏好对
                     # 下一个epoch开始时，reload_dataloaders_every_n_epochs=1
