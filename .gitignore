@@ -552,3 +552,4 @@ xtb-dist
 training/jobs
 log
 training/data
+xtb_input_debug*
