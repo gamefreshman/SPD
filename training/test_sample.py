@@ -296,15 +296,35 @@ print("\n💾 数据已保存到 output_all_mols.json")
 #######################
 # %%
 # 从新的 JSON 文件读取数据（批量采样结果
-try:
-    with open('output_all_mols.json', 'r', encoding='utf-8') as f:
-        loaded_data = json.load(f)
-    print("✅ 从 output_all_mols.json 读取新的批量采样数据")
-except FileNotFoundError:
-    # 如果新文件不存在，尝试读取旧文件
-    with open('output.json', 'r', encoding='utf-8') as f:
-        loaded_data = json.load(f)
-    print("⚠️ 使用 output.json 中的旧数据")
+# 加载 evaluation/dpo 文件夹下的5个json文件
+dpo_json_dir = '/home1/zhh/workspace/SPD/evaluation/core/data/dpo'
+dpo_json_files = [
+    'generated_mols_20251226_071513.json',
+    'generated_mols_20251226_074052.json',
+    'generated_mols_20251226_081008.json',
+    'generated_mols_20251226_083919.json',
+    'generated_mols_20251226_090950.json',
+]
+
+# try:
+#     with open('output_all_mols.json', 'r', encoding='utf-8') as f:
+#         loaded_data = json.load(f)
+#     print("✅ 从 output_all_mols.json 读取新的批量采样数据")
+# except FileNotFoundError:
+#     # 如果新文件不存在，尝试读取旧文件
+#     with open('output.json', 'r', encoding='utf-8') as f:
+#         loaded_data = json.load(f)
+#     print("⚠️ 使用 output.json 中的旧数据")
+
+loaded_data = []
+for json_file in dpo_json_files:
+    json_path = os.path.join(dpo_json_dir, json_file)
+    with open(json_path, 'r', encoding='utf-8') as f:
+        file_data = json.load(f)
+        loaded_data.extend(file_data)
+        print(f"✅ 加载 {json_file}: {len(file_data)} 个样本")
+
+print(f"📊 总共加载 {len(loaded_data)} 个样本")
 
 # 转换数据格式
 reloaded_samples = []
@@ -334,94 +354,6 @@ if len(reloaded_samples) > 0 and 'source_mol_index' in reloaded_samples[0]:
     total_expected = len(mol_counts) * 20  # 预期每个分子20个样本
     actual_total = len(reloaded_samples)
     print(f"📈 采样进度: {actual_total}/{total_expected} ({actual_total/total_expected*100:.1f}%)")
-
-# %%
-# from shepherd.extract import create_rdkit_molecule
-from shepherd.extract_shepherd import create_rdkit_molecule
-
-output_filepath = 'data/batch.sdf'
-
-output_dir = os.path.dirname(output_filepath)
-
-# 每次都重新生成新的档案
-os.makedirs(output_dir, exist_ok = True)
-print(f"Created directory: {output_dir}")
-
-# 测试 采样结果是否正常
-successful_writes = 0
-failed_writes = 0
-failed_sample_indices = []  # 记录失败的样本索引
-
-with rdkit.Chem.SDWriter('data/batch.sdf') as writer:
-    for b, sample_dict in enumerate(reloaded_samples):
-        print(f"\n处理样本 {b+1}/{len(reloaded_samples)}...")
-        
-        mol_ = create_rdkit_molecule(sample_dict)
-
-        if mol_ is None:
-            print(f"  ❌ 分子创建失败，跳过")
-            failed_writes += 1
-            failed_sample_indices.append(b)  # 记录失败的索引
-            continue
-
-        try:
-            # 尝试写入SDF之前先验证分子
-            # 这会触发 Kekulization 和其他验证
-            smiles = rdkit.Chem.MolToSmiles(mol_)
-            
-            # 如果能成功生成SMILES，说明分子结构合理
-            print(f"  ✅ 分子验证成功: {smiles[:50]}...")
-            # display(mol_)
-            writer.write(mol_)
-            successful_writes += 1
-            
-        except (rdkit.Chem.AtomKekulizeException, rdkit.Chem.AtomValenceException, Exception) as e:
-            print(f"  ❌ 分子结构错误，无法写入SDF: {str(e)}")
-            
-            # 尝试修复选项1：清除芳香性标记
-            try:
-                mol_copy = rdkit.Chem.Mol(mol_)
-                rdkit.Chem.Kekulize(mol_copy, clearAromaticFlags=True)
-                rdkit.Chem.SanitizeMol(mol_copy)
-                
-                writer.write(mol_copy)
-                print(f"  ✅ 修复后写入成功")
-                successful_writes += 1
-            except:
-                print(f"  ❌ 修复失败，跳过此分子")
-                failed_writes += 1
-                failed_sample_indices.append(b)  # 记录失败的索引
-
-print(f"\n{'='*50}")
-print(f"📊 写入统计:")
-print(f"  ✅ 成功: {successful_writes} 个分子")
-print(f"  ❌ 失败: {failed_writes} 个分子")
-print(f"  📈 成功率: {successful_writes/(successful_writes+failed_writes)*100:.1f}%")
-print(f"{'='*50}")
-
-# 从reloaded_samples中剔除失败的分子
-if failed_sample_indices:
-    print(f"\n🧹 清理失败的分子...")
-    print(f"  失败的样本索引: {failed_sample_indices}")
-    
-    original_count = len(reloaded_samples)
-    
-    # 从后往前删除，避免索引偏移问题
-    for idx in sorted(failed_sample_indices, reverse=True):
-        reloaded_samples.pop(idx)
-    
-    print(f"  ✅ 已从reloaded_samples中剔除 {len(failed_sample_indices)} 个失败的分子")
-    print(f"  📊 更新后: {original_count} -> {len(reloaded_samples)} 个样本")
-    
-    # 重新统计各分子的样本数量
-    if len(reloaded_samples) > 0 and 'source_mol_index' in reloaded_samples[0]:
-        from collections import Counter
-        mol_counts = Counter(s['source_mol_index'] for s in reloaded_samples)
-        print(f"  📊 清理后按来源分子分组:")
-        for mol_idx, count in sorted(mol_counts.items()):
-            print(f"    - 分子{mol_idx}: {count} 个样本")
-else:
-    print(f"\n✅ 所有分子提取成功，无需清理")
 
 # %%
 # ## 使用ConformerEval进行评估

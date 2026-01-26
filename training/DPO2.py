@@ -222,6 +222,11 @@ def load_dataset(params):
             molblocks_and_charges = pickle.load(f)
         print(f"✅ 加载NPs数据集: {len(molblocks_and_charges)} 个分子")
         output_file = "NPs"
+    elif params['data'] == 'PDB':
+        with open('../data/conformers/pdb/molblock_charges_pdb_pose.pkl', 'rb') as f:
+            molblocks_and_charges = pickle.load(f)
+        print(f"✅ 加载PDB数据集: {len(molblocks_and_charges)} 个分子")
+        output_file = "PDB"
     elif params['data'] == 'GDB17':
         with open('../data/conformers/gdb/example_molblock_charges.pkl', 'rb') as f:
             molblocks_and_charges = pickle.load(f)

@@ -554,3 +554,6 @@ log
 training/data
 xtb_input_debug*
 nohup.out
+training/debug_inference_params
+evaluation/core/data/
+evaluation/core/data/1

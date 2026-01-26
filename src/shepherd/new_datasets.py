@@ -986,7 +986,7 @@ class HeteroDataset(torch_geometric.data.Dataset):
 
         # 创建药效团类型的one-hot编码（t=0时的干净特征）
         x = np.zeros((pharm_types.size, self.max_node_types_x4))
-        x[np.arange(pharm_types.size), pharm_types] = 1  # one-hot编码
+        x[np.arange(pharm_types.size), pharm_types.astype(int)] = 1  # one-hot编码
         data['x'] = torch.from_numpy(x.copy()).float() * self.scale_node_features_x4
         data['x_0'] = data['x'].clone()  # 保存干净的特征用于损失计算
 

@@ -217,6 +217,10 @@ class DPODataset(Dataset):
             sigma_t = sigma_dash_t
         
         # === 2. 准备分子坐标 ===
+        # 检查分子是否有3D构象，如果没有则生成
+        if mol.GetNumConformers() == 0:
+            from rdkit.Chem import AllChem
+            AllChem.EmbedMolecule(mol, randomSeed=seed if seed is not None else 42)
         mol_coordinates = np.array(mol.GetConformer().GetPositions())
         
         # === 3. 构建data_dict（与HeteroDataset的__getitem__完全一致）===

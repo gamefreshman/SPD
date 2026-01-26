@@ -289,6 +289,21 @@ class LightningModule(pl.LightningModule):
                 self.log('train_feature_loss_x4', feature_loss_x4, batch_size = batch_size_nodes)
             
             self.log('train_loss', loss, batch_size = batch_size)
+            
+            # 每隔一定步数打印训练指标
+            if batch_idx % 100 == 0:
+                lr = self.optimizers().param_groups[0]['lr']
+                print(f"\n[Epoch {self.current_epoch}, Step {batch_idx}] 标准训练:")
+                print(f"  学习率: {lr:.2e}")
+                print(f"  总损失: {loss:.4f}")
+                if self.train_x1_denoising:
+                    print(f"  X1损失: {loss_x1:.4f} (位置: {pos_loss_x1:.4f}, 原子: {feature_loss_x1:.4f}, 键: {bond_loss_x1:.4f})")
+                if self.train_x2_denoising:
+                    print(f"  X2损失: {loss_x2:.4f}")
+                if self.train_x3_denoising:
+                    print(f"  X3损失: {loss_x3:.4f} (位置: {pos_loss_x3:.4f}, 特征: {feature_loss_x3:.4f})")
+                if self.train_x4_denoising:
+                    print(f"  X4损失: {loss_x4:.4f} (位置: {pos_loss_x4:.4f}, 方向: {direction_loss_x4:.4f}, 特征: {feature_loss_x4:.4f})")
 
             return loss
 
@@ -327,6 +342,19 @@ class LightningModule(pl.LightningModule):
             self.log('loss_dpo', loss_dpo)
             self.log('loss_std_on_winner', loss_std)
             self.log('train_loss', loss)
+            
+            # 每隔一定步数打印DPO训练指标
+            if batch_idx % 50 == 0:
+                lr = self.optimizers().param_groups[0]['lr']
+                print(f"\n[Epoch {self.current_epoch}, Step {batch_idx}] DPO训练:")
+                print(f"  学习率: {lr:.2e}")
+                print(f"  总损失: {loss:.4f}")
+                print(f"  DPO权重: {dpo_weight:.3f}")
+                print(f"  标准损失: {loss_std:.4f}")
+                print(f"  DPO损失: {loss_dpo:.4f}")
+                print(f"  隐式准确率: {implicit_acc:.3f}")
+                print(f"  模型损失差: {model_diff:.4f}")
+                print(f"  参考损失差: {ref_diff:.4f}")
             
             return loss
 
@@ -439,13 +467,35 @@ class LightningModule(pl.LightningModule):
         return loss, feature_loss, pos_loss, direction_loss
         
     def compute_dpo_loss(self, batch_winner, batch_loser,  shared_noise, shared_timestep):
+        """
+        计算DPO (Direct Preference Optimization) 损失
         
+        DPO通过比较模型在偏好对（winner vs loser）上的表现来优化模型，
+        使其更倾向于生成高质量的分子。
+        
+        Args:
+            batch_winner: 评分较高的分子批次数据
+            batch_loser: 评分较低的分子批次数据
+            shared_noise: 共享的噪声（确保公平比较）
+            shared_timestep: 共享的时间步（扩散过程中的位置）
+            
+        Returns:
+            loss_dpo_total: 总的DPO损失
+            implicit_acc: 隐式准确率（模型正确识别偏好的比例）
+            model_diff: 模型在winner和loser上的损失差异
+            ref_diff: 参考模型在winner和loser上的损失差异
+        """
+        
+        # 准备输入数据
         input_winner = self.get_training_input_dict(batch_winner)
         input_loser = self.get_training_input_dict(batch_loser)
 
+        # 获取当前模型的预测
         output_model_winner = self.model.forward(input_winner)[1]
         output_model_loser = self.model.forward(input_loser)[1] 
 
+        # 获取参考模型（冻结的初始模型）的预测
+        # 参考模型用于防止模型偏离初始分布太远
         with torch.no_grad():
             output_ref_winner = self.ref_model.forward(input_winner)[1]
             output_ref_loser = self.ref_model.forward(input_loser)[1]
@@ -454,37 +504,45 @@ class LightningModule(pl.LightningModule):
         loss_dpo_discrete = 0.0
 
         if self.train_x1_denoising:
-        # 计算MSE损失
+            # ========== 计算连续特征（原子位置）的DPO损失 ==========
+            # 获取真实原子的掩码（排除虚拟节点）
             mask_w = ~input_winner['x1']['decoder']['virtual_node_mask']
             mask_l = ~input_loser['x1']['decoder']['virtual_node_mask']
             
-            # Model losses
-            noise_pred_w = output_model_winner['x1']['decoder']['denoiser']['pos_out']
+            # 计算当前模型的位置预测损失
+            noise_pred_w = output_model_winner['x1']['decoder']['denoiser']['pos_out']  # 模型预测的噪声
             noise_pred_l = output_model_loser['x1']['decoder']['denoiser']['pos_out']
-            noise_true_w = input_winner['x1']['decoder']['pos_noise']
+            
+            noise_true_w = input_winner['x1']['decoder']['pos_noise']  # 真实添加的噪声
             noise_true_l = input_loser['x1']['decoder']['pos_noise']
             
+            # MSE损失：衡量模型去噪能力
             model_loss_w = torch.mean((noise_pred_w[mask_w] - noise_true_w[mask_w]) ** 2)
             model_loss_l = torch.mean((noise_pred_l[mask_l] - noise_true_l[mask_l]) ** 2)
             
-            # Ref losses
+            # 计算参考模型的位置预测损失（作为基准）
             noise_ref_w = output_ref_winner['x1']['decoder']['denoiser']['pos_out']
             noise_ref_l = output_ref_loser['x1']['decoder']['denoiser']['pos_out']
             
             ref_loss_w = torch.mean((noise_ref_w[mask_w] - noise_true_w[mask_w]) ** 2)
             ref_loss_l = torch.mean((noise_ref_l[mask_l] - noise_true_l[mask_l]) ** 2)
             
-            # DPO公式
+            # DPO损失计算（基于Bradley-Terry偏好模型）
+            # model_diff < 0 表示模型在winner上表现更好（损失更小），这是我们期望的
             model_diff = model_loss_w - model_loss_l
             ref_diff = ref_loss_w - ref_loss_l
+            
+            # DPO核心公式：鼓励 model_diff < ref_diff
+            # beta_dpo 控制与参考模型的偏离程度（越大越保守）
             inside_term = -0.5 * self.beta_dpo * (model_diff - ref_diff)
             loss_dpo_continuous = -torch.log(torch.sigmoid(inside_term) + 1e-8)
 
         if self.train_x1_denoising:
+            # ========== 计算离散特征（原子类型）的DPO损失 ==========
             mask_w = ~input_winner['x1']['decoder']['virtual_node_mask']
             mask_l = ~input_loser['x1']['decoder']['virtual_node_mask']
             
-            # Model losses - atom types
+            # 获取原子类型预测
             logits_w = output_model_winner['x1']['decoder']['denoiser']['x_out']
             logits_l = output_model_loser['x1']['decoder']['denoiser']['x_out']
             true_labels_w = torch.argmax(input_winner['x1']['decoder']['true_atom_types_t0'], dim=1)
@@ -500,14 +558,17 @@ class LightningModule(pl.LightningModule):
             ref_loss_w = F.cross_entropy(logits_ref_w[mask_w], true_labels_w[mask_w])
             ref_loss_l = F.cross_entropy(logits_ref_l[mask_l], true_labels_l[mask_l])
             
-            # DPO公式
+            # 应用相同的DPO公式到离散特征
             model_diff = model_loss_w - model_loss_l
             ref_diff = ref_loss_w - ref_loss_l
             inside_term = -0.5 * self.beta_dpo * (model_diff - ref_diff)
             loss_dpo_discrete = -torch.log(torch.sigmoid(inside_term) + 1e-8)
 
+        # 隐式准确率：模型正确识别winner的比例
+        # model_diff < 0 表示模型认为winner更好（损失更小）
         implicit_acc =  (model_diff < 0).float().mean()
 
+        # 总DPO损失 = 连续特征损失 + 离散特征损失
         loss_dpo_total = loss_dpo_continuous + loss_dpo_discrete
 
         return loss_dpo_total, implicit_acc, model_diff, ref_diff
