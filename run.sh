@@ -11,7 +11,7 @@ nohup python dpo_trainer.py params_x1x3x4_dpo_finetune_nps 0 > logs/dpo_nps.log 
 
 nohup python DPO2.py params_x1x3x4_dpo_finetune_pdb 0 > logs/dpo_pdb.log 2>&1 &
 
-nohup python DPO3.py params_x1x3x4_dpo_fragment_merging1 0 > logs/dpo_fragment_merging1.log 2>&1 & 
+nohup python DPO3.py params_x1x3x4_dpo_fragment_merging 0 > logs/dpo_fragment_merging.log 2>&1 & 
 
 ---
 

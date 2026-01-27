@@ -24,9 +24,6 @@ from shepherd.shepherd_score_utils.generate_point_cloud import (
 )
 from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
 
-# 设置CUDA环境变量
-os.environ['CUDA_LAUNCH_BLOCKING'] = "0"
-
 # 检测可用GPU
 if torch.cuda.is_available():
     num_gpus = torch.cuda.device_count()
@@ -63,20 +60,15 @@ else:
     gpu_devices = [torch.device('cpu')]
     gpu_memory_info = []
 
-# 根据GPU内存动态调整批量大小
-# 固定的最优batch size配置（经测试验证）
-GPU_BATCH_SIZES = {
-    0: 2,   # GPU 0 (4090)
-    1: 2,  # GPU 1 (3090)
-    2: 2,  # GPU 2 (3090)
-}
+# 统一的batch size配置
+UNIFORM_BATCH_SIZE = 2
 
 def get_optimal_batch_size(gpu_id):
-    """返回固定的最优batch size"""
-    return GPU_BATCH_SIZES.get(gpu_id, 2)
+    """返回统一的batch size"""
+    return UNIFORM_BATCH_SIZE
 
 # 加载模型
-chkpt = '/home1/zhh/workspace/SPD/evaluation/ckpt/last-33epoch.ckpt'
+chkpt = '/home1/zhh/workspace/SPD/evaluation/ckpt/last_33epoch.ckpt'
 
 # 主设备用于加载模型
 main_device = gpu_devices[0] if gpu_devices else torch.device('cpu')
@@ -290,17 +282,18 @@ def preprocess_molecule(args):
         return mol_index, None
 
 # ==================== 采样配置 ====================
-TOTAL_SAMPLES_PER_MOL = 20  # 每个分子生成的样本数
+# 原子数量列表：25个不同的原子数量（与ref_NP.py保持一致）
+N_ATOMS_LIST = [36, 40, 44, 48, 49, 50, 51, 52, 56, 60, 64, 68, 70, 72, 76, 77, 78, 79, 80, 81, 83, 84, 85, 86, 87]
+SAMPLES_PER_N_ATOMS = 1  # 每个原子数量生成100个分子
 
 # ==================== 主进程中执行模型推理（支持多GPU） ====================
-def generate_samples_batch(mol_index, mol_features, model_pl, device, marginals, params, gpu_id, batch_size, num_samples):
+def generate_samples_batch(mol_index, mol_features, model_pl, device, marginals, params, gpu_id, batch_size, num_samples, n_atoms):
     """
     在指定GPU上为单个分子生成指定数量的样本（用于细粒度并行）
     """
     if mol_features is None:
         return mol_index, []
     
-    n_atoms = 70
     mol_samples = []
     
     # 计算需要的迭代次数
@@ -370,12 +363,12 @@ def generate_samples_batch(mol_index, mol_features, model_pl, device, marginals,
     
     return mol_index, mol_samples
 
-def generate_samples_for_molecule(mol_index, mol_features, model_pl, device, marginals, params, gpu_id=0):
+def generate_samples_for_molecule(mol_index, mol_features, model_pl, device, marginals, params, gpu_id=0, n_atoms=70):
     """
     在指定GPU上为单个分子生成所有样本（兼容旧接口）
     """
     batch_size = get_optimal_batch_size(gpu_id)
-    return generate_samples_batch(mol_index, mol_features, model_pl, device, marginals, params, gpu_id, batch_size, TOTAL_SAMPLES_PER_MOL)
+    return generate_samples_batch(mol_index, mol_features, model_pl, device, marginals, params, gpu_id, batch_size, SAMPLES_PER_N_ATOMS, n_atoms)
 
 # ==================== 多GPU并行推理任务 ====================
 def gpu_inference_worker(task_queue, result_queue, gpu_id, model, marginals, params):
@@ -493,6 +486,14 @@ print(f"  使用 {num_gpus} 张GPU进行并行推理")
 # 准备边际分布
 marginals = (atom_marginals_x1, bond_marginals_x1)
 
+print(f"  📋 采样配置:")
+print(f"    - 原子数量列表: {N_ATOMS_LIST} (共{len(N_ATOMS_LIST)}种)")
+print(f"    - 每种原子数量生成: {SAMPLES_PER_N_ATOMS} 个样本")
+print(f"    - 每个分子总计: {len(N_ATOMS_LIST) * SAMPLES_PER_N_ATOMS} 个样本")
+
+# 结果存储: {mol_index: {n_atoms: [samples]}}
+all_results = {}
+
 if num_gpus > 1:
     import queue
     import threading
@@ -502,29 +503,28 @@ if num_gpus > 1:
     result_queue = queue.Queue()
     
     # ==================== 基于batch_size的任务拆分 ====================
-    # 根据GPU batch_size来分配子任务，使任务量与GPU处理能力成比例
-    # 总batch_size用于计算任务比例
-    total_batch_capacity = sum(GPU_BATCH_SIZES.get(i, 8) for i in range(num_gpus))
-    print(f"  📊 GPU配置: {[f'GPU{i}={GPU_BATCH_SIZES.get(i,8)}' for i in range(num_gpus)]}")
+    total_batch_capacity = num_gpus * UNIFORM_BATCH_SIZE
+    print(f"  📊 GPU配置: {num_gpus} 个GPU, 统一 batch_size={UNIFORM_BATCH_SIZE}")
     print(f"  📊 总批处理能力: {total_batch_capacity}")
     
-    # 每个子任务的样本数 - 使用较小的值以便更均匀分配
-    samples_per_subtask = 20  # 每个子任务生成的样本数
+    # 每个子任务的样本数
+    samples_per_subtask = 20
     
     total_subtasks = 0
     for mol_index in sorted(mol_features_dict.keys()):
         if mol_features_dict[mol_index] is not None:
-            # 将200样本拆成多个子任务
-            num_subtasks = (TOTAL_SAMPLES_PER_MOL + samples_per_subtask - 1) // samples_per_subtask
-            for subtask_id in range(num_subtasks):
-                samples_this_subtask = min(samples_per_subtask, 
-                                           TOTAL_SAMPLES_PER_MOL - subtask_id * samples_per_subtask)
-                # 任务格式: (mol_index, mol_features, subtask_id, num_samples)
-                task_queue.put((mol_index, mol_features_dict[mol_index], subtask_id, samples_this_subtask))
-                total_subtasks += 1
+            # 遍历所有原子数量
+            for n_atoms in N_ATOMS_LIST:
+                num_subtasks = (SAMPLES_PER_N_ATOMS + samples_per_subtask - 1) // samples_per_subtask
+                for subtask_id in range(num_subtasks):
+                    samples_this_subtask = min(samples_per_subtask, 
+                                               SAMPLES_PER_N_ATOMS - subtask_id * samples_per_subtask)
+                    # 任务格式: (mol_index, mol_features, n_atoms, subtask_id, num_samples)
+                    task_queue.put((mol_index, mol_features_dict[mol_index], n_atoms, subtask_id, samples_this_subtask))
+                    total_subtasks += 1
     
     valid_mol_count = sum(1 for f in mol_features_dict.values() if f is not None)
-    print(f"  📋 任务拆分: {valid_mol_count} 个分子 → {total_subtasks} 个子任务")
+    print(f"  📋 任务拆分: {valid_mol_count} 个分子 × {len(N_ATOMS_LIST)} 种原子数 → {total_subtasks} 个子任务")
     print(f"  🔄 每个子任务生成 {samples_per_subtask} 个样本，可在不同GPU上并行")
     
     # 添加进度追踪
@@ -550,19 +550,23 @@ if num_gpus > 1:
                 if task is None:
                     break
                 
-                mol_index, mol_features, subtask_id, num_samples = task
+                mol_index, mol_features, n_atoms, subtask_id, num_samples = task
                 
                 # 生成这个子任务的样本
                 _, samples = generate_samples_batch(
                     mol_index, mol_features, model, device, marginals, params, 
-                    gpu_id, batch_size, num_samples
+                    gpu_id, batch_size, num_samples, n_atoms
                 )
                 
-                result_queue.put((mol_index, subtask_id, samples))
+                # 为每个样本添加n_atoms信息
+                for sample in samples:
+                    sample['n_atoms'] = n_atoms
+                
+                result_queue.put((mol_index, n_atoms, subtask_id, samples))
                 processed += 1
                 update_progress()
                 
-                print(f"    [GPU {gpu_id}] ✅ 分子{mol_index}_子任务{subtask_id} | "
+                print(f"    [GPU {gpu_id}] ✅ 分子{mol_index}_n{n_atoms}_子任务{subtask_id} | "
                       f"样本数: {len(samples)} | 本GPU已处理: {processed}")
                 
             except queue.Empty:
@@ -591,17 +595,14 @@ if num_gpus > 1:
     for worker in workers:
         worker.join()
     
-    # 收集并合并结果
-    results = {}  # {mol_index: [samples]}
+    # 收集并合并结果: {mol_index: {n_atoms: [samples]}}
     while not result_queue.empty():
-        mol_index, subtask_id, samples = result_queue.get()
-        if mol_index not in results:
-            results[mol_index] = []
-        results[mol_index].extend(samples)
-    
-    # 按原始顺序整理结果
-    for mol_index in sorted(results.keys()):
-        all_generated_samples.extend(results[mol_index])
+        mol_index, n_atoms, subtask_id, samples = result_queue.get()
+        if mol_index not in all_results:
+            all_results[mol_index] = {}
+        if n_atoms not in all_results[mol_index]:
+            all_results[mol_index][n_atoms] = []
+        all_results[mol_index][n_atoms].extend(samples)
     
     # 显示统计
     print(f"\n  📈 GPU并行统计:")
@@ -618,32 +619,79 @@ else:
             print(f"  ⚠️  分子 {mol_index} 无有效特征，跳过")
             continue
         
-        print(f"\n{'='*50}")
-        print(f"🧪 处理分子 {mol_index + 1}/{len(molblocks_and_charges)}")
-        print(f"  - 原子数: 70")
-        print(f"  - 药效团数: {mol_features['num_pharmacophores']}")
-        print(f"  - 总样本数: 20")
+        all_results[mol_index] = {}
         
-        # 生成样本
-        mol_index, mol_samples = generate_samples_for_molecule(
-            mol_index, mol_features, models_dict[0], main_device, marginals, params
-        )
-        
-        all_generated_samples.extend(mol_samples)
-        print(f"  ✅ 完成: 生成 {len(mol_samples)} 个样本")
+        for n_atoms in N_ATOMS_LIST:
+            print(f"\n{'='*50}")
+            print(f"🧪 处理分子 {mol_index + 1}/{len(molblocks_and_charges)}, n_atoms={n_atoms}")
+            print(f"  - 药效团数: {mol_features['num_pharmacophores']}")
+            print(f"  - 总样本数: {SAMPLES_PER_N_ATOMS}")
+            
+            # 生成样本
+            _, mol_samples = generate_samples_for_molecule(
+                mol_index, mol_features, models_dict[0], main_device, marginals, params,
+                gpu_id=0, n_atoms=n_atoms
+            )
+            
+            # 为每个样本添加n_atoms信息
+            for sample in mol_samples:
+                sample['n_atoms'] = n_atoms
+            
+            all_results[mol_index][n_atoms] = mol_samples
+            print(f"  ✅ 完成: 生成 {len(mol_samples)} 个样本")
 
 print(f"\n{'='*60}")
 print(f"🎉 所有采样完成!")
 print(f"{'='*60}")
-print(f"总样本数: {len(all_generated_samples)}")
-print(f"每个分子采样 500 个样本")
-# 统计每个分子的样本数
-for mol_idx in sorted(set(s['source_mol_index'] for s in all_generated_samples)):
-    count = sum(1 for s in all_generated_samples if s['source_mol_index'] == mol_idx)
-    print(f"  - 分子 {mol_idx}: {count} 个样本")
 
-# 保存结果
-generated_samples_for_json = convert_for_json(all_generated_samples)
-with open(f'output_all_mols_{os.path.basename(chkpt)}.json', 'w', encoding='utf-8') as f:
-    json.dump(generated_samples_for_json, f, ensure_ascii=False, indent=4)
-print(f"\n💾 数据已保存到 output_all_mols_{os.path.basename(chkpt)}.json")
+# 统计结果
+total_samples = 0
+for mol_index in sorted(all_results.keys()):
+    mol_total = sum(len(samples) for samples in all_results[mol_index].values())
+    total_samples += mol_total
+    print(f"  - 分子 {mol_index}: {mol_total} 个样本 ({len(all_results[mol_index])} 种原子数)")
+
+print(f"总样本数: {total_samples}")
+print(f"配置: {len(molblocks_and_charges)} 个分子 × {len(N_ATOMS_LIST)} 种原子数 × {SAMPLES_PER_N_ATOMS} 个样本")
+
+# 保存结果（与ref_NP.py格式兼容）
+os.makedirs('data', exist_ok=True)
+os.makedirs('data/incremental', exist_ok=True)
+
+for mol_index in sorted(all_results.keys()):
+    molecule_results = {}
+    for n_atoms in N_ATOMS_LIST:
+        if n_atoms in all_results[mol_index]:
+            samples = all_results[mol_index][n_atoms][:SAMPLES_PER_N_ATOMS]
+            serializable_samples = [convert_for_json(s) for s in samples]
+            molecule_results[f'n_atoms_{n_atoms}'] = {
+                'n_atoms': n_atoms,
+                'num_samples': len(serializable_samples),
+                'samples': serializable_samples
+            }
+            print(f"  分子{mol_index} n_atoms={n_atoms}: {len(serializable_samples)} 个样本")
+    
+    # 保存单个分子的JSON
+    mol_output_file = f'data/molecule_{mol_index}_all_samples.json'
+    with open(mol_output_file, 'w') as f:
+        json.dump(molecule_results, f, indent=2)
+    print(f"  JSON已保存到: {mol_output_file}")
+
+# 保存汇总JSON
+all_results_json = {}
+for mol_index in sorted(all_results.keys()):
+    all_results_json[f'molecule_{mol_index}'] = {}
+    for n_atoms in N_ATOMS_LIST:
+        if n_atoms in all_results[mol_index]:
+            samples = all_results[mol_index][n_atoms][:SAMPLES_PER_N_ATOMS]
+            serializable_samples = [convert_for_json(s) for s in samples]
+            all_results_json[f'molecule_{mol_index}'][f'n_atoms_{n_atoms}'] = {
+                'n_atoms': n_atoms,
+                'num_samples': len(serializable_samples),
+                'samples': serializable_samples
+            }
+
+output_file = f'data/generated_samples_all_molecules_{os.path.basename(chkpt)}.json'
+with open(output_file, 'w') as f:
+    json.dump(all_results_json, f, indent=2)
+print(f"\n💾 汇总数据已保存到 {output_file}")

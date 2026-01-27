@@ -45,9 +45,9 @@ params = {
         'train_x4_denoising': True,
         
         # 调整批次大小（Fragment Merging数据集）
-        'batch_size': 5,  # 中等批次大小
+        'batch_size': 2,  # 中等批次大小
         'accumulate_grad_batches': 1,  # 不累积梯度
-        'num_gpus': 3,  # 3 GPU
+        'num_gpus': 3,  # 使用所有3个GPU
         
         'lr': 0.0001,  # 标准学习率
         'min_lr': 0.00001,
@@ -72,8 +72,8 @@ params = {
         'dpo_max_weight': 0.6,  # DPO最大权重（较高）
         
         # 采样策略
-        'dpo_sampling_ratio': 0.2,  # 每个epoch采样20%
-        'dpo_batch_ratio': 0.5,  # DPO batch占总batch的50%
+        'dpo_sampling_ratio': 1,  # 每个epoch采样20%
+        'dpo_batch_ratio': 1,  # DPO batch占总batch的50%
         
         # 偏好对构建
         'dpo_min_score_gap': 0.3,  # 降低最小分数差距阈值（因为没有相似性评分）
@@ -84,7 +84,7 @@ params = {
         'dpo_load_weights_only': True,  # 从旧checkpoint只加载权重
         
         # 预训练模型路径（从MOSES_aq模型开始微调）
-        'pretrained_checkpoint_path': '/home1/zhh/workspace/SPD/data/shepherd_chkpts/x1x3x4_diffusion_mosesaq_20240824_submission.ckpt',
+        'pretrained_checkpoint_path': '/home1/zhh/workspace/SPD/evaluation/ckpt/last_33epoch.ckpt',
         
         # 其他选项
         'save_preference_pairs': True,  # 保存偏好对用于分析
@@ -93,8 +93,10 @@ params = {
     # ==================== DPO采样配置 ====================
     'sampling': {
         'timesteps': 400,  # 采样步数（与训练T一致）
-        'num_samples_per_molecule': 8,  # 每个种子分子生成8个样本（批量采样）
+        'num_groups': -1,  # -1表示自动使用GPU数量作为组数
+        'samples_per_group': 4,  # 每组样本数
         'fixed_n_atoms': 70,  # 固定生成的原子数
+        # 总样本数 = GPU数量 × samples_per_group
     },
     
     # ==================== DPO评分权重 ====================
