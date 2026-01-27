@@ -284,7 +284,7 @@ def preprocess_molecule(args):
 # ==================== 采样配置 ====================
 # 原子数量列表：25个不同的原子数量（与ref_NP.py保持一致）
 N_ATOMS_LIST = [36, 40, 44, 48, 49, 50, 51, 52, 56, 60, 64, 68, 70, 72, 76, 77, 78, 79, 80, 81, 83, 84, 85, 86, 87]
-SAMPLES_PER_N_ATOMS = 1  # 每个原子数量生成100个分子
+SAMPLES_PER_N_ATOMS = 100  # 每个原子数量生成100个分子
 
 # ==================== 主进程中执行模型推理（支持多GPU） ====================
 def generate_samples_batch(mol_index, mol_features, model_pl, device, marginals, params, gpu_id, batch_size, num_samples, n_atoms):
