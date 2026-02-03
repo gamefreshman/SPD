@@ -403,7 +403,8 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
                 atom_marginals[0] = 0.0
                 atom_marginals = atom_marginals / atom_marginals.sum()
             
-            n_atoms = params.get('sampling', {}).get('fixed_n_atoms', 70)
+            # n_atoms = params.get('sampling', {}).get('fixed_n_atoms', 78)
+            n_atoms = 78 # 直接硬编码为当前优化的原子的原子序数
             
             # 准备inference参数
             inference_kwargs = {
@@ -469,13 +470,17 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
 
 
 def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, dataset, 
-                                   num_samples_per_mol=4, device='cuda'):
+                                   num_samples_per_mol=4, num_parallel_groups=4, device='cuda'):
     """
-    多GPU多分子并行采样和评估
+    多GPU多组并行采样和评估
     
     并行策略：
     1. 多线程并行提取条件特征（CPU密集型）
-    2. 多GPU并行采样（每个GPU一组分子）
+    2. 多GPU并行采样（对同一分子进行多组并行采样，分配到不同GPU）
+    
+    Args:
+        num_samples_per_mol: 每组采样的样本数
+        num_parallel_groups: 并行采样组数（对同一分子进行多组采样以充分利用多GPU）
     
     Returns:
         preference_pairs: List[(winner_data, loser_data, winner_scores, loser_scores)]
@@ -515,11 +520,24 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     print(f"✅ 条件特征提取完成: {len(prepared_conditions)}/{len(molblocks_and_charges)} 个分子")
     
     # ========================================================================
-    # 阶段2：多GPU并行采样（每个GPU处理一个分子）
+    # 阶段2：多GPU并行采样（对同一分子进行多组并行采样）
     # ========================================================================
+    # 当分子数量少于GPU数量时，将每个分子复制为多组以充分利用GPU
+    original_num_mols = len(prepared_conditions)
+    if original_num_mols < num_gpus and original_num_mols > 0:
+        # 对每个分子复制多组，最多 num_parallel_groups 组
+        expanded_conditions = []
+        for cond in prepared_conditions:
+            for group_idx in range(num_parallel_groups):
+                cond_copy = deepcopy(cond)
+                cond_copy['group_idx'] = group_idx  # 标记组索引
+                expanded_conditions.append(cond_copy)
+        prepared_conditions = expanded_conditions
+        print(f"\n🔄 单分子多组并行模式: 将 {original_num_mols} 个分子扩展为 {len(prepared_conditions)} 组")
+    
     num_groups = len(prepared_conditions)
     print(f"\n🚀 阶段2: 多GPU并行采样")
-    print(f"   GPU数量: {num_gpus}, 分子数量: {num_groups}, 每分子样本数: {num_samples_per_mol}")
+    print(f"   GPU数量: {num_gpus}, 采样组数: {num_groups}, 每组样本数: {num_samples_per_mol}")
     print(f"   总样本数: {num_groups * num_samples_per_mol}")
     
     # 在每个GPU上创建模型副本
@@ -648,13 +666,14 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
     """
     print(f"\n🔍 评估 {len(generated_samples)} 个生成样本...")
     
-    # 按源分子分组
+    # 按采样组ID分组（而不是按源分子分组），这样每个采样组都能独立构建偏好对
     from collections import defaultdict
     grouped_samples = defaultdict(list)
     
     for sample in generated_samples:
-        source_idx = sample.get('source_mol_index', 0)
-        grouped_samples[source_idx].append(sample)
+        # 优先使用group_id分组，这样对同一分子的多组采样可以各自构建偏好对
+        group_id = sample.get('group_id', sample.get('source_mol_index', 0))
+        grouped_samples[group_id].append(sample)
     
     all_preference_pairs = []
     all_valid_molecules_across_groups = []  # 收集所有组的有效分子，用于跨组匹配
@@ -735,26 +754,19 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 
                 eval_df = conf_eval.to_pandas()
                 
-                # 提取关键指标，处理可能的None值
-                # 注意：ConfEval.to_pandas() 返回的是 Series，键名是属性名
-                qed_val = eval_df.get('QED', None)
+                # 提取关键指标（只保留SA Score和logP）
                 logp_val = eval_df.get('logP', None)
-                strain_val = eval_df.get('strain_energy', None)
                 sa_val = eval_df.get('SA_score', None)
-                fsp3_val = eval_df.get('fsp3', None)  # 结构复杂性
                 
                 # 检查关键指标是否为None或nan
-                if qed_val is None or sa_val is None or (isinstance(qed_val, float) and np.isnan(qed_val)):
-                    print(f"  🔬 样本 {i+1}: ✗ 指标无效 (QED={qed_val}, SA={sa_val})")
+                if sa_val is None or (isinstance(sa_val, float) and np.isnan(sa_val)):
+                    print(f"  🔬 样本 {i+1}: ✗ 指标无效 (SA={sa_val})")
                     # 给无效分子赋予极低分数
                     invalid_samples.append({
                         'sample': sample,
                         'conf_scores': {
-                            'qed': 0.0,
                             'logp': -10.0,
-                            'strain_energy': 100.0,
                             'sa_score': 10.0,
-                            'fsp3': 0.0,
                             'is_valid': False,
                         },
                         'atoms': atoms,
@@ -776,15 +788,12 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                         return default
                 
                 conf_scores = {
-                    'qed': safe_float(qed_val, 0.0),
                     'logp': safe_float(logp_val, 0.0),
-                    'strain_energy': safe_float(strain_val, 0.0),
                     'sa_score': safe_float(sa_val, 5.0),
-                    'fsp3': safe_float(fsp3_val, 0.0),  # 结构复杂性
                     'is_valid': True,
                 }
-                # 简洁日志：只打印关键指标
-                print(f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}, logP={logp_val:.2f}, fsp3={fsp3_val:.3f}" if fsp3_val else f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}")
+                # 简洁日志
+                print(f"  🔬 样本 {i+1}: ✓ SA={sa_val:.2f}, logP={logp_val:.2f}")
                 
             except Exception as e:
                 print(f"  🔬 样本 {i+1}: ✗ ConfEval失败 ({type(e).__name__}: {str(e)[:50]})")
@@ -792,11 +801,8 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 invalid_samples.append({
                     'sample': sample,
                     'conf_scores': {
-                        'qed': 0.0,
                         'logp': -10.0,
-                        'strain_energy': 100.0,
                         'sa_score': 10.0,
-                        'fsp3': 0.0,
                         'is_valid': False,
                     },
                     'atoms': atoms,
@@ -831,12 +837,12 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         print("  🔬 开始ConditionalEval评估...")
         
         # 检查是否有参考分子
-        if reference_mols is None or source_idx >= len(reference_mols):
+        # 注意：所有组都使用第一个参考分子（因为所有组都是对同一分子的采样）
+        ref_mol_idx = 0  # 始终使用第一个参考分子
+        if reference_mols is None or len(reference_mols) == 0:
             print("  ⚠️  无参考分子，使用默认相似性分数")
             for item in all_evaluated:  # 包括有效和无效样本
                 item['cond_scores'] = {
-                    'graph_sim': 0.0,        # 2D图相似度
-                    'sims_surf_target': 0.0,  # 形状相似度
                     'sims_esp_target': 0.0,   # ESP表面相似度
                     'sims_pharm_target': 0.0, # 药效团相似度
                 }
@@ -845,35 +851,27 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             # 使用RDKit直接计算相似度，绕过XTB依赖
             try:
                 from shepherd_score.container import Molecule
-                from shepherd_score.score.gaussian_overlap_np import get_overlap_np
                 from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
                 from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
                 from shepherd_score.score.constants import ALPHA, LAM_SCALING
                 from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
-                from rdkit.DataStructs import TanimotoSimilarity
-                from rdkit.Chem import AllChem
                 import rdkit.Chem as Chem
                 
-                ref_mol = reference_mols[source_idx]
+                ref_mol = reference_mols[ref_mol_idx]
                 
                 # 创建参考分子对象
                 ref_molec = Molecule(
                     ref_mol, 
-                    num_surf_points=200, 
+                    num_surf_points=400,  # 与ConditionalEvalPipeline保持一致
                     probe_radius=1.2,
                     partial_charges=None,  # 使用MMFF自动计算
                     pharm_multi_vector=False
                 )
                 
-                # 计算参考分子的Morgan指纹用于2D相似度
-                ref_mol_noH = Chem.RemoveHs(ref_mol)
-                morgan_fp_gen = AllChem.GetMorganGenerator(radius=2, fpSize=2048)
-                ref_morgan_fp = morgan_fp_gen.GetFingerprint(ref_mol_noH)
-                
                 # 调试：检查参考分子的属性
-                print(f"    📊 参考分子属性: has_surf_pos={ref_molec.surf_pos is not None}, has_surf_esp={ref_molec.surf_esp is not None}, has_pharm_ancs={ref_molec.pharm_ancs is not None}")
+                print(f"    📊 参考分子属性: has_surf_esp={ref_molec.surf_esp is not None}, has_pharm_ancs={ref_molec.pharm_ancs is not None}")
                 
-                num_surf_points = 200
+                num_surf_points = 400  # 与ConditionalEvalPipeline保持一致
                 alpha = ALPHA(num_surf_points)
                 lam_scaled = 0.3 * LAM_SCALING
                 
@@ -883,8 +881,6 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     if item['conf_scores'].get('is_valid', True) == False:
                         print(f"    ⏩ 分子 {i+1}: 无效分子，跳过条件评估")
                         item['cond_scores'] = {
-                            'graph_sim': 0.0,
-                            'sims_surf_target': 0.0,
                             'sims_esp_target': 0.0,
                             'sims_pharm_target': 0.0,
                         }
@@ -925,13 +921,6 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                             pharm_multi_vector=False
                         )
                         
-                        # 计算表面相似度
-                        sims_surf_target = 0.0
-                        if gen_molec.surf_pos is not None and ref_molec.surf_pos is not None:
-                            sims_surf_target = float(get_overlap_np(
-                                gen_molec.surf_pos, ref_molec.surf_pos, alpha=alpha
-                            ))
-                        
                         # 计算ESP相似度
                         sims_esp_target = 0.0
                         if (gen_molec.surf_pos is not None and gen_molec.surf_esp is not None and
@@ -954,34 +943,20 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                             ))
                         
                         # 计算2D图相似度（Tanimoto）
-                        graph_sim = 0.0
-                        try:
-                            gen_mol_noH = Chem.RemoveHs(gen_mol)
-                            gen_morgan_fp = morgan_fp_gen.GetFingerprint(gen_mol_noH)
-                            graph_sim = float(TanimotoSimilarity(gen_morgan_fp, ref_morgan_fp))
-                        except:
-                            pass
-                        
                         # 处理NaN值
-                        if np.isnan(sims_surf_target): sims_surf_target = 0.0
                         if np.isnan(sims_esp_target): sims_esp_target = 0.0
                         if np.isnan(sims_pharm_target): sims_pharm_target = 0.0
-                        if np.isnan(graph_sim): graph_sim = 0.0
                         
                         item['cond_scores'] = {
-                            'graph_sim': graph_sim,
-                            'sims_surf_target': sims_surf_target,
                             'sims_esp_target': sims_esp_target,
                             'sims_pharm_target': sims_pharm_target,
                         }
                         
-                        print(f"    ✓ 分子 {i+1}: GraphSim={graph_sim:.3f}, Surf={sims_surf_target:.3f}, ESP={sims_esp_target:.3f}, Pharm={sims_pharm_target:.3f}")
+                        print(f"    ✓ 分子 {i+1}: ESP={sims_esp_target:.3f}, Pharm={sims_pharm_target:.3f}")
                         
                     except Exception as e:
                         print(f"    ⚠️ 分子 {i+1} 条件评估失败: {e}")
                         item['cond_scores'] = {
-                            'graph_sim': 0.0,
-                            'sims_surf_target': 0.0,
                             'sims_esp_target': 0.0,
                             'sims_pharm_target': 0.0,
                         }
@@ -992,8 +967,6 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 print(f"  ⚠️  ConditionalEval初始化失败: {e}, 使用默认相似性分数")
                 for item in all_evaluated:
                     item['cond_scores'] = {
-                        'graph_sim': 0.0,
-                        'sims_surf_target': 0.0,
                         'sims_esp_target': 0.0,
                         'sims_pharm_target': 0.0,
                     }
@@ -1008,55 +981,32 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 # 无效分子赋予负无穷分
                 item['total_score'] = float('-inf')
             else:
-                # 综合评分（基于用户指定的评估指标）
+                # 综合评分（只使用SA Score、logP、ESP和药效团相似度）
                 try:
                     total_score = 0.0
                     
                     # === Conf评估指标 ===
                     # 1. SA Score - 合成可及性，越小越好 (范围1-10，1最好)
-                    # 归一化到0-1范围后惩罚，权重2.0
                     sa_normalized = (conf['sa_score'] - 1.0) / 9.0
                     total_score -= sa_normalized * 2.0
                     
-                    # 2. QED - 类药性，越接近1越好 (范围0-1)
-                    # 权重2.0
-                    total_score += conf['qed'] * 2.0
-                    
-                    # 3. LogP - 亲脂性，目标范围1~5
-                    # 在范围内不惩罚，超出范围惩罚
+                    # 2. LogP - 亲脂性，目标范围1~5
                     logp = conf['logp']
                     if logp < 1.0:
                         logp_penalty = (1.0 - logp) * 0.5
                     elif logp > 5.0:
                         logp_penalty = (logp - 5.0) * 0.5
                     else:
-                        logp_penalty = 0.0  # 在1-5范围内，不惩罚
-                    total_score -= min(logp_penalty, 2.0)  # 最多扣2分
-                    
-                    # 4. fsp3 - 结构复杂性，越高越好 (范围0-1)
-                    # 权重1.0
-                    total_score += conf['fsp3'] * 1.0
-                    
-                    # 5. strain_energy - 应变能，越小越好
-                    # 权重0.5，上限10
-                    total_score -= min(conf['strain_energy'], 10.0) * 0.5
+                        logp_penalty = 0.0
+                    total_score -= min(logp_penalty, 2.0)
                     
                     # === Cond评估指标 ===
-                    # （不再使用graph_sim 2D图相似度）
+                    # 3. ESP相似度 (范围0-1)
+                    total_score += cond['sims_esp_target'] * 3.0
                     
-                    # 1. sims_surf_target - 形状相似度 (范围0-1)
-                    # 权重1.0
-                    total_score += cond['sims_surf_target'] * 1.0
-                    
-                    # 3. sims_esp_target - ESP表面相似度 (范围0-1)
-                    # 权重1.5（静电势更重要）
-                    total_score += cond['sims_esp_target'] * 3
-                    
-                    # 4. sims_pharm_target - 药效团相似度 (范围0-1)
-                    # 权重2.0（药效团最重要）
+                    # 4. 药效团相似度 (范围0-1)
                     total_score += cond['sims_pharm_target'] * 4.0
                     
-                    # 检查是否产生了NaN
                     if np.isnan(total_score) or np.isinf(total_score):
                         print(f"    ⚠️  分数计算产生NaN/Inf - conf: {conf}, cond: {cond}")
                         total_score = -100.0
@@ -1077,7 +1027,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         print(f"  📊 组 {source_idx} 得分排名 (有效:{len(valid_molecules)}, 无效:{len(invalid_samples)}, 总计:{len(all_evaluated)})")
         for rank, item in enumerate(valid_molecules[:5]):  # 只显示前5个有效分子
             marker = "🥇" if rank == 0 else ("🥈" if rank == 1 else "  ")
-            print(f"      {marker} #{rank+1} ✓: total={item['total_score']:.3f} (QED={item['conf_scores']['qed']:.3f}, SA={item['conf_scores']['sa_score']:.2f})")
+            print(f"      {marker} #{rank+1} ✓: total={item['total_score']:.3f} (SA={item['conf_scores']['sa_score']:.2f}, logP={item['conf_scores']['logp']:.2f})")
         if len(valid_molecules) > 5:
             print(f"      ... 省略 {len(valid_molecules) - 5} 个有效样本")
         
@@ -1195,6 +1145,10 @@ def main():
     # 加载数据集
     print("\n📂 加载数据集...")
     molblocks_and_charges, output_file = load_dataset(params)
+    
+    # 只使用第一个NPS分子进行训练和DPO微调
+    molblocks_and_charges = molblocks_and_charges[:1]
+    print(f"🎯 只使用第一个分子进行DPO微调: {len(molblocks_and_charges)} 个分子")
     
     # 计算边际分布
     print("\n📊 计算特征边际分布...")

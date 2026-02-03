@@ -1570,19 +1570,6 @@ def inference_sample(
         x4_pos_t = x4_pos_t_1  # 更新X4药效团位置
         x4_direction_t = x4_direction_t_1  # 更新X4药效团方向
         x4_x_t = x4_x_t_1  # 更新X4药效团类型
-        
-        # 确保log文件夹存在
-        os.makedirs('log', exist_ok=True)
-        
-        # 将时间步作为文件名保存到log文件夹
-        with open(f'log/{t}.txt', 'a') as f:
-            f.write(f'\nTime step {t}:\n\n')  # 添加换行确保新记录清晰分隔
-            f.write(f'X1 atom features: {x1_x_t}\n\n')  # 原子特征
-            f.write(f'X1 bond features: {x1_bond_edge_x_t}\n\n')  # 化学键特征
-            f.write(f'X1 positions: {x1_pos_t}\n\n')  # 原子位置坐标
-            f.write(f'X4 positions: {x4_pos_t}\n\n')  # 药效团位置
-            f.write(f'X4 directions: {x4_direction_t}\n\n')  # 药效团方向
-            f.write(f'X4 types: {x4_x_t}\n\n')  # 药效团类型
 
         # 时间步递减，向t=0迭代
         t = t - 1  # 主时间步递减

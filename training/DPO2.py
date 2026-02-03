@@ -21,8 +21,11 @@ import importlib
 import multiprocessing
 import json
 import traceback
+import threading
+import queue
 from functools import partial
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -222,11 +225,6 @@ def load_dataset(params):
             molblocks_and_charges = pickle.load(f)
         print(f"✅ 加载NPs数据集: {len(molblocks_and_charges)} 个分子")
         output_file = "NPs"
-    elif params['data'] == 'PDB':
-        with open('../data/conformers/pdb/molblock_charges_pdb_pose.pkl', 'rb') as f:
-            molblocks_and_charges = pickle.load(f)
-        print(f"✅ 加载PDB数据集: {len(molblocks_and_charges)} 个分子")
-        output_file = "PDB"
     elif params['data'] == 'GDB17':
         with open('../data/conformers/gdb/example_molblock_charges.pkl', 'rb') as f:
             molblocks_and_charges = pickle.load(f)
@@ -309,203 +307,293 @@ def create_dpo_dataloader(params, dataset, dpo_dataset):
     """创建纯DPO DataLoader（不混合标准数据）"""
     print("🎯 创建纯DPO DataLoader...")
     
-    # 纯DPO训练，只使用DPO数据集
+    # DPO训练使用num_workers=0避免多进程缓存问题
+    # 当preference_pairs动态更新时，多进程worker不会同步更新
     train_loader = torch_geometric.loader.DataLoader(
         dataset=dpo_dataset,
-        num_workers=params['training']['num_workers'],
+        num_workers=0,  # 避免多进程缓存导致的索引越界
         batch_size=params['training']['batch_size'],
         shuffle=True,
-        multiprocessing_context=multiprocessing.get_context("spawn") 
-            if params['training']['multiprocessing_spawn'] else None,
-        worker_init_fn=set_worker_sharing_strategy,
-        persistent_workers=True,
     )
     
     return train_loader
 
 
+def _prepare_molecule_condition(mol_index, mol_block, charges, params):
+    """
+    并行预处理单个分子的条件特征（CPU密集型操作）
+    
+    Returns:
+        dict: 包含分子索引、参考分子和条件特征的字典
+    """
+    mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
+    if mol is None:
+        return None
+    
+    charges = np.array(charges)
+    
+    # 预处理分子坐标
+    mol_coordinates = np.array(mol.GetConformer().GetPositions())
+    mol_coordinates = mol_coordinates - np.mean(mol_coordinates, axis=0)
+    mol = update_mol_coordinates(mol, mol_coordinates)
+    
+    # 提取条件特征
+    centers = mol.GetConformer().GetPositions()
+    radii = get_atomic_vdw_radii(mol)
+    
+    # 生成分子表面点云
+    surface = get_molecular_surface(
+        centers,
+        radii,
+        params['dataset']['x3']['num_points'],
+        probe_radius=params['dataset']['probe_radius'],
+        num_samples_per_atom=20,
+    )
+    
+    # 提取药效团特征
+    pharm_types, pharm_pos, pharm_direction = get_pharmacophores(
+        mol,
+        multi_vector=params['dataset']['x4']['multivectors'],
+        check_access=params['dataset']['x4']['check_accessibility'],
+    )
+    
+    # 计算表面静电势
+    electrostatics = get_electrostatics_given_point_charges(
+        charges, centers, surface,
+    )
+    
+    return {
+        'mol_index': mol_index,
+        'mol': mol,
+        'surface': surface,
+        'electrostatics': electrostatics,
+        'pharm_types': pharm_types,
+        'pharm_pos': pharm_pos,
+        'pharm_direction': pharm_direction,
+        'num_pharmacophores': len(pharm_types),
+    }
+
+
+def _sample_single_group(model_pl, params, condition, dataset, group_id, 
+                         samples_per_group, device, result_queue):
+    """
+    单个GPU上采样一组分子（用于多GPU并行）
+    
+    Args:
+        model_pl: 模型（已在指定GPU上）
+        params: 参数配置
+        condition: 条件数据字典
+        dataset: 数据集（用于获取边际分布）
+        group_id: 组ID
+        samples_per_group: 每组样本数
+        device: GPU设备
+        result_queue: 结果队列
+    """
+    try:
+        gpu_id = device.index if hasattr(device, 'index') else 0
+        print(f"  [GPU {gpu_id}] 组 {group_id} 开始采样 {samples_per_group} 个样本...")
+        
+        with torch.no_grad():
+            # 获取边际分布
+            atom_marginals = dataset.x1_atom_diffuser.transition_model.marginals.to(device)
+            bond_marginals = dataset.x1_bond_diffuser.transition_model.marginals.to(device)
+            
+            # 修正虚拟节点边际概率
+            if len(atom_marginals) > 0:
+                atom_marginals[0] = 0.0
+                atom_marginals = atom_marginals / atom_marginals.sum()
+            
+            n_atoms = params.get('sampling', {}).get('fixed_n_atoms', 70)
+            
+            # 准备inference参数
+            inference_kwargs = {
+                "batch_size": samples_per_group,
+                "N_x1": n_atoms,
+                "N_x4": condition['num_pharmacophores'],
+                "unconditional": False,
+                "prior_noise_scale": 1.0,
+                "denoising_noise_scale": 1.0,
+                "inject_noise_at_ts": [],
+                "inject_noise_scales": [],
+                "harmonize": False,
+                "harmonize_ts": [],
+                "harmonize_jumps": [],
+                "inpaint_x2_pos": False,
+                "inpaint_x3_pos": False,
+                "inpaint_x3_x": False,
+                "inpaint_x4_pos": True,
+                "inpaint_x4_direction": True,
+                "inpaint_x4_type": True,
+                "stop_inpainting_at_time_x2": 0.0,
+                "add_noise_to_inpainted_x2_pos": 0.0,
+                "stop_inpainting_at_time_x3": 0.0,
+                "add_noise_to_inpainted_x3_pos": 0.0,
+                "add_noise_to_inpainted_x3_x": 0.0,
+                "stop_inpainting_at_time_x4": 0.0,
+                "add_noise_to_inpainted_x4_pos": 0.0,
+                "add_noise_to_inpainted_x4_direction": 0.0,
+                "add_noise_to_inpainted_x4_type": 0.0,
+                "center_of_mass": np.zeros(3),
+                "surface": condition['surface'],
+                "electrostatics": condition['electrostatics'],
+                "pharm_types": condition['pharm_types'],
+                "pharm_pos": condition['pharm_pos'],
+                "pharm_direction": condition['pharm_direction'],
+                "atom_marginals": atom_marginals,
+                "bond_marginals": bond_marginals,
+            }
+            
+            # 执行采样
+            with torch.cuda.device(device):
+                generated_samples = inference_sample(model_pl, **inference_kwargs)
+            
+            # 为每个样本标记组ID和分子索引
+            for sample in generated_samples:
+                sample['source_mol_index'] = condition['mol_index']
+                sample['group_id'] = group_id
+            
+            # 清理中间张量
+            del atom_marginals, bond_marginals
+        
+        # 释放GPU缓存
+        torch.cuda.empty_cache()
+        
+        print(f"  [GPU {gpu_id}] ✅ 组 {group_id} 完成: {len(generated_samples)} 个样本")
+        result_queue.put((group_id, generated_samples, condition['mol']))
+        
+    except Exception as e:
+        gpu_id = device.index if hasattr(device, 'index') else 0
+        print(f"  [GPU {gpu_id}] ❌ 组 {group_id} 采样失败: {e}")
+        traceback.print_exc()
+        result_queue.put((group_id, [], None))
+
+
 def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, dataset, 
                                    num_samples_per_mol=4, device='cuda'):
     """
-    采样和评估分子，基于dpo_sample_and_evaluation.py的方式
+    多GPU多分子并行采样和评估
+    
+    并行策略：
+    1. 多线程并行提取条件特征（CPU密集型）
+    2. 多GPU并行采样（每个GPU一组分子）
     
     Returns:
         preference_pairs: List[(winner_data, loser_data, winner_scores, loser_scores)]
     """
     print("\n" + "="*80)
-    print("🧬 开始在线采样和评估")
+    print("🧬 开始多GPU多分子并行采样和评估")
     print("="*80)
     
-    model_pl.eval() # 切换评估模式
-    # dropout 等层是关闭的
-    # batch normalization 使用的是统计值
-     
-    # 获取边际分布（从dataset）
-    atom_marginals = dataset.x1_atom_diffuser.transition_model.marginals.to(device)
-    bond_marginals = dataset.x1_bond_diffuser.transition_model.marginals.to(device)
+    # 检测可用GPU数量
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    print(f"   可用GPU数量: {num_gpus}")
     
     # ========================================================================
-    # 【修正】强制将虚拟节点（Index 0）的边际概率设为0，以避免生成无效原子
-    # 这一步是为了对齐 test_sample.py 的行为，已被证实能提高生成质量
+    # 阶段1：多线程并行提取条件特征（CPU密集型）
     # ========================================================================
-    if len(atom_marginals) > 0:
-        print(f"🔧 修正前 atom_marginals[0] = {atom_marginals[0]:.6f}")
-        atom_marginals[0] = 0.0
-        atom_marginals = atom_marginals / atom_marginals.sum()
-        print(f"🔧 修正后 atom_marginals[0] = {atom_marginals[0]:.6f}")
-    # ========================================================================
-
-    print("atom_marginals: ", atom_marginals)
-    print("bond_marginals: ", bond_marginals)
+    print(f"\n📦 阶段1: 并行提取 {len(molblocks_and_charges)} 个分子的条件特征...")
     
-    # 存储所有生成的样本
+    num_workers = min(8, len(molblocks_and_charges))
+    prepared_conditions = []
+    
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {}
+        for mol_index, (mol_block, charges) in enumerate(molblocks_and_charges):
+            future = executor.submit(
+                _prepare_molecule_condition,
+                mol_index, mol_block, charges, params
+            )
+            futures[future] = mol_index
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc="提取条件特征"):
+            result = future.result()
+            if result is not None:
+                prepared_conditions.append(result)
+    
+    # 按分子索引排序
+    prepared_conditions.sort(key=lambda x: x['mol_index'])
+    print(f"✅ 条件特征提取完成: {len(prepared_conditions)}/{len(molblocks_and_charges)} 个分子")
+    
+    # ========================================================================
+    # 阶段2：多GPU并行采样（每个GPU处理一个分子）
+    # ========================================================================
+    num_groups = len(prepared_conditions)
+    print(f"\n🚀 阶段2: 多GPU并行采样")
+    print(f"   GPU数量: {num_gpus}, 分子数量: {num_groups}, 每分子样本数: {num_samples_per_mol}")
+    print(f"   总样本数: {num_groups * num_samples_per_mol}")
+    
+    # 在每个GPU上创建模型副本
+    model_pl.eval()
+    models_dict = {}
+    
+    for gpu_id in range(num_gpus):
+        gpu_device = torch.device('cuda', gpu_id)
+        if gpu_id == 0:
+            # 主GPU使用原模型
+            models_dict[gpu_id] = model_pl
+        else:
+            # 其他GPU复制模型
+            model_copy = deepcopy(model_pl)
+            model_copy.to(gpu_device)
+            model_copy.model.device = gpu_device
+            model_copy.eval()
+            models_dict[gpu_id] = model_copy
+    
+    print(f"   ✅ 已在 {len(models_dict)} 个GPU上准备模型")
+    
+    # 创建结果队列
+    result_queue = queue.Queue()
     all_generated_samples = []
     all_reference_mols = []
     
-    # 对每个分子进行采样
-    for mol_index in range(len(molblocks_and_charges)):
-        print(f"\n{'='*60}")
-        print(f"🔬 处理分子 {mol_index + 1}/{len(molblocks_and_charges)}")
-        print(f"{'='*60}")
+    # 分批并行处理（每批最多num_gpus个分子）
+    for batch_start in range(0, num_groups, num_gpus):
+        batch_end = min(batch_start + num_gpus, num_groups)
+        batch_conditions = prepared_conditions[batch_start:batch_end]
         
-        mol_block, charges = molblocks_and_charges[mol_index]
-        mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
-        charges = np.array(charges)
+        print(f"\n📋 并行采样批次 {batch_start//num_gpus + 1}: 分子 {batch_start}-{batch_end-1}")
         
-        # 保存参考分子
-        all_reference_mols.append(mol)
+        threads = []
+        for i, cond in enumerate(batch_conditions):
+            gpu_id = i % num_gpus
+            gpu_device = torch.device('cuda', gpu_id)
+            model = models_dict[gpu_id]
+            group_id = batch_start + i
+            
+            t = threading.Thread(
+                target=_sample_single_group,
+                args=(model, params, cond, dataset, group_id,
+                      num_samples_per_mol, gpu_device, result_queue)
+            )
+            threads.append(t)
         
-        # 预处理分子坐标
-        mol_coordinates = np.array(mol.GetConformer().GetPositions())
-        mol_coordinates = mol_coordinates - np.mean(mol_coordinates, axis=0)
-        mol = update_mol_coordinates(mol, mol_coordinates)
+        # 启动所有线程
+        for t in threads:
+            t.start()
         
-        # 提取条件特征
-        centers = mol.GetConformer().GetPositions()
-        radii = get_atomic_vdw_radii(mol)
-        
-        # 生成分子表面点云
-        surface = get_molecular_surface(
-            centers,
-            radii,
-            params['dataset']['x3']['num_points'],
-            probe_radius=params['dataset']['probe_radius'],
-            num_samples_per_atom=20,
-        )
-        
-        # 提取药效团特征
-        pharm_types, pharm_pos, pharm_direction = get_pharmacophores(
-            mol,
-            multi_vector=params['dataset']['x4']['multivectors'],
-            check_access=params['dataset']['x4']['check_accessibility'],
-        )
-        
-        # 计算表面静电势
-        electrostatics = get_electrostatics_given_point_charges(
-            charges, centers, surface,
-        )
-        
-        # 采样参数
-        n_atoms = params.get('sampling', {}).get('fixed_n_atoms', 70)
-        num_pharmacophores = len(pharm_types)
-        
-        print(f"  采样配置: {num_samples_per_mol} 个样本, {n_atoms} 个原子")
-        
-        # 循环生成多个样本
-        mol_samples = []
-        for i in range(num_samples_per_mol):
-            try:
-                # 准备inference_sample参数字典以便记录
-                inference_kwargs = {
-                    "batch_size": 1,
-                    "N_x1": n_atoms,
-                    "N_x4": num_pharmacophores,
-                    "unconditional": False,
-                    
-                    # 噪声控制
-                    "prior_noise_scale": 1.0,
-                    "denoising_noise_scale": 1.0,
-                    "inject_noise_at_ts": [],
-                    "inject_noise_scales": [],
-                    
-                    # 谐波化
-                    "harmonize": False,
-                    "harmonize_ts": [],
-                    "harmonize_jumps": [],
-                    
-                    # 条件修复
-                    "inpaint_x2_pos": False,
-                    "inpaint_x3_pos": False,
-                    "inpaint_x3_x": False,
-                    "inpaint_x4_pos": True,
-                    "inpaint_x4_direction": True,
-                    "inpaint_x4_type": True,
-                    
-                    # 修复控制
-                    "stop_inpainting_at_time_x2": 0.0,
-                    "add_noise_to_inpainted_x2_pos": 0.0,
-                    "stop_inpainting_at_time_x3": 0.0,
-                    "add_noise_to_inpainted_x3_pos": 0.0,
-                    "add_noise_to_inpainted_x3_x": 0.0,
-                    "stop_inpainting_at_time_x4": 0.0,
-                    "add_noise_to_inpainted_x4_pos": 0.0,
-                    "add_noise_to_inpainted_x4_direction": 0.0,
-                    "add_noise_to_inpainted_x4_type": 0.0,
-                    
-                    # 条件输入
-                    "center_of_mass": np.zeros(3),
-                    "surface": surface,
-                    "electrostatics": electrostatics,
-                    "pharm_types": pharm_types,
-                    "pharm_pos": pharm_pos,
-                    "pharm_direction": pharm_direction,
-                    
-                    # 边际分布
-                    "atom_marginals": atom_marginals,
-                    "bond_marginals": bond_marginals,
-                }
-
-                # 记录参数到JSON文件
-                try:
-                    debug_params_dir = "debug_inference_params"
-                    os.makedirs(debug_params_dir, exist_ok=True)
-                    debug_params_file = f"{debug_params_dir}/mol_{mol_index}_sample_{i}.json"
-                    with open(debug_params_file, 'w') as f:
-                        json.dump(convert_for_json(inference_kwargs), f, indent=4, default=str)
-                    print(f"    💾 参数已记录: {debug_params_file}")
-                except Exception as e:
-                    print(f"    ⚠️  无法记录参数: {e}")
-
-                # 调用inference_sample
-                generated_samples = inference_sample(
-                    model_pl,
-                    **inference_kwargs
-                )
-                
-                # 处理生成的样本
-                if len(generated_samples) > 0:
-                    sample = generated_samples[0]
-                    
-                    # 打印原子类型信息
-                    if 'x1' in sample and 'atoms' in sample['x1']:
-                        atom_types = sample['x1']['atoms']
-                        unique_atoms = set(atom_types)
-                        print(f"    📊 样本 {i+1}/{num_samples_per_mol} 原子类型: {sorted(unique_atoms)}")
-                        if 0 in unique_atoms:
-                            atom_count_0 = list(atom_types).count(0)
-                            print(f"       ⚠️  包含无效原子(0): {atom_count_0} 个")
-                    
-                    # 设置样本所属的源分子索引，用于后续分组构建偏好对
-                    sample['source_mol_index'] = mol_index
-                    mol_samples.append(sample)
-                else:
-                    print(f"    ⚠️  样本 {i+1}/{num_samples_per_mol}: inference_sample未生成任何输出")
-                    
-            except Exception as e:
-                print(f"    ❌ 样本 {i+1}/{num_samples_per_mol}: 采样异常 - {e}")
-        
-        all_generated_samples.extend(mol_samples)
-        print(f"✅ 分子 {mol_index + 1} 完成: {len(mol_samples)}/{num_samples_per_mol} 个有效样本")
+        # 等待所有线程完成
+        for t in threads:
+            t.join()
+    
+    # 收集结果
+    results_by_group = {}
+    while not result_queue.empty():
+        group_id, samples, ref_mol = result_queue.get()
+        results_by_group[group_id] = (samples, ref_mol)
+    
+    # 按组ID排序合并
+    for group_id in sorted(results_by_group.keys()):
+        samples, ref_mol = results_by_group[group_id]
+        all_generated_samples.extend(samples)
+        if ref_mol is not None:
+            all_reference_mols.append(ref_mol)
+    
+    # 释放非主GPU上的模型
+    for gpu_id, model in models_dict.items():
+        if gpu_id != 0:
+            del model
+    models_dict.clear()
+    torch.cuda.empty_cache()
     
     print(f"\n📊 总采样统计: {len(all_generated_samples)} 个样本")
     
@@ -553,6 +641,10 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
 def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_charges, params):
     """
     评估生成的分子并构建偏好对
+    
+    优化策略：
+    1. 首先尝试在每个分组内构建偏好对
+    2. 如果分组内构建失败，则从整个批次的有效分子中跨组匹配
     """
     print(f"\n🔍 评估 {len(generated_samples)} 个生成样本...")
     
@@ -565,10 +657,12 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         grouped_samples[source_idx].append(sample)
     
     all_preference_pairs = []
+    all_valid_molecules_across_groups = []  # 收集所有组的有效分子，用于跨组匹配
+    groups_with_pairs = set()  # 记录已成功构建偏好对的组
     
     # 为每组分子评估
     for source_idx, samples in grouped_samples.items():
-        print(f"\n📋 评估分子组 {source_idx}: {len(samples)} 个样本")
+        print(f"\n📋 评估组 {source_idx}: {len(samples)} 个样本")
         
         # 1. 使用ConfEval评估每个生成的分子（或使用RDKit备选方案）
         evaluated_samples = []
@@ -604,6 +698,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                             'logp': -10.0,
                             'strain_energy': 100.0,
                             'sa_score': 10.0,
+                            'fsp3': 0.0,
                             'is_valid': False,
                         },
                         'atoms': atoms,
@@ -629,6 +724,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                             'logp': -10.0,
                             'strain_energy': 100.0,
                             'sa_score': 10.0,
+                            'fsp3': 0.0,
                             'is_valid': False,
                         },
                         'atoms': atoms,
@@ -645,6 +741,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 logp_val = eval_df.get('logP', None)
                 strain_val = eval_df.get('strain_energy', None)
                 sa_val = eval_df.get('SA_score', None)
+                fsp3_val = eval_df.get('fsp3', None)  # 结构复杂性
                 
                 # 检查关键指标是否为None或nan
                 if qed_val is None or sa_val is None or (isinstance(qed_val, float) and np.isnan(qed_val)):
@@ -657,6 +754,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                             'logp': -10.0,
                             'strain_energy': 100.0,
                             'sa_score': 10.0,
+                            'fsp3': 0.0,
                             'is_valid': False,
                         },
                         'atoms': atoms,
@@ -682,10 +780,11 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     'logp': safe_float(logp_val, 0.0),
                     'strain_energy': safe_float(strain_val, 0.0),
                     'sa_score': safe_float(sa_val, 5.0),
+                    'fsp3': safe_float(fsp3_val, 0.0),  # 结构复杂性
                     'is_valid': True,
                 }
                 # 简洁日志：只打印关键指标
-                print(f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}, Strain={strain_val:.3f}" if strain_val else f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}")
+                print(f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}, logP={logp_val:.2f}, fsp3={fsp3_val:.3f}" if fsp3_val else f"  🔬 样本 {i+1}: ✓ QED={qed_val:.3f}, SA={sa_val:.2f}")
                 
             except Exception as e:
                 print(f"  🔬 样本 {i+1}: ✗ ConfEval失败 ({type(e).__name__}: {str(e)[:50]})")
@@ -697,6 +796,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                         'logp': -10.0,
                         'strain_energy': 100.0,
                         'sa_score': 10.0,
+                        'fsp3': 0.0,
                         'is_valid': False,
                     },
                     'atoms': atoms,
@@ -735,15 +835,24 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             print("  ⚠️  无参考分子，使用默认相似性分数")
             for item in all_evaluated:  # 包括有效和无效样本
                 item['cond_scores'] = {
-                    'rmsd': 10.0,
-                    'sims_surf': 0.0,
-                    'sims_esp': 0.0,
+                    'graph_sim': 0.0,        # 2D图相似度
+                    'sims_surf_target': 0.0,  # 形状相似度
+                    'sims_esp_target': 0.0,   # ESP表面相似度
+                    'sims_pharm_target': 0.0, # 药效团相似度
                 }
         else:
             # 有参考分子时才进行条件评估
+            # 使用RDKit直接计算相似度，绕过XTB依赖
             try:
-                from shepherd_score.evaluations.evaluate import ConditionalEvalPipeline
                 from shepherd_score.container import Molecule
+                from shepherd_score.score.gaussian_overlap_np import get_overlap_np
+                from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
+                from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
+                from shepherd_score.score.constants import ALPHA, LAM_SCALING
+                from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
+                from rdkit.DataStructs import TanimotoSimilarity
+                from rdkit.Chem import AllChem
+                import rdkit.Chem as Chem
                 
                 ref_mol = reference_mols[source_idx]
                 
@@ -752,102 +861,141 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     ref_mol, 
                     num_surf_points=200, 
                     probe_radius=1.2,
-                    partial_charges=None, 
+                    partial_charges=None,  # 使用MMFF自动计算
                     pharm_multi_vector=False
                 )
                 
-                # 对每个分子单独进行条件评估
+                # 计算参考分子的Morgan指纹用于2D相似度
+                ref_mol_noH = Chem.RemoveHs(ref_mol)
+                morgan_fp_gen = AllChem.GetMorganGenerator(radius=2, fpSize=2048)
+                ref_morgan_fp = morgan_fp_gen.GetFingerprint(ref_mol_noH)
+                
+                # 调试：检查参考分子的属性
+                print(f"    📊 参考分子属性: has_surf_pos={ref_molec.surf_pos is not None}, has_surf_esp={ref_molec.surf_esp is not None}, has_pharm_ancs={ref_molec.pharm_ancs is not None}")
+                
+                num_surf_points = 200
+                alpha = ALPHA(num_surf_points)
+                lam_scaled = 0.3 * LAM_SCALING
+                
+                # 对每个分子单独进行条件评估（使用RDKit，不依赖XTB）
                 for i, item in enumerate(all_evaluated):
                     # 跳过无效分子的条件评估
                     if item['conf_scores'].get('is_valid', True) == False:
-                        print(f"    ⏩ 分子 {i+1}: 无效分子，跳过条件评估 (设置默认值: RMSD=10.0, 表面相似性=0.0, 静电势相似性=0.0)")
+                        print(f"    ⏩ 分子 {i+1}: 无效分子，跳过条件评估")
                         item['cond_scores'] = {
-                            'rmsd': 10.0,
-                            'sims_surf': 0.0,
-                            'sims_esp': 0.0,
+                            'graph_sim': 0.0,
+                            'sims_surf_target': 0.0,
+                            'sims_esp_target': 0.0,
+                            'sims_pharm_target': 0.0,
                         }
                         continue
-                        
-                    # item['sample'] 是原始字典数据，需要使用已经存储的atoms和positions
-                    atoms = item['atoms']
-                    positions = item['positions']
-                    
-                    # 为单个分子创建列表
-                    single_mol_list = [(atoms, positions)]
                     
                     try:
-                        # 使用GPU加速
-                        with torch.enable_grad():
-                            cond_pipe = ConditionalEvalPipeline(
-                                ref_molec,
-                                generated_mols=single_mol_list,  # 只包含一个分子
-                                condition='all',
-                                num_surf_points=200,
-                                pharm_multi_vector=False,
-                                solvent=None
-                            )
-                            cond_pipe.evaluate(verbose=False)
+                        atoms = item['atoms']
+                        positions = item['positions']
+                        bonds = item.get('bonds', None)
                         
-                        # 获取单个分子的评估结果
-                        # ConditionalEvalPipeline.to_pandas()返回：
-                        # - series_global: 全局属性（pd.Series）
-                        # - df_rowwise: 每个分子的属性（pd.DataFrame）
-                        series_global, df_rowwise = cond_pipe.to_pandas()
+                        # 使用RDKit构建分子（不依赖XTB）
+                        gen_mol, charge, xyz_block = get_mol_from_atom_pos(atoms, positions, bonds=bonds)
                         
-                        # print(f"    📊 分子 {i+1} 条件评估结果:")
-                        # print(f"    全局属性 (series_global):\n{series_global}")
-                        # print(f"    逐行属性 (df_rowwise):\n{df_rowwise}")
+                        if gen_mol is None:
+                            print(f"    ⚠️ 分子 {i+1}: RDKit构建失败")
+                            item['cond_scores'] = {
+                                'graph_sim': 0.0, 'sims_surf_target': 0.0,
+                                'sims_esp_target': 0.0, 'sims_pharm_target': 0.0,
+                            }
+                            continue
                         
-                        # 提取该分子的评估指标
-                        # rmsds是每个分子的属性，在DataFrame中
-                        if 'rmsds' in df_rowwise.columns and len(df_rowwise) > 0:
-                            rmsd = float(df_rowwise['rmsds'].iloc[0])
-                        else:
-                            rmsd = 10.0
-                            print(f"    ⚠️  评估结果中没有RMSD数据，使用默认值10.0")
+                        # 使用MMFF获取partial charges（不依赖XTB）
+                        try:
+                            molec_props = AllChem.MMFFGetMoleculeProperties(gen_mol)
+                            if molec_props is not None:
+                                partial_charges = np.array([molec_props.GetMMFFPartialCharge(j) for j in range(gen_mol.GetNumAtoms())])
+                            else:
+                                partial_charges = None
+                        except:
+                            partial_charges = None
                         
-                        # 获取该分子的相似性分数，处理可能的NaN值
-                        # 由于只有一个分子，upper_bound就是该分子的实际值
-                        def safe_cond_float(val, default):
-                            try:
-                                f_val = float(val)
-                                if np.isnan(f_val) or np.isinf(f_val):
-                                    return default
-                                return f_val
-                            except:
-                                return default
+                        # 创建生成分子的Molecule对象
+                        gen_molec = Molecule(
+                            gen_mol,
+                            num_surf_points=num_surf_points,
+                            probe_radius=1.2,
+                            partial_charges=partial_charges,
+                            pharm_multi_vector=False
+                        )
                         
-                        # 相似性分数在global attributes中（因为只有一个分子，upper_bound就是实际值）
-                        sims_surf = safe_cond_float(series_global.get('sims_surf_upper_bound', 0.0), 0.0)
-                        sims_esp = safe_cond_float(series_global.get('sims_esp_upper_bound', 0.0), 0.0)
-                        rmsd = safe_cond_float(rmsd, 10.0)
+                        # 计算表面相似度
+                        sims_surf_target = 0.0
+                        if gen_molec.surf_pos is not None and ref_molec.surf_pos is not None:
+                            sims_surf_target = float(get_overlap_np(
+                                gen_molec.surf_pos, ref_molec.surf_pos, alpha=alpha
+                            ))
+                        
+                        # 计算ESP相似度
+                        sims_esp_target = 0.0
+                        if (gen_molec.surf_pos is not None and gen_molec.surf_esp is not None and
+                            ref_molec.surf_pos is not None and ref_molec.surf_esp is not None):
+                            sims_esp_target = float(get_overlap_esp_np(
+                                gen_molec.surf_pos, ref_molec.surf_pos,
+                                gen_molec.surf_esp, ref_molec.surf_esp,
+                                alpha=alpha, lam=lam_scaled
+                            ))
+                        
+                        # 计算药效团相似度
+                        sims_pharm_target = 0.0
+                        if (gen_molec.pharm_ancs is not None and ref_molec.pharm_ancs is not None and
+                            len(gen_molec.pharm_ancs) > 0 and len(ref_molec.pharm_ancs) > 0):
+                            sims_pharm_target = float(get_overlap_pharm_np(
+                                gen_molec.pharm_types, ref_molec.pharm_types,
+                                gen_molec.pharm_ancs, ref_molec.pharm_ancs,
+                                gen_molec.pharm_vecs, ref_molec.pharm_vecs,
+                                similarity='tanimoto', extended_points=False, only_extended=False
+                            ))
+                        
+                        # 计算2D图相似度（Tanimoto）
+                        graph_sim = 0.0
+                        try:
+                            gen_mol_noH = Chem.RemoveHs(gen_mol)
+                            gen_morgan_fp = morgan_fp_gen.GetFingerprint(gen_mol_noH)
+                            graph_sim = float(TanimotoSimilarity(gen_morgan_fp, ref_morgan_fp))
+                        except:
+                            pass
+                        
+                        # 处理NaN值
+                        if np.isnan(sims_surf_target): sims_surf_target = 0.0
+                        if np.isnan(sims_esp_target): sims_esp_target = 0.0
+                        if np.isnan(sims_pharm_target): sims_pharm_target = 0.0
+                        if np.isnan(graph_sim): graph_sim = 0.0
                         
                         item['cond_scores'] = {
-                            'rmsd': rmsd,
-                            'sims_surf': sims_surf,
-                            'sims_esp': sims_esp,
+                            'graph_sim': graph_sim,
+                            'sims_surf_target': sims_surf_target,
+                            'sims_esp_target': sims_esp_target,
+                            'sims_pharm_target': sims_pharm_target,
                         }
                         
-                        # 打印条件评估结果
-                        print(f"    ✓ 分子 {i+1} 条件评估: RMSD={rmsd:.3f}, 表面相似性={sims_surf:.3f}, 静电势相似性={sims_esp:.3f}")
+                        print(f"    ✓ 分子 {i+1}: GraphSim={graph_sim:.3f}, Surf={sims_surf_target:.3f}, ESP={sims_esp_target:.3f}, Pharm={sims_pharm_target:.3f}")
                         
                     except Exception as e:
                         print(f"    ⚠️ 分子 {i+1} 条件评估失败: {e}")
                         item['cond_scores'] = {
-                            'rmsd': 10.0,
-                            'sims_surf': 0.0,
-                            'sims_esp': 0.0,
+                            'graph_sim': 0.0,
+                            'sims_surf_target': 0.0,
+                            'sims_esp_target': 0.0,
+                            'sims_pharm_target': 0.0,
                         }
                 
-                print(f"  ✓ ConditionalEval完成 ({len(all_evaluated)} 个分子)")
+                print(f"  ✓ ConditionalEval完成 ({len(all_evaluated)} 个分子，使用RDKit)")
                 
             except Exception as e:
                 print(f"  ⚠️  ConditionalEval初始化失败: {e}, 使用默认相似性分数")
                 for item in all_evaluated:
                     item['cond_scores'] = {
-                        'rmsd': 10.0,
-                        'sims_surf': 0.0,
-                        'sims_esp': 0.0,
+                        'graph_sim': 0.0,
+                        'sims_surf_target': 0.0,
+                        'sims_esp_target': 0.0,
+                        'sims_pharm_target': 0.0,
                     }
         
         # 3. 计算综合分数并构建偏好对
@@ -860,35 +1008,58 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 # 无效分子赋予负无穷分
                 item['total_score'] = float('-inf')
             else:
-                # 综合评分（更平衡的Shepherd Score）
+                # 综合评分（基于用户指定的评估指标）
                 try:
-                    # 基础分：QED (0-2分)
-                    total_score = conf['qed'] * 2.0
+                    total_score = 0.0
                     
-                    # LogP惩罚：目标值1.5，限制最大惩罚 (最多扣1.5分)
-                    logp_penalty = min(abs(conf['logp'] - 1.5), 5.0) * 0.3
-                    total_score -= logp_penalty
-                    
-                    # 应变能惩罚：上限10 (最多扣5分)
-                    total_score -= min(conf['strain_energy'], 10.0) * 0.5
-                    
-                    # SA Score惩罚：归一化到0-1范围 (最多扣2分)
-                    sa_normalized = (conf['sa_score'] - 1.0) / 9.0  # SA通常范围1-10
+                    # === Conf评估指标 ===
+                    # 1. SA Score - 合成可及性，越小越好 (范围1-10，1最好)
+                    # 归一化到0-1范围后惩罚，权重2.0
+                    sa_normalized = (conf['sa_score'] - 1.0) / 9.0
                     total_score -= sa_normalized * 2.0
                     
-                    # 表面相似性奖励 (0-1分)
-                    total_score += cond['sims_surf'] * 1.0
+                    # 2. QED - 类药性，越接近1越好 (范围0-1)
+                    # 权重2.0
+                    total_score += conf['qed'] * 2.0
                     
-                    # 静电势相似性奖励 (0-2分，权重更高因为更重要)
-                    total_score += cond['sims_esp'] * 2.0
+                    # 3. LogP - 亲脂性，目标范围1~5
+                    # 在范围内不惩罚，超出范围惩罚
+                    logp = conf['logp']
+                    if logp < 1.0:
+                        logp_penalty = (1.0 - logp) * 0.5
+                    elif logp > 5.0:
+                        logp_penalty = (logp - 5.0) * 0.5
+                    else:
+                        logp_penalty = 0.0  # 在1-5范围内，不惩罚
+                    total_score -= min(logp_penalty, 2.0)  # 最多扣2分
                     
-                    # RMSD惩罚：构象偏差 (最多扣2.5分)
-                    total_score -= min(cond['rmsd'], 5.0) * 0.5
+                    # 4. fsp3 - 结构复杂性，越高越好 (范围0-1)
+                    # 权重1.0
+                    total_score += conf['fsp3'] * 1.0
+                    
+                    # 5. strain_energy - 应变能，越小越好
+                    # 权重0.5，上限10
+                    total_score -= min(conf['strain_energy'], 10.0) * 0.5
+                    
+                    # === Cond评估指标 ===
+                    # （不再使用graph_sim 2D图相似度）
+                    
+                    # 1. sims_surf_target - 形状相似度 (范围0-1)
+                    # 权重1.0
+                    total_score += cond['sims_surf_target'] * 1.0
+                    
+                    # 3. sims_esp_target - ESP表面相似度 (范围0-1)
+                    # 权重1.5（静电势更重要）
+                    total_score += cond['sims_esp_target'] * 1.5
+                    
+                    # 4. sims_pharm_target - 药效团相似度 (范围0-1)
+                    # 权重2.0（药效团最重要）
+                    total_score += cond['sims_pharm_target'] * 2.0
                     
                     # 检查是否产生了NaN
                     if np.isnan(total_score) or np.isinf(total_score):
                         print(f"    ⚠️  分数计算产生NaN/Inf - conf: {conf}, cond: {cond}")
-                        total_score = -100.0  # 给一个极低但有效的分数
+                        total_score = -100.0
                     
                 except Exception as e:
                     print(f"    ⚠️  分数计算异常: {e}")
@@ -899,54 +1070,92 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         # 按分数排序（有效分子优先，无效分子排在最后）
         all_evaluated.sort(key=lambda x: x['total_score'], reverse=True)
         
-        # 打印组内所有样本的得分
-        print(f"  📊 组 {source_idx} 得分排名 (有效:{len(evaluated_samples)}, 无效:{len(invalid_samples)}, 总计:{len(all_evaluated)})")
-        for rank, item in enumerate(all_evaluated[:5]):  # 只显示前5个
-            is_valid = item['conf_scores'].get('is_valid', True)
-            validity = "✓" if is_valid else "✗"
-            marker = "🥇" if rank == 0 else ("🥈" if rank == 1 else "  ")
-            if is_valid:
-                print(f"      {marker} #{rank+1} {validity}: total={item['total_score']:.3f} (QED={item['conf_scores']['qed']:.3f}, SA={item['conf_scores']['sa_score']:.2f})")
-            else:
-                print(f"      {marker} #{rank+1} {validity}: total=-∞ (无效分子)")
-        if len(all_evaluated) > 5:
-            print(f"      ... 省略 {len(all_evaluated) - 5} 个样本")
-        
-        # 构建偏好对：winner和loser都必须是有效分子
-        # 从有效分子中选择最高分和最低分
+        # 筛选有效分子
         valid_molecules = [item for item in all_evaluated if item['conf_scores'].get('is_valid', True)]
         
-        if len(valid_molecules) < 2:
-            print(f"  ❌ 组 {source_idx} 偏好对构建失败: 有效分子不足2个 ({len(valid_molecules)}个)")
-            continue
-            
-        winner = valid_molecules[0]  # 有效分子中分数最高的
-        loser = valid_molecules[-1]  # 有效分子中分数最低的
+        # 打印组内有效样本的得分（简洁日志）
+        print(f"  📊 组 {source_idx} 得分排名 (有效:{len(valid_molecules)}, 无效:{len(invalid_samples)}, 总计:{len(all_evaluated)})")
+        for rank, item in enumerate(valid_molecules[:5]):  # 只显示前5个有效分子
+            marker = "🥇" if rank == 0 else ("🥈" if rank == 1 else "  ")
+            print(f"      {marker} #{rank+1} ✓: total={item['total_score']:.3f} (QED={item['conf_scores']['qed']:.3f}, SA={item['conf_scores']['sa_score']:.2f})")
+        if len(valid_molecules) > 5:
+            print(f"      ... 省略 {len(valid_molecules) - 5} 个有效样本")
         
-        score_gap = winner['total_score'] - loser['total_score']
+        # 收集本组的有效分子用于后续跨组匹配
+        for item in valid_molecules:
+            item['group_id'] = source_idx
+        all_valid_molecules_across_groups.extend(valid_molecules)
+        
+        # 尝试在组内构建偏好对（需要至少2个有效分子）
+        if len(valid_molecules) >= 2:
+            winner = valid_molecules[0]
+            loser = valid_molecules[-1]
+            winner_score = winner['total_score']
+            loser_score = loser['total_score']
+            score_gap = winner_score - loser_score
+            min_gap = params.get('dpo', {}).get('min_score_gap', 0.3)
+            
+            if score_gap >= min_gap:
+                winner_mol = create_rdkit_molecule(winner['sample'])
+                loser_mol = create_rdkit_molecule(loser['sample'])
+                
+                if winner_mol is not None and loser_mol is not None:
+                    pair = (
+                        winner_mol,
+                        loser_mol,
+                        {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner_score},
+                        {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser_score},
+                    )
+                    all_preference_pairs.append(pair)
+                    groups_with_pairs.add(source_idx)
+                    print(f"  ✅ 组 {source_idx} 偏好对构建成功: Winner={winner_score:.3f}, Loser={loser_score:.3f}, Gap={score_gap:.3f}")
+                else:
+                    print(f"  ❌ 组 {source_idx} 偏好对构建失败: 分子重构失败")
+            else:
+                print(f"  ⚠️  组 {source_idx} 组内分差不足 ({score_gap:.3f} < {min_gap})，等待跨组匹配")
+        else:
+            print(f"  ⚠️  组 {source_idx} 有效分子不足 ({len(valid_molecules)}<2)，等待跨组匹配")
+    
+    # === 跨组匹配：如果单组构建失败，从所有有效分子中构建偏好对 ===
+    if len(all_preference_pairs) < len(grouped_samples) and len(all_valid_molecules_across_groups) >= 2:
+        print(f"\n🔄 跨组匹配: 从 {len(all_valid_molecules_across_groups)} 个有效分子中补充偏好对")
+        
+        # 按分数排序所有有效分子
+        all_valid_molecules_across_groups.sort(key=lambda x: x['total_score'], reverse=True)
+        
         min_gap = params.get('dpo', {}).get('min_score_gap', 0.3)
         
-        if score_gap >= min_gap:
-            # 将样本转换为RDKit分子对象，供DPO Dataset使用
-            winner_mol = create_rdkit_molecule(winner['sample'])
-            loser_mol = create_rdkit_molecule(loser['sample'])
+        # 构建跨组偏好对：最高分 vs 最低分
+        for i in range(min(3, len(all_valid_molecules_across_groups) - 1)):  # 最多补充3对
+            winner = all_valid_molecules_across_groups[i]
+            loser = all_valid_molecules_across_groups[-(i+1)]
             
-            if winner_mol is not None and loser_mol is not None:
-                pair = (
-                    winner_mol,  # 传递RDKit对象而不是字典
-                    loser_mol,   # 传递RDKit对象而不是字典
-                    {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner['total_score']},
-                    {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser['total_score']},
-                )
-                all_preference_pairs.append(pair)
-                print(f"  ✅ 组 {source_idx} 偏好对构建成功: Winner={winner['total_score']:.3f}, Loser={loser['total_score']:.3f}, Gap={score_gap:.3f}")
-            else:
-                print(f"  ❌ 组 {source_idx} 偏好对构建失败: 分子重构失败 (Winner有效={winner_mol is not None}, Loser有效={loser_mol is not None})")
-        else:
-            print(f"  ❌ 组 {source_idx} 偏好对构建失败: 分差不足 ({score_gap:.3f} < {min_gap})")
+            # 避免同一分子
+            if winner is loser:
+                continue
+            
+            winner_score = winner['total_score']
+            loser_score = loser['total_score']
+            score_gap = winner_score - loser_score
+            
+            if score_gap >= min_gap:
+                winner_mol = create_rdkit_molecule(winner['sample'])
+                loser_mol = create_rdkit_molecule(loser['sample'])
+                
+                if winner_mol is not None and loser_mol is not None:
+                    pair = (
+                        winner_mol,
+                        loser_mol,
+                        {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner_score},
+                        {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser_score},
+                    )
+                    all_preference_pairs.append(pair)
+                    w_group = winner.get('group_id', '?')
+                    l_group = loser.get('group_id', '?')
+                    print(f"  ✅ 跨组偏好对: 组{w_group}(Winner={winner_score:.3f}) vs 组{l_group}(Loser={loser_score:.3f}), Gap={score_gap:.3f}")
     
     print(f"\n{'='*50}")
-    print(f"✅ 偏好对构建汇总: {len(all_preference_pairs)}/{len(grouped_samples)} 组成功")
+    print(f"✅ 偏好对构建汇总: {len(all_preference_pairs)} 对 (来自 {len(grouped_samples)} 组)")
     print(f"{'='*50}")
     return all_preference_pairs
 
@@ -1018,7 +1227,11 @@ def main():
         
         pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
         if pretrained_path is not None:
-            pretrained_ckpt_path = f"jobs/{pretrained_path}"
+            # 如果是绝对路径则直接使用，否则加上jobs/前缀
+            if os.path.isabs(pretrained_path):
+                pretrained_ckpt_path = pretrained_path
+            else:
+                pretrained_ckpt_path = f"jobs/{pretrained_path}"
             if os.path.exists(pretrained_ckpt_path):
                 print(f"   加载预训练权重: {pretrained_ckpt_path}")
                 # 使用 load_from_checkpoint 加载模型
@@ -1093,8 +1306,8 @@ def main():
     if len(initial_pairs) > 0:
         print(f"   ✅ 采样准备就绪：{len(initial_pairs)} 个偏好对")
     
-    # 更新DPO数据集
-    dpo_dataset.preference_pairs = initial_pairs
+    # 更新DPO数据集（使用安全方法重置索引缓存）
+    dpo_dataset.update_preference_pairs(initial_pairs)
     print(f"✅ DPO数据集更新完成（偏好对: {len(dpo_dataset.preference_pairs)}）")
     
     # 创建DataLoader
@@ -1127,7 +1340,8 @@ def main():
             self.dataset = dataset
             self.dpo_dataset = dpo_dataset  # 直接引用DPO数据集
             self.molblocks_and_charges = molblocks_and_charges
-            self.preference_pairs = []
+            self.pairs_history = []  # 存储每轮的偏好对列表
+            self.max_rounds = 2  # 只保留最近两轮
             self.epoch_counter = 0  # 用于追踪采样次数
             
         def on_train_epoch_end(self, trainer, pl_module):
@@ -1159,14 +1373,23 @@ def main():
                 
                 # 更新偏好对
                 if len(new_pairs) > 0:
-                    # 保留所有旧数据，累积偏好对
-                    self.preference_pairs = self.preference_pairs + new_pairs
+                    # 添加新一轮的偏好对
+                    self.pairs_history.append(new_pairs)
+                    
+                    # 只保留最近两轮
+                    if len(self.pairs_history) > self.max_rounds:
+                        self.pairs_history = self.pairs_history[-self.max_rounds:]
+                    
+                    # 合并所有保留轮次的偏好对
+                    all_pairs = []
+                    for round_pairs in self.pairs_history:
+                        all_pairs.extend(round_pairs)
                     
                     # 直接更新DPO数据集的偏好对
                     # 下一个epoch开始时，reload_dataloaders_every_n_epochs=1
                     # 会重建DataLoader和DistributedSampler，使用更新后的数据集大小
-                    self.dpo_dataset.preference_pairs = self.preference_pairs
-                    print(f"✅ 更新DPO数据集: {len(self.preference_pairs)} 个偏好对 (将在下一epoch生效)")
+                    self.dpo_dataset.update_preference_pairs(all_pairs)
+                    print(f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 (保留{len(self.pairs_history)}轮, 将在下一epoch生效)")
 
     sampling_callback = DPOSamplingCallback(
         params=params,
@@ -1196,27 +1419,23 @@ def main():
     print(f"   CUDA可用: {cuda_available}")
     print(f"   GPU数量: {num_gpus_to_use}")
     
-    if params['training']['num_gpus'] > 1:
-        from pytorch_lightning.strategies import DDPStrategy
-        strategy = DDPStrategy(
-            find_unused_parameters=False,  # 减少通信开销
-            timeout=timedelta(hours=2),     # 增加超时时间到2小时
-            gradient_as_bucket_view=True,   # 优化梯度通信
-        )
-    else:
-        strategy = 'auto'
+    # DPO微调使用单GPU模式，避免DDP通信问题
+    # 多GPU采样在sample_and_evaluate_molecules中单独处理
+    strategy = 'auto'
+    dpo_devices = 1 if cuda_available else "auto"
+    print(f"   DPO训练模式: 单GPU (devices={dpo_devices})")
         
     trainer = pl.Trainer(
         callbacks=callbacks,
         logger=loggers,
         default_root_dir=output_dir,
-        accelerator="gpu" if (params['training']['num_gpus'] >= 1 and cuda_available) else 'cpu',
+        accelerator="gpu" if cuda_available else 'cpu',
         max_epochs=10000,
         gradient_clip_val=params['training']['gradient_clip_val'],
         accumulate_grad_batches=params['training']['accumulate_grad_batches'],
         log_every_n_steps=params['training']['log_every_n_steps'],
         reload_dataloaders_every_n_epochs=1,  # 重要：每个epoch重载以获取新的偏好对
-        devices=num_gpus_to_use if cuda_available else "auto",
+        devices=dpo_devices,
         strategy=strategy,
         precision=32,
         detect_anomaly=True,
@@ -1253,7 +1472,11 @@ def main():
     else:
         pretrained_path = params['training'].get('pretrained_checkpoint_path', None)
         if pretrained_path is not None:
-            pretrained_ckpt_path = f"jobs/{pretrained_path}"
+            # 如果是绝对路径则直接使用，否则加上jobs/前缀
+            if os.path.isabs(pretrained_path):
+                pretrained_ckpt_path = pretrained_path
+            else:
+                pretrained_ckpt_path = f"jobs/{pretrained_path}"
             if os.path.exists(pretrained_ckpt_path):
                 print(f"\n🔄 DPO微调：从预训练模型加载权重: {pretrained_ckpt_path}")
                 try:
@@ -1299,7 +1522,7 @@ def main():
         print(f"   建议增加采样数量或减少GPU数量")
         # 复制样本以确保每个GPU至少有一个样本
         while len(dpo_dataset.preference_pairs) < num_gpus_to_use:
-            dpo_dataset.preference_pairs = dpo_dataset.preference_pairs * 2
+            dpo_dataset.update_preference_pairs(dpo_dataset.preference_pairs * 2)
         print(f"   已自动复制样本至 {len(dpo_dataset.preference_pairs)} 个偏好对")
     
     # 启动训练

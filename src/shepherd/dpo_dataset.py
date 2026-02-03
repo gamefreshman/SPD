@@ -144,6 +144,18 @@ class DPODataset(Dataset):
     def len(self):
         return len(self.preference_pairs)
     
+    def update_preference_pairs(self, new_pairs):
+        """
+        安全更新偏好对，同时重置torch_geometric的索引缓存
+        
+        Args:
+            new_pairs: 新的偏好对列表
+        """
+        self.preference_pairs = new_pairs
+        # 重置torch_geometric Dataset的索引缓存
+        # 这是关键：防止DataLoader使用旧的索引范围导致IndexError
+        self._indices = None
+    
     def get(self, idx):
         """
         获取一个DPO训练样本

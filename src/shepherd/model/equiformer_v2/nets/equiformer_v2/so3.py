@@ -449,15 +449,29 @@ class SO3_Rotation(torch.nn.Module):
     # Rotate the embedding
     def rotate(self, embedding, out_lmax, out_mmax):
         out_mask = self.mapping.coefficient_idx(out_lmax, out_mmax)
-        wigner = self.wigner[:, out_mask, :]
+        # 确保wigner和out_mask都在与embedding相同的设备上
+        wigner = self.wigner
+        if wigner.device != embedding.device:
+            wigner = wigner.to(embedding.device)
+        if isinstance(out_mask, torch.Tensor) and out_mask.device != wigner.device:
+            out_mask = out_mask.to(wigner.device)
+        wigner = wigner[:, out_mask, :]
         return torch.bmm(wigner, embedding)
 
 
     # Rotate the embedding by the inverse of the rotation matrix
     def rotate_inv(self, embedding, in_lmax, in_mmax):
         in_mask = self.mapping.coefficient_idx(in_lmax, in_mmax)
-        wigner_inv = self.wigner_inv[:, :, in_mask]
+        # 确保wigner_inv和in_mask都在与embedding相同的设备上
+        wigner_inv = self.wigner_inv
+        if wigner_inv.device != embedding.device:
+            wigner_inv = wigner_inv.to(embedding.device)
+        if isinstance(in_mask, torch.Tensor) and in_mask.device != wigner_inv.device:
+            in_mask = in_mask.to(wigner_inv.device)
+        wigner_inv = wigner_inv[:, :, in_mask]
         wigner_inv_rescale = self.mapping.get_rotate_inv_rescale(in_lmax, in_mmax)
+        if wigner_inv_rescale.device != wigner_inv.device:
+            wigner_inv_rescale = wigner_inv_rescale.to(wigner_inv.device)
         wigner_inv = wigner_inv * wigner_inv_rescale
         return torch.bmm(wigner_inv, embedding)
 

@@ -83,7 +83,7 @@ params = {
         'dpo_load_weights_only': True,  # 从旧checkpoint只加载权重
         
         # 预训练模型路径（从MOSES_aq模型开始微调）
-        'pretrained_checkpoint_path': '/home1/zhh/workspace/SPD/evaluation/ckpt/last_33epoch.ckpt',
+        'pretrained_checkpoint_path': '/home1/zhh/workspace/SPD/evaluation/ckpt/epoch40.ckpt',
         
         # 其他选项
         'save_preference_pairs': True,  # 保存偏好对用于分析
