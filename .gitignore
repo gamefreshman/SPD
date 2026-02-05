@@ -544,3 +544,4 @@ src/score/shepherd_score/evaluations/pdbs/1iep.pdbqt
 evaluation/core/log/1.txt
 data/molblock_charges_0.pkl
 training/MOSES_aq
+data/shepherd_chkpts
