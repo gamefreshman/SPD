@@ -1299,9 +1299,9 @@ def main():
     
     # ==================== 提取目录配置 ====================
     # 基础目录（checkpoint、采样文件、日志等的根目录）
-    # base_dir = params['training'].get('base_dir', 'jobs')
+    base_dir = params['training'].get('base_dir', 'jobs/33')
 
-    base_dir = params['training'].get('base_dir', 'jobs/40')
+    # base_dir = params['training'].get('base_dir', 'jobs/40')
 
     # 输出子目录
     output_subdir = params['training'].get('output_dir', 'default_output')
