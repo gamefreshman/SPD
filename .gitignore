@@ -557,3 +557,4 @@ nohup.out
 training/debug_inference_params
 evaluation/core/data/
 evaluation/core/data/1
+evaluation/core_data/data/
