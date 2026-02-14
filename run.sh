@@ -33,3 +33,5 @@ pkill -9 -u zhh -f "DPO3.py"
 nvidia-smi
 
 nohup python sample_fragment.py > fragDPO.log 2>&1 &
+
+git fetch origin new-clean-branch
