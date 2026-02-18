@@ -10,8 +10,10 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = "0"
 import json
 import glob
 import pickle
+import multiprocessing
 from datetime import datetime
 from collections import defaultdict
+from functools import partial
 
 import numpy as np
 import pandas as pd
@@ -92,6 +94,18 @@ MODEL_FILES = {
 }
 
 REF_MOL_PKL = '/home1/zhh/workspace/SPD/data/conformers/np/molblock_charges_NPs.pkl'
+
+# ========== 并行配置 ==========
+# NUM_WORKERS: ConfEval 并行 worker 数（多进程并行评估多个样本）
+# NUM_PROCESSES: 每个 worker 内部 xtb 优化的进程数
+# 约束：NUM_WORKERS * NUM_PROCESSES <= 可用 CPU 核心数
+_AVAILABLE_CPUS = multiprocessing.cpu_count() or 1
+NUM_WORKERS = min(8, _AVAILABLE_CPUS)     # ConfEval 并行 worker 数
+NUM_PROCESSES = 1                          # 每个 worker 的 xtb 进程数
+COND_NUM_WORKERS = min(8, _AVAILABLE_CPUS) # CondEval 并行 worker 数
+print(f"\n⚙️  并行配置: CPU核心数={_AVAILABLE_CPUS}, "
+      f"ConfEval workers={NUM_WORKERS}, CondEval workers={COND_NUM_WORKERS}, "
+      f"xtb processes/worker={NUM_PROCESSES}")
 
 # =============================================================================
 # 缓存检测：查找上一次的评估结果，判断哪些模型需要重新评估
@@ -249,21 +263,28 @@ def serialize_value(value):
             return None
 
 
-def run_conf_eval_single(structure, structure_id, model_name):
+def _conf_eval_worker(args):
     """
-    对单个样本执行 ConfEval 评估。
-    返回 (result_dict, is_valid)
+    multiprocessing worker 函数：对单个样本执行 ConfEval。
+    必须是模块顶级函数才能被 pickle 序列化。
+    
+    args: (structure_id, model_name, atoms, positions, bonds, num_processes)
+    返回: (structure_id, result_dict, is_valid)
     """
+    structure_id, model_name, atoms, positions, bonds, num_processes = args
     try:
-        atoms = structure['x1']['atoms']
-        positions = structure['x1']['positions']
-        bonds = structure['x1'].get('bonds', None)
+        if isinstance(atoms, list):
+            atoms = np.array(atoms)
+        if isinstance(positions, list):
+            positions = np.array(positions)
+        if isinstance(bonds, list):
+            bonds = np.array(bonds)
 
         if isinstance(atoms, np.ndarray):
             atoms = atoms.flatten()
         if isinstance(positions, np.ndarray) and positions.ndim == 2:
             if positions.shape[1] != 3:
-                return {
+                return structure_id, {
                     'structure_id': structure_id,
                     'model_name': model_name,
                     'num_atoms': len(atoms) if hasattr(atoms, '__len__') else None,
@@ -272,7 +293,8 @@ def run_conf_eval_single(structure, structure_id, model_name):
                     'conf_error': f'位置坐标维度不正确: {positions.shape}'
                 }, False
 
-        conf_eval = ConfEval(atoms, positions, solvent='water', bonds=bonds)
+        conf_eval = ConfEval(atoms, positions, solvent='water', bonds=bonds,
+                             num_processes=num_processes)
         eval_df = conf_eval.to_pandas()
 
         # 构建结果字典
@@ -299,10 +321,10 @@ def run_conf_eval_single(structure, structure_id, model_name):
             else:
                 result[metric] = None
 
-        return result, bool(conf_eval.is_valid)
+        return structure_id, result, bool(conf_eval.is_valid)
 
     except Exception as e:
-        return {
+        return structure_id, {
             'structure_id': structure_id,
             'model_name': model_name,
             'num_atoms': None,
@@ -310,6 +332,92 @@ def run_conf_eval_single(structure, structure_id, model_name):
             'conf_data': None,
             'conf_error': str(e),
         }, False
+
+
+def run_conf_eval_parallel(samples, model_name, num_workers, num_processes):
+    """
+    并行执行 ConfEval：对一组样本使用多进程评估。
+    
+    返回:
+        results_list: list of result_dict（按原始顺序）
+        conf_valid_indices: list of (index, sample) -- conf 有效的样本
+    """
+    # 准备 worker 输入（提取 numpy 数据，避免传递复杂对象）
+    worker_inputs = []
+    sample_mapping = {}  # worker_id -> (original_index, sample)
+
+    for i, sample in enumerate(samples):
+        try:
+            atoms = sample['x1']['atoms']
+            positions = sample['x1']['positions']
+            bonds = sample['x1'].get('bonds', None)
+
+            # 转换为 list 以确保可 pickle
+            atoms_data = atoms.tolist() if isinstance(atoms, np.ndarray) else atoms
+            positions_data = positions.tolist() if isinstance(positions, np.ndarray) else positions
+            bonds_data = bonds.tolist() if isinstance(bonds, np.ndarray) else bonds
+
+            worker_inputs.append((i, model_name, atoms_data, positions_data, bonds_data, num_processes))
+            sample_mapping[i] = sample
+        except Exception as e:
+            # 数据提取失败的样本直接标记为无效
+            worker_inputs.append(None)
+            sample_mapping[i] = sample
+
+    # 过滤有效输入
+    valid_inputs = [inp for inp in worker_inputs if inp is not None]
+    failed_indices = {i for i, inp in enumerate(worker_inputs) if inp is None}
+
+    # 初始化结果列表
+    results_list = [None] * len(samples)
+    conf_valid_items = []  # (index, sample)
+
+    # 对失败的样本直接填充
+    for idx in failed_indices:
+        results_list[idx] = {
+            'structure_id': idx,
+            'model_name': model_name,
+            'num_atoms': None,
+            'conf_valid': False,
+            'conf_data': None,
+            'conf_error': '数据提取失败',
+        }
+
+    if len(valid_inputs) == 0:
+        return results_list, conf_valid_items
+
+    # 并行执行
+    effective_workers = min(num_workers, len(valid_inputs))
+
+    if effective_workers <= 1:
+        # 单进程模式（样本太少时避免进程启动开销）
+        for args in tqdm(valid_inputs, desc=f"    ConfEval ({model_name})"):
+            sid, result, is_valid = _conf_eval_worker(args)
+            results_list[sid] = result
+            if is_valid:
+                conf_valid_items.append((sid, sample_mapping[sid]))
+    else:
+        # 多进程模式
+        try:
+            ctx = multiprocessing.get_context('spawn')
+            with ctx.Pool(effective_workers) as pool:
+                for sid, result, is_valid in tqdm(
+                    pool.imap_unordered(_conf_eval_worker, valid_inputs, chunksize=1),
+                    total=len(valid_inputs),
+                    desc=f"    ConfEval ({model_name}, {effective_workers} workers)"
+                ):
+                    results_list[sid] = result
+                    if is_valid:
+                        conf_valid_items.append((sid, sample_mapping[sid]))
+        except Exception as e:
+            print(f"    ⚠️ 多进程失败 ({e})，回退到单进程模式")
+            for args in tqdm(valid_inputs, desc=f"    ConfEval ({model_name}, fallback)"):
+                sid, result, is_valid = _conf_eval_worker(args)
+                results_list[sid] = result
+                if is_valid:
+                    conf_valid_items.append((sid, sample_mapping[sid]))
+
+    return results_list, conf_valid_items
 
 
 def run_cond_eval_group(ref_mol, conf_valid_samples):
@@ -342,7 +450,7 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
     if len(generated_mols) == 0:
         return {}, None, None
 
-    # 执行条件评估
+    # 执行条件评估（启用多进程）
     cond_pipe = ConditionalEvalPipeline(
         ref_mol,
         generated_mols=generated_mols,
@@ -351,7 +459,11 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
         pharm_multi_vector=False,
         solvent=None
     )
-    cond_pipe.evaluate(verbose=False)
+    cond_pipe.evaluate(
+        num_workers=COND_NUM_WORKERS,
+        num_processes=NUM_PROCESSES,
+        verbose=True
+    )
     properties_df, global_attr = cond_pipe.to_pandas()
 
     # 将 properties_df 和 global_attr 转换为每个样本的条件评估数据
@@ -415,23 +527,26 @@ if not SKIP_EVALUATION:
         for ref_mol_idx, samples in grouped.items():
             print(f"\n  📋 参考分子 {ref_mol_idx}: {len(samples)} 个样本")
 
-            # ------ 步骤1：逐样本 ConfEval ------
-            conf_valid_samples = []  # (global_index, sample) -- conf 有效的样本
+            # ------ 步骤1：并行 ConfEval ------
+            global_id_offset = len(model_results)
+            conf_results, conf_valid_raw = run_conf_eval_parallel(
+                samples, model_name, NUM_WORKERS, NUM_PROCESSES
+            )
 
-            for i, sample in enumerate(tqdm(samples, desc=f"    ConfEval ref={ref_mol_idx}")):
-                global_id = len(model_results)
-                result, is_valid = run_conf_eval_single(sample, global_id, model_name)
+            # 将结果整合到 model_results，并调整索引
+            conf_valid_samples = []
+            for i, result in enumerate(conf_results):
+                global_id = global_id_offset + i
+                result['structure_id'] = global_id
                 result['ref_mol_index'] = ref_mol_idx
-                result['local_index'] = i  # 该参考分子分组内的索引
-
-                # 先初始化 cond_valid 为 False，后续更新
+                result['local_index'] = i
                 result['cond_valid'] = False
                 result['both_valid'] = False
-
                 model_results.append(result)
 
-                if is_valid:
-                    conf_valid_samples.append((global_id, sample))
+            # 将 conf_valid_raw 中的本地索引映射为全局索引
+            for local_id, sample in conf_valid_raw:
+                conf_valid_samples.append((global_id_offset + local_id, sample))
 
             conf_valid_count = len(conf_valid_samples)
             print(f"    ConfEval 完成: {conf_valid_count}/{len(samples)} 有效")
