@@ -399,7 +399,9 @@ def run_conf_eval_parallel(samples, model_name, num_workers, num_processes):
     else:
         # 多进程模式
         try:
-            ctx = multiprocessing.get_context('spawn')
+            # 使用 fork 而非 spawn：spawn 会重新导入模块，触发模块级代码重复执行
+            # fork 直接复制父进程内存，对纯 CPU 的 RDKit/xtb 计算安全
+            ctx = multiprocessing.get_context('fork')
             with ctx.Pool(effective_workers) as pool:
                 for sid, result, is_valid in tqdm(
                     pool.imap_unordered(_conf_eval_worker, valid_inputs, chunksize=1),
