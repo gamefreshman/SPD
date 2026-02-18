@@ -565,3 +565,4 @@ evaluation/experiment_SamEval/eval_results/*.json
 *.png
 evaluation/experiment_SamEval/conf_eval_results_20260215_181944.json
 evaluation/experiment_SamEval/evaluation_statistics_report_181944.json
+evaluation/experiment_SamEval/conf_eval_results_20260218_191011.json
