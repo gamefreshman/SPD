@@ -479,7 +479,7 @@ class ConsistencyEval(ConfEval):
                 use_jax=False
             )
         surf_similarity = mp_ref_and_relaxed.sim_aligned_surf
-        return float(surf_similarity)
+        return np.float64(surf_similarity).item()
     
 
     def _align_with_esp(self, mp_ref_and_relaxed: MoleculePair) -> float:
@@ -500,7 +500,7 @@ class ConsistencyEval(ConfEval):
                 use_jax=False
             ) 
         esp_similarity = mp_ref_and_relaxed.sim_aligned_esp
-        return float(esp_similarity)
+        return np.float64(esp_similarity).item()
 
 
     def _align_with_pharm(self, mp_ref_and_relaxed: MoleculePair) -> float:
@@ -522,7 +522,7 @@ class ConsistencyEval(ConfEval):
                 use_jax=False
             )
         pharm_similarity = mp_ref_and_relaxed.sim_aligned_pharm
-        return float(pharm_similarity)
+        return np.float64(pharm_similarity).item()
 
 
 class ConditionalEval(ConfEval):
@@ -703,16 +703,18 @@ class ConditionalEval(ConfEval):
                                                       fit_mol=molec_post_opt_esp_aligned,
                                                       num_surf_points=self.ref_molec.num_surf_points,
                                                       do_center=False)
-                self.sim_surf_target_relax_esp_aligned = esp_aligned_molec_pair.score_with_surf(
+                _surf_score = esp_aligned_molec_pair.score_with_surf(
                     alpha=self.alpha, use='np'
                 )
+                self.sim_surf_target_relax_esp_aligned = np.float64(_surf_score).item()
                 if isinstance(pharm_multi_vector, bool):
-                    self.sim_pharm_target_relax_esp_aligned = esp_aligned_molec_pair.score_with_pharm(
+                    _pharm_score = esp_aligned_molec_pair.score_with_pharm(
                         similarity='tanimoto',
                         extended_points=False,
                         only_extended=False,
                         use='np'
                     )
+                    self.sim_pharm_target_relax_esp_aligned = np.float64(_pharm_score).item()
 
 
     def _align_with_surface(self, mp_ref_and_relaxed: MoleculePair) -> float:
@@ -734,7 +736,7 @@ class ConditionalEval(ConfEval):
             )
 
         surf_similarity = mp_ref_and_relaxed.sim_aligned_surf
-        return float(surf_similarity)
+        return np.float64(surf_similarity).item()
     
 
     def _align_with_esp(self, mp_ref_and_relaxed: MoleculePair) -> float:
@@ -755,7 +757,7 @@ class ConditionalEval(ConfEval):
                 use_jax=False
             ) 
         esp_similarity = mp_ref_and_relaxed.sim_aligned_esp
-        return float(esp_similarity)
+        return np.float64(esp_similarity).item()
 
 
     def _align_with_pharm(self, mp_ref_and_relaxed: MoleculePair) -> float:
@@ -777,4 +779,4 @@ class ConditionalEval(ConfEval):
                 use_jax=False
             )
         pharm_similarity = mp_ref_and_relaxed.sim_aligned_pharm
-        return float(pharm_similarity)
+        return np.float64(pharm_similarity).item()
