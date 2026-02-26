@@ -3,6 +3,12 @@
 统一评估脚本：一次性完成 ConfEval（构象评估）和 CondEval（条件评估），
 只有同时通过两种评估的分子才参与最终指标统计。
 
+缓存设计：
+  - conf_eval_results.json: ConfEval 结果（独立保存）
+  - cond_eval_results.json: CondEval 结果（独立保存）
+  - 删除 cond_eval_results.json → 仅重跑 CondEval（跳过 ConfEval）
+  - 删除 conf_eval_results.json → 全部重跑
+
 使用 multiprocessing 并行加速评估。
 需要通过 `python eval_unified.py` 直接运行（而非 import），
 因为使用了 `if __name__ == '__main__':` 保护多进程安全。
@@ -15,6 +21,7 @@ import json
 import glob
 import pickle
 import multiprocessing
+import traceback
 from datetime import datetime
 from collections import defaultdict
 from functools import partial
@@ -136,10 +143,11 @@ MODEL_FILES = {
 
 REF_MOL_PKL = '/home1/zhh/workspace/SPD/data/conformers/np/molblock_charges_NPs.pkl'
 
+# ========== 缓存文件名（固定名称，方便管理） ==========
+CONF_CACHE_FILE = 'conf_eval_results.json'
+COND_CACHE_FILE = 'cond_eval_results.json'
+
 # ========== 并行配置 ==========
-# NUM_WORKERS: ConfEval 并行 worker 数（多进程并行评估多个样本）
-# NUM_PROCESSES: 每个 worker 内部 xtb 优化的进程数
-# 约束：NUM_WORKERS * NUM_PROCESSES <= 可用 CPU 核心数
 _AVAILABLE_CPUS = multiprocessing.cpu_count() or 1
 NUM_WORKERS = min(8, _AVAILABLE_CPUS)     # ConfEval 并行 worker 数
 NUM_PROCESSES = 1                          # 每个 worker 的 xtb 进程数
@@ -149,31 +157,38 @@ NUM_PROCESSES = 1                          # 每个 worker 的 xtb 进程数
 # 缓存检测函数
 # =============================================================================
 
-def find_latest_cache(pattern='unified_eval_results_*.json'):
-    """查找当前目录下最新的评估结果文件"""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = sorted(glob.glob(os.path.join(script_dir, pattern)))
-    if candidates:
-        return candidates[-1]  # 按文件名排序，最后一个即为最新
-    return None
+def _get_script_dir():
+    return os.path.dirname(os.path.abspath(__file__))
 
 
-def detect_changed_models(model_files, cache_path):
-    """
-    对比当前 MODEL_FILES 与缓存中记录的文件路径，
-    返回 (models_to_eval, cached_data):
-      - models_to_eval: set of model names that need re-evaluation
-      - cached_data: the loaded cache dict (or None if no cache)
-    """
-    if cache_path is None:
-        return set(model_files.keys()), None
-
+def load_cache(cache_filename):
+    """加载缓存文件，返回数据字典或 None"""
+    cache_path = os.path.join(_get_script_dir(), cache_filename)
+    if not os.path.exists(cache_path):
+        return None
     try:
         with open(cache_path, 'r', encoding='utf-8') as f:
-            cached_data = json.load(f)
+            return json.load(f)
     except Exception as e:
         print(f"⚠️ 无法加载缓存文件 {cache_path}: {e}")
-        return set(model_files.keys()), None
+        return None
+
+
+def save_cache(cache_filename, data):
+    """保存缓存文件"""
+    cache_path = os.path.join(_get_script_dir(), cache_filename)
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"💾 缓存已保存: {cache_path}")
+
+
+def detect_models_needing_eval(model_files, cached_data):
+    """
+    对比当前 MODEL_FILES 与缓存中的文件路径，
+    返回需要重新评估的模型集合。
+    """
+    if cached_data is None:
+        return set(model_files.keys())
 
     cached_model_files = cached_data.get('metadata', {}).get('model_files', {})
 
@@ -182,19 +197,14 @@ def detect_changed_models(model_files, cache_path):
         cached_path = cached_model_files.get(model_name)
         if cached_path != file_path:
             models_to_eval.add(model_name)
-            print(f"  🔄 {model_name}: 路径已变化，需要重新评估")
-            print(f"     旧: {cached_path}")
-            print(f"     新: {file_path}")
+            if cached_path is not None:
+                print(f"  🔄 {model_name}: 路径已变化，需要重新评估")
+            else:
+                print(f"  🆕 {model_name}: 新增模型，需要评估")
         else:
             print(f"  ✅ {model_name}: 路径未变化，将复用缓存")
 
-    # 检查是否有新增的模型
-    for model_name in model_files:
-        if model_name not in cached_model_files:
-            models_to_eval.add(model_name)
-            print(f"  🆕 {model_name}: 新增模型，需要评估")
-
-    return models_to_eval, cached_data
+    return models_to_eval
 
 
 # =============================================================================
@@ -207,7 +217,11 @@ def serialize_value(value):
         return value
     elif isinstance(value, np.ndarray):
         return value.tolist()
-    elif hasattr(value, 'item'):  # numpy scalar
+    elif isinstance(value, pd.Series):
+        return value.tolist()
+    elif isinstance(value, pd.DataFrame):
+        return value.to_dict(orient='list')
+    elif isinstance(value, (np.integer, np.floating)):
         return value.item()
     elif value is None:
         return None
@@ -219,6 +233,12 @@ def serialize_value(value):
                 return None
         except (TypeError, ValueError):
             pass
+        # 尝试 numpy 0-d 数组
+        if hasattr(value, 'item'):
+            try:
+                return value.item()
+            except (ValueError, TypeError):
+                pass
         try:
             return str(value)
         except Exception:
@@ -229,9 +249,6 @@ def _conf_eval_worker(args):
     """
     multiprocessing worker 函数：对单个样本执行 ConfEval。
     必须是模块顶级函数才能被 pickle 序列化（spawn 模式要求）。
-
-    args: (structure_id, model_name, atoms, positions, bonds, num_processes)
-    返回: (structure_id, result_dict, is_valid)
     """
     structure_id, model_name, atoms, positions, bonds, num_processes = args
     try:
@@ -414,7 +431,6 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
 
     # 执行条件评估
     # 注意：CondEval 使用 num_workers=1（单进程），避免嵌套多进程冲突
-    # CondEval 内部的 spawn 多进程与外层 ConfEval 的 spawn 可能冲突
     cond_pipe = ConditionalEvalPipeline(
         ref_mol,
         generated_mols=generated_mols,
@@ -467,40 +483,61 @@ def main():
           f"xtb processes/worker={NUM_PROCESSES}")
 
     # =================================================================
-    # 第一阶段：缓存检测 & 数据加载
+    # 第一阶段：缓存检测
     # =================================================================
 
-    # 检测缓存
     print("\n🔍 检测缓存...")
-    cache_path = find_latest_cache()
-    if cache_path:
-        print(f"  找到缓存文件: {cache_path}")
+
+    # 分别加载 conf 和 cond 缓存
+    conf_cache = load_cache(CONF_CACHE_FILE)
+    cond_cache = load_cache(COND_CACHE_FILE)
+
+    if conf_cache:
+        print(f"  ✅ ConfEval 缓存存在: {CONF_CACHE_FILE}")
     else:
-        print("  未找到缓存文件，将对所有模型进行完整评估")
+        print(f"  ❌ ConfEval 缓存不存在")
 
-    models_to_eval, cached_data = detect_changed_models(MODEL_FILES, cache_path)
-
-    if len(models_to_eval) == 0:
-        print("\n✅ 所有模型路径均未变化，无需重新评估。")
-        print("   如需强制重新评估，请删除缓存文件后重新运行。")
-        # 直接使用缓存数据进入统计阶段
-        all_unified_results = cached_data['per_sample_results']
-        all_cond_group_results = {
-            model_name: {int(k): v for k, v in groups.items()}
-            for model_name, groups in cached_data['cond_group_results'].items()
-        }
-        SKIP_EVALUATION = True
+    if cond_cache:
+        print(f"  ✅ CondEval 缓存存在: {COND_CACHE_FILE}")
     else:
-        print(f"\n📋 需要评估的模型: {models_to_eval}")
-        SKIP_EVALUATION = False
+        print(f"  ❌ CondEval 缓存不存在")
 
-    # 仅加载需要评估的模型数据（未变化的模型无需加载原始采样数据）
+    # 确定哪些模型的 ConfEval 需要重新评估
+    print("\n📋 检查 ConfEval 缓存...")
+    models_needing_conf = detect_models_needing_eval(MODEL_FILES, conf_cache)
+
+    # 确定哪些模型的 CondEval 需要重新评估
+    print("\n📋 检查 CondEval 缓存...")
+    models_needing_cond = detect_models_needing_eval(MODEL_FILES, cond_cache)
+
+    # 如果 conf 需要重跑，cond 也必须重跑（conf 是前置依赖）
+    for model_name in models_needing_conf:
+        if model_name not in models_needing_cond:
+            print(f"  ⚠️ {model_name}: ConfEval 需要重跑，CondEval 也必须重跑")
+            models_needing_cond.add(model_name)
+
+    # 判断执行状态
+    SKIP_CONF = len(models_needing_conf) == 0
+    SKIP_COND = len(models_needing_cond) == 0
+
+    print(f"\n📊 评估计划:")
+    for model_name in MODEL_FILES:
+        conf_status = "📦 缓存" if model_name not in models_needing_conf else "🔄 重跑"
+        cond_status = "📦 缓存" if model_name not in models_needing_cond else "🔄 重跑"
+        print(f"  {model_name}: ConfEval={conf_status}, CondEval={cond_status}")
+
+    # =================================================================
+    # 第二阶段：加载数据
+    # =================================================================
+
+    # 确定实际需要加载数据的模型（ConfEval 或 CondEval 需要重跑的）
+    models_needing_data = models_needing_conf | models_needing_cond
     all_model_samples = {}
     all_model_grouped = {}
 
     for model_name, json_file in MODEL_FILES.items():
-        if model_name not in models_to_eval:
-            print(f"\n⏭️  跳过加载 {model_name}（将使用缓存）")
+        if model_name not in models_needing_data:
+            print(f"\n⏭️  跳过加载 {model_name}（全部使用缓存）")
             continue
         print(f"\n加载 {model_name} 模型数据: {json_file}")
         with open(json_file, 'r', encoding='utf-8') as f:
@@ -512,15 +549,11 @@ def main():
         for ref_idx, s_list in grouped.items():
             print(f"     - 参考分子{ref_idx}: {len(s_list)} 个样本")
 
-    print(f"\n{'='*60}")
-    print("📋 数据加载完成")
-    print(f"{'='*60}")
-
     # =================================================================
-    # 第二阶段：准备参考分子（用于条件评估，仅在需要评估时加载）
+    # 第三阶段：加载参考分子（仅 CondEval 需要时加载）
     # =================================================================
 
-    if not SKIP_EVALUATION:
+    if not SKIP_COND:
         print("\n🔬 加载参考分子...")
         with open(REF_MOL_PKL, 'rb') as f:
             molblocks_and_charges = pickle.load(f)
@@ -540,76 +573,140 @@ def main():
 
         print(f"✅ 共创建了 {len(ref_molecules)} 个参考分子对象")
     else:
-        print("\n⏭️  跳过参考分子加载（全部使用缓存）")
+        print("\n⏭️  跳过参考分子加载（CondEval 全部使用缓存）")
         ref_molecules = {}
 
     # =================================================================
-    # 第三阶段：统一评估（ConfEval + CondEval 一次性完成）
+    # 第四阶段：ConfEval（完成后立即保存）
     # =================================================================
 
-    if not SKIP_EVALUATION:
-        # 从缓存中预加载未变化模型的结果
-        all_unified_results = {}
-        all_cond_group_results = {}
+    # 从缓存预加载不需要重跑的模型结果
+    all_conf_results = {}
+    if conf_cache is not None:
+        for model_name in MODEL_FILES:
+            if model_name not in models_needing_conf:
+                all_conf_results[model_name] = conf_cache['per_sample_results'].get(model_name, [])
+                print(f"\n📦 {model_name}: 已从 ConfEval 缓存加载")
 
-        if cached_data is not None:
-            for model_name in MODEL_FILES:
-                if model_name not in models_to_eval:
-                    # 直接复用缓存
-                    all_unified_results[model_name] = cached_data['per_sample_results'][model_name]
-                    all_cond_group_results[model_name] = {
-                        int(k): v
-                        for k, v in cached_data['cond_group_results'][model_name].items()
-                    }
-                    print(f"\n📦 {model_name}: 已从缓存加载评估结果")
-
+    if not SKIP_CONF:
         print("\n" + "=" * 80)
-        print("🚀 开始增量评估：仅评估路径已变化的模型")
+        print("🚀 开始 ConfEval 评估")
         print("=" * 80)
 
-        for model_name, grouped in all_model_grouped.items():
-            # all_model_grouped 只包含需要重新评估的模型
+        for model_name in models_needing_conf:
+            if model_name not in all_model_grouped:
+                continue
+            grouped = all_model_grouped[model_name]
+
             print(f"\n{'='*60}")
-            print(f"🔬 模型: {model_name}")
+            print(f"🔬 ConfEval: {model_name}")
             print(f"{'='*60}")
 
-            model_results = []  # 每个样本一条记录
-            model_cond_groups = {}  # ref_mol_idx -> {cond_summary, global_summary, ...}
+            model_results = []
 
             for ref_mol_idx, samples in grouped.items():
                 print(f"\n  📋 参考分子 {ref_mol_idx}: {len(samples)} 个样本")
 
-                # ------ 步骤1：并行 ConfEval ------
                 global_id_offset = len(model_results)
                 conf_results, conf_valid_raw = run_conf_eval_parallel(
                     samples, model_name, NUM_WORKERS, NUM_PROCESSES
                 )
 
-                # 将结果整合到 model_results，并调整索引
-                conf_valid_samples = []
                 for i, result in enumerate(conf_results):
                     global_id = global_id_offset + i
                     result['structure_id'] = global_id
                     result['ref_mol_index'] = ref_mol_idx
                     result['local_index'] = i
-                    result['cond_valid'] = False
-                    result['both_valid'] = False
                     model_results.append(result)
 
-                # 将 conf_valid_raw 中的本地索引映射为全局索引
-                for local_id, sample in conf_valid_raw:
-                    conf_valid_samples.append((global_id_offset + local_id, sample))
-
-                conf_valid_count = len(conf_valid_samples)
+                conf_valid_count = sum(1 for r in conf_results if r and r.get('conf_valid'))
                 print(f"    ConfEval 完成: {conf_valid_count}/{len(samples)} 有效")
 
-                # ------ 步骤2：对 conf 有效的样本组执行 CondEval ------
+            all_conf_results[model_name] = model_results
+
+            total = len(model_results)
+            conf_ok = sum(1 for r in model_results if r.get('conf_valid'))
+            print(f"\n  ✅ {model_name} ConfEval 汇总: 总共 {total} | 构象有效 {conf_ok}")
+
+        # 立即保存 ConfEval 结果
+        conf_save_data = {
+            'metadata': {
+                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'model_files': MODEL_FILES,
+            },
+            'per_sample_results': all_conf_results,
+        }
+        save_cache(CONF_CACHE_FILE, conf_save_data)
+        print("\n✅ ConfEval 完成并已保存！")
+    else:
+        print("\n⏭️  跳过 ConfEval（全部使用缓存）")
+
+    # =================================================================
+    # 第五阶段：CondEval（完成后立即保存）
+    # =================================================================
+
+    # 从缓存预加载不需要重跑的模型结果
+    all_cond_group_results = {}
+    all_cond_sample_status = {}  # model_name -> {global_id: {cond_valid: True/False}}
+
+    if cond_cache is not None:
+        for model_name in MODEL_FILES:
+            if model_name not in models_needing_cond:
+                all_cond_group_results[model_name] = {
+                    int(k): v
+                    for k, v in cond_cache.get('cond_group_results', {}).get(model_name, {}).items()
+                }
+                all_cond_sample_status[model_name] = cond_cache.get('per_sample_cond_status', {}).get(model_name, {})
+                print(f"\n📦 {model_name}: 已从 CondEval 缓存加载")
+
+    if not SKIP_COND:
+        print("\n" + "=" * 80)
+        print("🚀 开始 CondEval 评估")
+        print("=" * 80)
+
+        for model_name in models_needing_cond:
+            if model_name not in all_model_grouped:
+                continue
+            grouped = all_model_grouped[model_name]
+            model_conf_results = all_conf_results.get(model_name, [])
+
+            print(f"\n{'='*60}")
+            print(f"🔬 CondEval: {model_name}")
+            print(f"{'='*60}")
+
+            model_cond_groups = {}
+            model_cond_status = {}
+
+            for ref_mol_idx, samples in grouped.items():
+                print(f"\n  📋 参考分子 {ref_mol_idx}: {len(samples)} 个样本")
+
                 if ref_mol_idx not in ref_molecules:
                     print(f"    ❌ 缺少参考分子 {ref_mol_idx}，跳过条件评估")
                     continue
 
+                # 从 conf 结果中找出该组中 conf_valid=True 的样本
+                # 需要根据 ref_mol_index 过滤
+                conf_valid_samples = []
+                for r in model_conf_results:
+                    if r.get('ref_mol_index') == ref_mol_idx and r.get('conf_valid'):
+                        global_id = r['structure_id']
+                        local_idx = r.get('local_index', 0)
+                        # 从 grouped 中获取对应的样本
+                        if local_idx < len(samples):
+                            conf_valid_samples.append((global_id, samples[local_idx]))
+
+                conf_valid_count = len(conf_valid_samples)
+                print(f"    ConfEval 有效样本: {conf_valid_count}")
+
                 if conf_valid_count == 0:
                     print(f"    ⚠️ 无有效构象，跳过条件评估")
+                    model_cond_groups[ref_mol_idx] = {
+                        'cond_summary': None,
+                        'global_summary': None,
+                        'num_samples': len(samples),
+                        'num_conf_valid': 0,
+                        'num_both_valid': 0,
+                    }
                     continue
 
                 try:
@@ -617,14 +714,12 @@ def main():
                         ref_molecules[ref_mol_idx], conf_valid_samples
                     )
 
-                    # 更新每个样本的 cond_valid 和 both_valid
                     cond_valid_count = 0
-                    for global_id, is_cond_valid_info in cond_results.items():
-                        model_results[global_id]['cond_valid'] = is_cond_valid_info['cond_valid']
-                        model_results[global_id]['both_valid'] = (
-                            model_results[global_id]['conf_valid'] and is_cond_valid_info['cond_valid']
-                        )
-                        if model_results[global_id]['both_valid']:
+                    for global_id, cond_info in cond_results.items():
+                        model_cond_status[str(global_id)] = {
+                            'cond_valid': cond_info.get('cond_valid', False)
+                        }
+                        if cond_info.get('cond_valid', False):
                             cond_valid_count += 1
 
                     model_cond_groups[ref_mol_idx] = {
@@ -635,10 +730,9 @@ def main():
                         'num_both_valid': cond_valid_count,
                     }
 
-                    print(f"    CondEval 完成: {cond_valid_count}/{conf_valid_count} 条件有效 (同时有效)")
+                    print(f"    CondEval 完成: {cond_valid_count}/{conf_valid_count} 条件有效")
 
                 except Exception as e:
-                    import traceback
                     print(f"    ❌ CondEval 评估失败: {str(e)}")
                     traceback.print_exc()
                     model_cond_groups[ref_mol_idx] = {
@@ -651,57 +745,72 @@ def main():
                     }
                     continue
 
-            all_unified_results[model_name] = model_results
             all_cond_group_results[model_name] = model_cond_groups
+            all_cond_sample_status[model_name] = model_cond_status
 
             # 模型汇总
-            total = len(model_results)
-            conf_ok = sum(1 for r in model_results if r['conf_valid'])
-            both_ok = sum(1 for r in model_results if r['both_valid'])
-            print(f"\n  ✅ {model_name} 汇总: 总共 {total} | 构象有效 {conf_ok} | 联合有效 {both_ok}")
+            total_both = sum(g.get('num_both_valid', 0) for g in model_cond_groups.values())
+            total_conf = sum(g.get('num_conf_valid', 0) for g in model_cond_groups.values())
+            print(f"\n  ✅ {model_name} CondEval 汇总: 构象有效 {total_conf} | 联合有效 {total_both}")
 
-        # 打印数据来源汇总
-        print(f"\n{'='*80}")
-        print("🎉 增量评估完成!")
-        print(f"{'='*80}")
-        for model_name in MODEL_FILES:
-            source = "🔄 重新评估" if model_name in models_to_eval else "📦 缓存复用"
-            print(f"  {model_name}: {source}")
+        # 立即保存 CondEval 结果
+        cond_save_data = {
+            'metadata': {
+                'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+                'model_files': MODEL_FILES,
+            },
+            'cond_group_results': {
+                model_name: {
+                    str(ref_idx): group_data
+                    for ref_idx, group_data in groups.items()
+                }
+                for model_name, groups in all_cond_group_results.items()
+            },
+            'per_sample_cond_status': all_cond_sample_status,
+        }
+        save_cache(COND_CACHE_FILE, cond_save_data)
+        print("\n✅ CondEval 完成并已保存！")
+    else:
+        print("\n⏭️  跳过 CondEval（全部使用缓存）")
 
     # =================================================================
-    # 第四阶段：保存中间结果
+    # 打印评估来源汇总
+    # =================================================================
+
+    print(f"\n{'='*80}")
+    print("🎉 评估完成!")
+    print(f"{'='*80}")
+    for model_name in MODEL_FILES:
+        conf_src = "🔄 重新评估" if model_name in models_needing_conf else "📦 缓存复用"
+        cond_src = "🔄 重新评估" if model_name in models_needing_cond else "📦 缓存复用"
+        print(f"  {model_name}: ConfEval={conf_src}, CondEval={cond_src}")
+
+    # =================================================================
+    # 第六阶段：合并数据并进行统计分析
+    # =================================================================
+
+    # 合并 conf 和 cond 结果，生成 unified results
+    all_unified_results = {}
+    for model_name in MODEL_FILES:
+        model_conf = all_conf_results.get(model_name, [])
+        model_cond_status = all_cond_sample_status.get(model_name, {})
+
+        unified = []
+        for r in model_conf:
+            r_copy = dict(r)  # 不修改原始缓存数据
+            global_id = str(r_copy.get('structure_id', ''))
+            cond_info = model_cond_status.get(global_id, {})
+            r_copy['cond_valid'] = cond_info.get('cond_valid', False)
+            r_copy['both_valid'] = r_copy.get('conf_valid', False) and r_copy['cond_valid']
+            unified.append(r_copy)
+
+        all_unified_results[model_name] = unified
+
+    # =================================================================
+    # 统计分析
     # =================================================================
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"unified_eval_results_{timestamp}.json"
-
-    save_data = {
-        'metadata': {
-            'timestamp': timestamp,
-            'models': list(all_unified_results.keys()),
-            'model_files': MODEL_FILES,
-        },
-        'per_sample_results': {
-            model_name: results
-            for model_name, results in all_unified_results.items()
-        },
-        'cond_group_results': {
-            model_name: {
-                str(ref_idx): group_data
-                for ref_idx, group_data in groups.items()
-            }
-            for model_name, groups in all_cond_group_results.items()
-        },
-    }
-
-    with open(output_filename, 'w', encoding='utf-8') as f:
-        json.dump(save_data, f, ensure_ascii=False, indent=2)
-
-    print(f"\n💾 中间结果已保存到: {output_filename}")
-
-    # =================================================================
-    # 第五阶段：统计分析（仅使用 both_valid=True 的分子）
-    # =================================================================
 
     print("\n" + "=" * 80)
     print("📊 最终统计分析（仅统计构象+条件同时有效的分子）")
@@ -715,19 +824,19 @@ def main():
     validity_table = []
     for model_name, results in all_unified_results.items():
         total = len(results)
-        conf_valid = sum(1 for r in results if r['conf_valid'])
-        cond_valid = sum(1 for r in results if r['cond_valid'])
-        both_valid = sum(1 for r in results if r['both_valid'])
+        conf_valid = sum(1 for r in results if r.get('conf_valid'))
+        cond_valid = sum(1 for r in results if r.get('cond_valid'))
+        both_valid = sum(1 for r in results if r.get('both_valid'))
 
         validity_table.append({
             '模型': model_name,
             '总样本': total,
             '构象有效': conf_valid,
-            '构象有效率': f"{conf_valid/total*100:.1f}%",
+            '构象有效率': f"{conf_valid/total*100:.1f}%" if total > 0 else "N/A",
             '条件有效': cond_valid,
-            '条件有效率': f"{cond_valid/total*100:.1f}%",
+            '条件有效率': f"{cond_valid/total*100:.1f}%" if total > 0 else "N/A",
             '联合有效': both_valid,
-            '联合有效率': f"{both_valid/total*100:.1f}%",
+            '联合有效率': f"{both_valid/total*100:.1f}%" if total > 0 else "N/A",
         })
 
     df_validity = pd.DataFrame(validity_table)
@@ -745,8 +854,8 @@ def main():
         stats = defaultdict(list)
 
         for r in results:
-            if not r['both_valid']:
-                continue  # ← 核心：仅联合有效的分子参与统计
+            if not r.get('both_valid'):
+                continue
 
             conf_data = r.get('conf_data', {})
             if conf_data is None:
@@ -754,13 +863,10 @@ def main():
 
             for metric in conf_metrics:
                 value = None
-                # 从 conf_data 获取
                 if metric in conf_data and conf_data[metric] is not None:
                     value = conf_data[metric]
-                # 从顶层获取
                 elif metric in r and r[metric] is not None:
                     value = r[metric]
-                # 尝试 post_opt 版本
                 elif f"{metric}_post_opt" in conf_data and conf_data[f"{metric}_post_opt"] is not None:
                     value = conf_data[f"{metric}_post_opt"]
 
@@ -769,10 +875,9 @@ def main():
 
         model_conf_stats[model_name] = stats
 
-    # 打印统计表
     for model_name in all_unified_results.keys():
         print(f"\n📌 {model_name} （联合有效分子）:")
-        both_count = sum(1 for r in all_unified_results[model_name] if r['both_valid'])
+        both_count = sum(1 for r in all_unified_results[model_name] if r.get('both_valid'))
         print(f"   联合有效样本数: {both_count}")
 
         for metric in conf_metrics:
@@ -797,9 +902,9 @@ def main():
 
         for ref_idx, group_data in groups.items():
             print(f"\n  📋 参考分子 {ref_idx}:")
-            print(f"     总样本: {group_data['num_samples']} | "
-                  f"构象有效: {group_data['num_conf_valid']} | "
-                  f"联合有效: {group_data['num_both_valid']}")
+            print(f"     总样本: {group_data.get('num_samples', 'N/A')} | "
+                  f"构象有效: {group_data.get('num_conf_valid', 'N/A')} | "
+                  f"联合有效: {group_data.get('num_both_valid', 'N/A')}")
 
             if group_data.get('error'):
                 print(f"     ❌ 错误: {group_data['error']}")
@@ -850,7 +955,6 @@ def main():
     print(f"\n📋 4b. CondEval 指标对比:")
     print("-" * 90)
 
-    # 从 cond_group_results 中提取所有模型的汇总相似度
     cond_comparison = []
     for model_name, groups in all_cond_group_results.items():
         all_surf, all_esp, all_pharm, all_rmsds = [], [], [], []
@@ -878,9 +982,8 @@ def main():
                 elif isinstance(rmsd_values, (int, float)) and not np.isnan(rmsd_values):
                     all_rmsds.append(rmsd_values)
 
-        # 汇总统计
-        total_samples = sum(g['num_samples'] for g in groups.values())
-        both_valid_total = sum(g['num_both_valid'] for g in groups.values())
+        total_samples = sum(g.get('num_samples', 0) for g in groups.values())
+        both_valid_total = sum(g.get('num_both_valid', 0) for g in groups.values())
 
         row = {
             'Model': model_name,
@@ -939,9 +1042,13 @@ def main():
 
     print("\n" + "=" * 80)
     print("✨ 统一评估流程全部完成！")
-    print(f"   中间结果: {output_filename}")
+    print(f"   ConfEval 缓存: {CONF_CACHE_FILE}")
+    print(f"   CondEval 缓存: {COND_CACHE_FILE}")
     print(f"   统计报告: {report_filename}")
     print("=" * 80)
+    print("\n💡 提示: 如果 CondEval 出现问题，可以:")
+    print(f"   1. 删除 {COND_CACHE_FILE}")
+    print(f"   2. 重新运行脚本 → 将跳过 ConfEval，仅重跑 CondEval")
 
 
 # =============================================================================
