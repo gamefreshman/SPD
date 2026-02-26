@@ -9,7 +9,7 @@
 """
 
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = "0"
+os.environ['CUDA_LAUNCH_BLOCKING'] = "0,1,2"
 
 import json
 import glob
@@ -48,6 +48,45 @@ from shepherd_score.evaluations.evaluate import (
     ConsistencyEvalPipeline,
     ConditionalEvalPipeline,
 )
+
+# =============================================================================
+# 运行时修复：monkey-patch ConditionalEval/ConsistencyEval 的 _align_with_* 方法
+# 原始代码中 float(score.numpy()) 会在 score 为多元素数组时报错:
+#   "can only convert an array of size 1 to a Python scalar"
+# 修复方式：用 np.float64(x).item() 替代 float(x)
+# =============================================================================
+from shepherd_score.evaluations.evaluate.evals import ConditionalEval, ConsistencyEval
+from shepherd_score.container import MoleculePair
+
+def _patched_align_with_surface(self, mp_ref_and_relaxed: MoleculePair) -> float:
+    with torch.enable_grad():
+        mp_ref_and_relaxed.align_with_surf(
+            self.alpha, num_repeats=1, trans_init=False, use_jax=False
+        )
+    return np.float64(mp_ref_and_relaxed.sim_aligned_surf).item()
+
+def _patched_align_with_esp(self, mp_ref_and_relaxed: MoleculePair) -> float:
+    with torch.enable_grad():
+        mp_ref_and_relaxed.align_with_esp(
+            self.alpha, lam=self.lam, num_repeats=1, trans_init=False, use_jax=False
+        )
+    return np.float64(mp_ref_and_relaxed.sim_aligned_esp).item()
+
+def _patched_align_with_pharm(self, mp_ref_and_relaxed: MoleculePair) -> float:
+    with torch.enable_grad():
+        mp_ref_and_relaxed.align_with_pharm(
+            similarity='tanimoto', extended_points=False, only_extended=False,
+            num_repeats=1, trans_init=False, use_jax=False
+        )
+    return np.float64(mp_ref_and_relaxed.sim_aligned_pharm).item()
+
+# 应用 monkey-patch
+for cls in (ConditionalEval, ConsistencyEval):
+    cls._align_with_surface = _patched_align_with_surface
+    cls._align_with_esp = _patched_align_with_esp
+    cls._align_with_pharm = _patched_align_with_pharm
+
+print("✅ 已应用 monkey-patch: _align_with_surface/esp/pharm → np.float64().item()")
 
 # =============================================================================
 # 工具函数和评估函数（模块顶层，可被子进程 import）
@@ -599,7 +638,9 @@ def main():
                     print(f"    CondEval 完成: {cond_valid_count}/{conf_valid_count} 条件有效 (同时有效)")
 
                 except Exception as e:
+                    import traceback
                     print(f"    ❌ CondEval 评估失败: {str(e)}")
+                    traceback.print_exc()
                     model_cond_groups[ref_mol_idx] = {
                         'cond_summary': None,
                         'global_summary': None,
