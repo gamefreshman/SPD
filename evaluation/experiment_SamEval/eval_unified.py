@@ -174,11 +174,34 @@ def load_cache(cache_filename):
         return None
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """自定义 JSON encoder，处理 numpy/pandas 类型"""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, pd.Series):
+            return obj.tolist()
+        if isinstance(obj, pd.DataFrame):
+            return obj.to_dict(orient='list')
+        try:
+            if pd.isna(obj):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return super().default(obj)
+
+
 def save_cache(cache_filename, data):
     """保存缓存文件"""
     cache_path = os.path.join(_get_script_dir(), cache_filename)
     with open(cache_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
     print(f"💾 缓存已保存: {cache_path}")
 
 
