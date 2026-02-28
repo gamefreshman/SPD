@@ -955,23 +955,24 @@ def main():
     print("=" * 80)
 
     # --- 4a. ConfEval 对比 ---
-    print("\n📋 4a. ConfEval 指标对比（平均值±标准差）:")
-    print("-" * 90)
+    conf_compare_metrics = ['QED', 'SA_score', 'logP', 'strain_energy']
+    print("\n📋 4a. ConfEval 指标对比（平均值±标准差 [min, max]）:")
+    print("-" * 120)
     header = f"{'模型':<20}"
-    for metric in ['QED', 'SA_score', 'logP', 'strain_energy']:
-        header += f"{metric:>16}"
+    for metric in conf_compare_metrics:
+        header += f"{metric:>25}"
     print(header)
-    print("-" * 90)
+    print("-" * 120)
 
     for model_name in all_unified_results.keys():
         row = f"{model_name:<20}"
-        for metric in ['QED', 'SA_score', 'logP', 'strain_energy']:
+        for metric in conf_compare_metrics:
             values = model_conf_stats[model_name][metric]
             if len(values) > 0:
-                cell = f"{np.mean(values):.3f}±{np.std(values):.3f}"
+                cell = f"{np.mean(values):.3f}±{np.std(values):.3f} [{np.min(values):.2f},{np.max(values):.2f}]"
             else:
                 cell = "N/A"
-            row += f"{cell:>16}"
+            row += f"{cell:>25}"
         print(row)
 
     # --- 4b. CondEval 对比 ---
@@ -1008,16 +1009,22 @@ def main():
         total_samples = sum(g.get('num_samples', 0) for g in groups.values())
         both_valid_total = sum(g.get('num_both_valid', 0) for g in groups.values())
 
+        def _fmt(arr):
+            """格式化: mean±std [min, max]"""
+            if not arr:
+                return "N/A"
+            return f"{np.mean(arr):.3f}±{np.std(arr):.3f} [{np.min(arr):.3f},{np.max(arr):.3f}]"
+
         row = {
             'Model': model_name,
             'Samples': total_samples,
             'Both_Valid': both_valid_total,
             'Valid_Rate': f"{both_valid_total/total_samples*100:.1f}%" if total_samples > 0 else "N/A",
         }
-        row['Surf_Sim'] = f"{np.mean(all_surf):.3f}±{np.std(all_surf):.3f}" if all_surf else "N/A"
-        row['ESP_Sim'] = f"{np.mean(all_esp):.3f}±{np.std(all_esp):.3f}" if all_esp else "N/A"
-        row['Pharm_Sim'] = f"{np.mean(all_pharm):.3f}±{np.std(all_pharm):.3f}" if all_pharm else "N/A"
-        row['RMSD'] = f"{np.mean(all_rmsds):.3f}±{np.std(all_rmsds):.3f}" if all_rmsds else "N/A"
+        row['Surf_Sim'] = _fmt(all_surf)
+        row['ESP_Sim'] = _fmt(all_esp)
+        row['Pharm_Sim'] = _fmt(all_pharm)
+        row['RMSD'] = _fmt(all_rmsds)
 
         cond_comparison.append(row)
 
