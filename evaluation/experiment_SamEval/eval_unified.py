@@ -918,6 +918,32 @@ def main():
     print("📊 3. CondEval 条件评估指标（按参考分子分组）")
     print("=" * 80)
 
+    # 定义需要统计的 per-sample 相似度指标
+    COND_SIM_KEYS = [
+        'sims_surf_target',           # 表面相似度（未优化）
+        'sims_esp_target',            # ESP 相似度（未优化）
+        'sims_pharm_target',          # 药效团相似度（未优化）
+        'sims_surf_target_relax',     # 表面相似度（优化后）
+        'sims_esp_target_relax',      # ESP 相似度（优化后）
+        'sims_pharm_target_relax',    # 药效团相似度（优化后）
+        'sims_surf_target_relax_optimal',   # 最优表面相似度
+        'sims_esp_target_relax_optimal',    # 最优 ESP 相似度
+        'sims_pharm_target_relax_optimal',  # 最优药效团相似度
+        'sims_surf_target_relax_esp_aligned',  # ESP对齐后的表面相似度
+        'sims_pharm_target_relax_esp_aligned', # ESP对齐后的药效团相似度
+    ]
+
+    def _extract_valid_values(data, key):
+        """从 global_summary dict 中提取有效数值列表"""
+        values = data.get(key, None)
+        if values is None:
+            return []
+        if isinstance(values, list):
+            return [v for v in values if isinstance(v, (int, float)) and not np.isnan(v)]
+        elif isinstance(values, (int, float)) and not np.isnan(values):
+            return [values]
+        return []
+
     for model_name, groups in all_cond_group_results.items():
         print(f"\n{'='*60}")
         print(f"🔹 {model_name}")
@@ -933,21 +959,28 @@ def main():
                 print(f"     ❌ 错误: {group_data['error']}")
                 continue
 
+            # 上界（归一化参考值）
             cond_summary = group_data.get('cond_summary', {})
             if cond_summary:
-                for key, value in cond_summary.items():
-                    if isinstance(value, (int, float)) and not np.isnan(value):
-                        key_lower = str(key).lower()
-                        if any(kw in key_lower for kw in ['sims_surf', 'sims_esp', 'sims_pharm', 'rmsd']):
-                            print(f"     {key}: {value:.4f}")
+                for key in ['sims_surf_upper_bound', 'sims_esp_upper_bound']:
+                    val = cond_summary.get(key)
+                    if val is not None and isinstance(val, (int, float)):
+                        print(f"     {key}: {val:.4f} (归一化上界)")
 
+            # 实际 per-sample 相似度分数
             global_summary = group_data.get('global_summary', {})
-            if global_summary and 'rmsds' in global_summary:
-                rmsd_values = global_summary['rmsds']
-                if isinstance(rmsd_values, list):
-                    valid_rmsds = [v for v in rmsd_values if isinstance(v, (int, float)) and not np.isnan(v)]
-                    if valid_rmsds:
-                        print(f"     RMSD (avg): {np.mean(valid_rmsds):.4f} ± {np.std(valid_rmsds):.4f}")
+            if global_summary:
+                for key in COND_SIM_KEYS:
+                    vals = _extract_valid_values(global_summary, key)
+                    if vals:
+                        print(f"     {key}: {np.mean(vals):.4f} ± {np.std(vals):.4f} "
+                              f"[{np.min(vals):.4f}, {np.max(vals):.4f}]  (n={len(vals)})")
+
+                # RMSD
+                rmsds = _extract_valid_values(global_summary, 'rmsds')
+                if rmsds:
+                    print(f"     rmsds: {np.mean(rmsds):.4f} ± {np.std(rmsds):.4f} "
+                          f"[{np.min(rmsds):.4f}, {np.max(rmsds):.4f}]  (n={len(rmsds)})")
 
     # ==================== 4. 模型间对比表格 ====================
     print("\n" + "=" * 80)
@@ -976,60 +1009,53 @@ def main():
         print(row)
 
     # --- 4b. CondEval 对比 ---
-    print(f"\n📋 4b. CondEval 指标对比:")
-    print("-" * 90)
+    # 提取关键相似度指标（从 global_summary 的 per-sample 数组）
+    KEY_COND_METRICS = [
+        'sims_surf_target',
+        'sims_esp_target',
+        'sims_pharm_target',
+        'sims_surf_target_relax',
+        'sims_esp_target_relax',
+        'sims_pharm_target_relax',
+        'sims_surf_target_relax_optimal',
+        'sims_esp_target_relax_optimal',
+        'sims_pharm_target_relax_optimal',
+    ]
 
-    cond_comparison = []
+    def _fmt(arr):
+        """格式化: mean±std [min, max]"""
+        if not arr:
+            return "N/A"
+        return f"{np.mean(arr):.3f}±{np.std(arr):.3f} [{np.min(arr):.3f},{np.max(arr):.3f}]"
+
+    print(f"\n📋 4b. CondEval 3D相似度对比（per-sample 实际分数）:")
+    print("-" * 140)
+
+    for sim_key in KEY_COND_METRICS:
+        print(f"\n  📊 {sim_key}:")
+        print(f"  {'模型':<20} {'mean±std [min, max]':>40} {'样本数':>10}")
+        print(f"  {'-'*75}")
+
+        for model_name, groups in all_cond_group_results.items():
+            all_vals = []
+            for ref_idx, group_data in groups.items():
+                global_summary = group_data.get('global_summary', {})
+                if global_summary:
+                    all_vals.extend(_extract_valid_values(global_summary, sim_key))
+
+            print(f"  {model_name:<20} {_fmt(all_vals):>40} {len(all_vals):>10}")
+
+    # RMSD 对比
+    print(f"\n  📊 rmsds:")
+    print(f"  {'模型':<20} {'mean±std [min, max]':>40} {'样本数':>10}")
+    print(f"  {'-'*75}")
     for model_name, groups in all_cond_group_results.items():
-        all_surf, all_esp, all_pharm, all_rmsds = [], [], [], []
-
+        all_rmsds = []
         for ref_idx, group_data in groups.items():
-            cond_summary = group_data.get('cond_summary', {})
-            if cond_summary is None:
-                continue
-
-            for key, value in cond_summary.items():
-                if isinstance(value, (int, float)) and not np.isnan(value):
-                    key_lower = str(key).lower()
-                    if 'sims_surf' in key_lower:
-                        all_surf.append(value)
-                    elif 'sims_esp' in key_lower:
-                        all_esp.append(value)
-                    elif 'sims_pharm' in key_lower:
-                        all_pharm.append(value)
-
             global_summary = group_data.get('global_summary', {})
-            if global_summary and 'rmsds' in global_summary:
-                rmsd_values = global_summary['rmsds']
-                if isinstance(rmsd_values, list):
-                    all_rmsds.extend([v for v in rmsd_values if isinstance(v, (int, float)) and not np.isnan(v)])
-                elif isinstance(rmsd_values, (int, float)) and not np.isnan(rmsd_values):
-                    all_rmsds.append(rmsd_values)
-
-        total_samples = sum(g.get('num_samples', 0) for g in groups.values())
-        both_valid_total = sum(g.get('num_both_valid', 0) for g in groups.values())
-
-        def _fmt(arr):
-            """格式化: mean±std [min, max]"""
-            if not arr:
-                return "N/A"
-            return f"{np.mean(arr):.3f}±{np.std(arr):.3f} [{np.min(arr):.3f},{np.max(arr):.3f}]"
-
-        row = {
-            'Model': model_name,
-            'Samples': total_samples,
-            'Both_Valid': both_valid_total,
-            'Valid_Rate': f"{both_valid_total/total_samples*100:.1f}%" if total_samples > 0 else "N/A",
-        }
-        row['Surf_Sim'] = _fmt(all_surf)
-        row['ESP_Sim'] = _fmt(all_esp)
-        row['Pharm_Sim'] = _fmt(all_pharm)
-        row['RMSD'] = _fmt(all_rmsds)
-
-        cond_comparison.append(row)
-
-    df_cond_comp = pd.DataFrame(cond_comparison)
-    print(df_cond_comp.to_string(index=False))
+            if global_summary:
+                all_rmsds.extend(_extract_valid_values(global_summary, 'rmsds'))
+        print(f"  {model_name:<20} {_fmt(all_rmsds):>40} {len(all_rmsds):>10}")
 
     # ==================== 5. 保存最终统计报告 ====================
     report = {
