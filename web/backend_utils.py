@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Web 前端逻辑工具库：模型加载、推理封装、数据格式转换、3D 可视化辅助等。
-所有与后端 src/shepherd、shepherd_score 的交互均在本模块中封装，使用相对路径与缓存。
+Web 后端与数据工具：路径与设备、模型加载与推理、分子数据转换、检查点与实验列表、分子对接等。
 """
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 import glob
 from typing import Any, Dict, List, Optional, Tuple
 
-# 将项目根目录与 src 加入 Python 路径，以便导入 shepherd（不修改项目其他文件）
+# 将项目根目录与 src 加入 Python 路径，以便导入 shepherd
 _WEB_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_WEB_DIR)
 _SRC_DIR = os.path.join(_PROJECT_ROOT, "src")
@@ -28,9 +28,7 @@ def get_project_root() -> str:
 
 def get_device() -> str:
     """
-    自动选择计算设备：有 CUDA 则用 cuda，否则 cpu。
-    Returns:
-        str: 'cuda' 或 'cpu'。
+    自动选择计算设备
     """
     try:
         import torch
@@ -41,18 +39,79 @@ def get_device() -> str:
     return "cpu"
 
 
+def get_gpu_memory_info() -> Optional[str]:
+    """返回当前 GPU 显存简要信息"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        return f"{allocated:.1f} / {total:.1f} GB"
+    except Exception:
+        return None
+
+
+def get_gpu_memory_ratio() -> Optional[Tuple[float, float]]:
+    """返回 (已用 GB, 总 GB)，用于状态栏进度条；无 GPU 返回 None。"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        return (round(allocated, 2), round(total, 2))
+    except Exception:
+        return None
+
+
+def get_sidebar_status_text(device: str, current_ckpt_path: Optional[str], n_mols: int) -> str:
+    """组装侧边栏状态面板的简要文本（设备、显存、当前模型、会话分子数）。"""
+    lines = [f"**运行设备**: {device.upper()}"]
+    gpu_info = get_gpu_memory_info()
+    if gpu_info:
+        lines.append(f"**显存**: {gpu_info}")
+    if current_ckpt_path:
+        base = os.path.basename(current_ckpt_path)
+        if len(base) > 24:
+            base = base[:21] + "..."
+        lines.append(f"**当前模型**: {base}")
+    if n_mols > 0:
+        lines.append(f"**会话分子数**: {n_mols}")
+    return "  \n".join(lines)
+
+
+def get_sidebar_status_html(device: str, current_ckpt_path: Optional[str], n_mols: int) -> str:
+    """返回侧边栏状态面板 HTML：微型卡片、标签:数值左右对齐、显存进度条。"""
+    rows: List[str] = []
+    rows.append(f'<div class="status-row"><span class="label">运行设备</span><span>{device.upper()}</span></div>')
+    gpu_ratio = get_gpu_memory_ratio()
+    if gpu_ratio:
+        used_gb, total_gb = gpu_ratio
+        pct = min(100, int((used_gb / total_gb) * 100)) if total_gb > 0 else 0
+        rows.append(f'<div class="status-row"><span class="label">显存</span><span>{used_gb:.1f} / {total_gb:.1f} GB</span></div>')
+        rows.append(f'<div class="status-progress"><div class="status-progress-fill" style="width:{pct}%"></div></div>')
+    if current_ckpt_path:
+        base = os.path.basename(current_ckpt_path)
+        if len(base) > 20:
+            base = base[:17] + "..."
+        rows.append(f'<div class="status-row"><span class="label">当前模型</span><span>{base}</span></div>')
+    if n_mols > 0:
+        rows.append(f'<div class="status-row"><span class="label">会话分子数</span><span>{n_mols}</span></div>')
+    return f'<div class="sidebar-status-panel">{"".join(rows)}</div>'
+
+
 def list_checkpoints() -> List[Tuple[str, str]]:
     """
-    扫描项目内 checkpoint 目录，返回 (显示名, 绝对路径) 列表。
+    扫描项目内 checkpoint 目录，返回 (相对路径, 绝对路径) 列表。
     搜索目录：checkpoint/、data/shepherd_chkpts/、training/jobs/*/last.ckpt。
     Returns:
-        List[Tuple[str, str]]: [(label, abspath), ...]。
+        List[Tuple[str, str]]: [(rel_path, abspath), ...]。
     """
     root = get_project_root()
     out: List[Tuple[str, str]] = []
     seen: set = set()
 
-    # 1) checkpoint/ 下的 .ckpt 文件
     ckpt_dir = os.path.join(root, "checkpoint")
     if os.path.isdir(ckpt_dir):
         for p in glob.glob(os.path.join(ckpt_dir, "**", "*.ckpt"), recursive=True):
@@ -62,7 +121,6 @@ def list_checkpoints() -> List[Tuple[str, str]]:
                 rel = os.path.relpath(p, root)
                 out.append((rel, abspath))
 
-    # 2) data/shepherd_chkpts/
     shepherd_ckpt = os.path.join(root, "data", "shepherd_chkpts")
     if os.path.isdir(shepherd_ckpt):
         for p in glob.glob(os.path.join(shepherd_ckpt, "**", "*.ckpt"), recursive=True):
@@ -72,7 +130,6 @@ def list_checkpoints() -> List[Tuple[str, str]]:
                 rel = os.path.relpath(p, root)
                 out.append((rel, abspath))
 
-    # 3) training/jobs/*/last.ckpt
     jobs_dir = os.path.join(root, "training", "jobs")
     if os.path.isdir(jobs_dir):
         for p in glob.glob(os.path.join(jobs_dir, "**", "last.ckpt"), recursive=True):
@@ -87,19 +144,13 @@ def list_checkpoints() -> List[Tuple[str, str]]:
 
 def checkpoint_to_readable_label(rel_path: str) -> str:
     """
-    将检查点相对路径转为科研人员可读的模型名称（不展示路径）。
-    Args:
-        rel_path: 相对项目根的路径，如 training/jobs/33/x1x3x4_dpo_finetune_nps/last.ckpt
-    Returns:
-        可读名称，如 "DPO 微调 (NP)" 或最后目录名。
+    将检查点相对路径转为可读的模型名称。
     """
     if not rel_path:
         return "未命名模型"
-    # 取最后两级目录或文件名作为上下文
     parts = rel_path.replace("\\", "/").split("/")
     name = parts[-2] if len(parts) >= 2 and parts[-1] == "last.ckpt" else parts[-1]
     name = name.replace(".ckpt", "").strip()
-    # 常见模式转可读名
     if "dpo_finetune_nps" in name or "dpo_finetune_np" in name:
         return "DPO 微调 (天然产物)"
     if "dpo_fragment" in name:
@@ -109,6 +160,50 @@ def checkpoint_to_readable_label(rel_path: str) -> str:
     if "diffusion" in name:
         return "扩散模型"
     return name or "模型"
+
+
+def checkpoint_to_source_hint(rel_path: str) -> str:
+    """
+    从检查点相对路径提取简短来源提示，用于区分。
+    """
+    if not rel_path:
+        return ""
+    parts = rel_path.replace("\\", "/").strip("/").split("/")
+    if len(parts) >= 2 and parts[0] == "training" and parts[1] == "jobs":
+        if len(parts) >= 4 and parts[-1] == "last.ckpt":
+            return f"实验 {parts[2]} · {parts[3]}"
+        if len(parts) >= 3:
+            return f"实验 {parts[2]}"
+        return "jobs"
+    if len(parts) >= 1 and parts[0] == "data":
+        if len(parts) >= 2 and "shepherd" in parts[1].lower():
+            return f"预训练 · {parts[-1].replace('.ckpt', '')}" if len(parts) >= 3 else "预训练"
+        return "data"
+    if len(parts) >= 1 and parts[0] == "checkpoint":
+        if len(parts) >= 2:
+            return parts[1]
+        return "checkpoint"
+    return parts[0] if parts else ""
+
+
+def build_unique_checkpoint_labels(checkpoints: List[Tuple[str, str]]) -> List[str]:
+    from collections import Counter
+    base_labels = [checkpoint_to_readable_label(rel) for rel, _ in checkpoints]
+    hints = [checkpoint_to_source_hint(rel) for rel, _ in checkpoints]
+    count = Counter(base_labels)
+    out = []
+    for i, base in enumerate(base_labels):
+        if count[base] <= 1 or not hints[i]:
+            out.append(base)
+        else:
+            out.append(f"{base} — {hints[i]}")
+    out_count = Counter(out)
+    seen: Dict[str, int] = {}
+    for i in range(len(out)):
+        if out_count[out[i]] > 1:
+            seen[out[i]] = seen.get(out[i], 0) + 1
+            out[i] = f"{out[i]} ({seen[out[i]]})"
+    return out
 
 
 def _cache_resource(f):
@@ -124,13 +219,6 @@ def _cache_resource(f):
 def load_model_pl(checkpoint_path: str, device: str) -> Any:
     """
     加载 Lightning 模型并移至指定设备（使用 Streamlit 缓存，避免重复加载）。
-    Args:
-        checkpoint_path: .ckpt 文件绝对路径。
-        device: 'cuda' 或 'cpu'。
-    Returns:
-        LightningModule 实例（已 eval、已 to(device)）。
-    Raises:
-        Exception: 加载失败时抛出，由调用方 try/except 后通过 st.error 提示。
     """
     import torch
     from shepherd.lightning_module import LightningModule
@@ -159,39 +247,24 @@ def run_inference(
 ) -> List[Dict[str, Any]]:
     """
     调用后端 inference_sample 进行采样；无条件生成时使用默认 inpainting 占位。
-    Args:
-        model_pl: LightningModule 实例。
-        batch_size: 批次大小。
-        N_x1: 原子数。
-        N_x4: 药效团数。
-        unconditional: 是否无条件生成。
-        device: 设备字符串。
-        prior_noise_scale: 先验噪声尺度。
-        denoising_noise_scale: 去噪噪声尺度。
-        harmonize: 是否协调化。
-        harmonize_ts: 协调化时间步。
-        harmonize_jumps: 协调化步长。
-        atom_marginals: 原子边际（None 则后端使用默认）。
-        bond_marginals: 键边际（None 则后端使用默认）。
-    Returns:
-        生成的样本列表，每项为 inference_sample 返回的字典结构（含 x1/x2/x3/x4）。
-    Raises:
-        Exception: 推理过程中任何异常会向上抛出，由 app 层捕获并 st.error。
     """
     import numpy as np
     import torch
     from shepherd.inference import inference_sample
 
-    # 后端 inference 要求 atom_marginals / bond_marginals 非 None，否则 DiscreteFeatureDiffusion 会报错
-    # 与 src/shepherd/discrete_diffuser.py 默认一致：4 类原子、5 类键，归一化后传入
+    params = model_pl.params
+    x1 = params.get("dataset", {}).get("x1", {})
+    num_atom_types = len(x1.get("atom_types", []))
+    num_bond_types = len(x1.get("bond_types", []))
+    if num_atom_types == 0:
+        num_atom_types = 4
+    if num_bond_types == 0:
+        num_bond_types = 5
     if atom_marginals is None:
-        _atom = torch.tensor([0.7230, 0.1151, 0.1593, 0.0026], dtype=torch.float32)
-        atom_marginals = _atom / _atom.sum()
+        atom_marginals = torch.ones(num_atom_types, dtype=torch.float32) / num_atom_types
     if bond_marginals is None:
-        _bond = torch.tensor([0.7261, 0.2384, 0.0274, 0.0081, 0.0], dtype=torch.float32)
-        bond_marginals = _bond / _bond.sum()
+        bond_marginals = torch.ones(num_bond_types, dtype=torch.float32) / num_bond_types
 
-    # 无条件生成时 inpainting 目标使用零占位，与 basic_inference_test 一致
     n_pharm = N_x4
     pharm_types = np.zeros(n_pharm, dtype=int)
     pharm_pos = np.zeros((n_pharm, 3))
@@ -240,10 +313,6 @@ def run_inference(
 def sample_to_rdkit_mol(sample: Dict[str, Any]) -> Optional[Any]:
     """
     将 inference 输出的单条 sample 转为 RDKit Mol。
-    Args:
-        sample: 含 'x1']['atoms' 与 'x1']['positions' 的字典。
-    Returns:
-        RDKit Mol 或 None（转换失败时）。
     """
     try:
         from shepherd.extract_shepherd import create_rdkit_molecule
@@ -299,99 +368,97 @@ def sample_to_xyz(sample: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-def render_3d_mol_html(
-    xyz_or_mol_block: str,
-    style: str = "stick",
-    width: int = 400,
-    height: int = 400,
-) -> str:
+def smiles_to_xyz(smiles: str) -> Optional[str]:
     """
-    使用 py3Dmol 生成分子 3D 显示的 HTML 字符串，供 st.components.v1.html 使用。
-    Args:
-        xyz_or_mol_block: XYZ 格式字符串或 MOL block。
-        style: 'stick' | 'sphere' | 'cartoon' 等。
-        width: 视图宽度。
-        height: 视图高度。
-    Returns:
-        完整 HTML 字符串。
+    从 SMILES 解析分子、加氢、生成 3D 构象并转为 XYZ 字符串。
+    成功返回 XYZ 字符串，失败返回 None。
     """
+    if not (smiles and smiles.strip()):
+        return None
     try:
-        import py3Dmol
-    except ImportError:
-        return "<p>需要安装 py3Dmol: pip install py3Dmol</p>"
-
-    view = py3Dmol.view(width=width, height=height)
-    # 根据前几行判断格式：首行为数字则视为 XYZ
-    first_line = (xyz_or_mol_block.strip().split("\n")[0] or "").strip()
-    if first_line.isdigit():
-        view.addModel(xyz_or_mol_block, "xyz")
-    else:
-        view.addModel(xyz_or_mol_block, "sdf")
-    view.setStyle({style: {}})
-    view.zoomTo()
-    return view.write_html()
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        mol = Chem.MolFromSmiles(smiles.strip())
+        if mol is None:
+            return None
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+        return mol_to_xyz(mol)
+    except Exception:
+        return None
 
 
-def render_3d_two_mols_synced(
-    xyz1: str,
-    xyz2: str,
-    style: str = "stick",
-    width: int = 500,
-    height: int = 450,
-    offset_second: float = 12.0,
-) -> str:
+def run_docking(
+    protein_bytes: bytes,
+    ref_smi: str,
+    lig_smi: str,
+    vina_module_path: str,
+) -> Tuple[bool, Any]:
     """
-    在同一 3D 视图中添加两个分子，实现同步旋转（旋转一侧，另一侧同步）。
-    第二个分子沿 x 轴平移 offset_second，避免重叠。
-    Args:
-        xyz1: 分子 1 的 XYZ 字符串。
-        xyz2: 分子 2 的 XYZ 字符串。
-        style: 显示风格。
-        width: 视图宽度。
-        height: 视图高度。
-        offset_second: 分子 2 的 x 轴偏移量（埃）。
+    执行分子对接：写入临时蛋白文件、加载 vina 模块、计算对接分数。
     Returns:
-        完整 HTML 字符串。
+        (True, score_float) 成功；(False, error_message_str) 失败。
     """
+    import tempfile
+    import importlib.util
     try:
-        import py3Dmol
-    except ImportError:
-        return "<p>需要安装 py3Dmol</p>"
-
-    def shift_xyz(xyz: str, dx: float) -> str:
-        """将 XYZ 字符串中所有 x 坐标加上 dx。"""
-        lines = xyz.strip().split("\n")
-        if len(lines) < 3:
-            return xyz
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        spec = importlib.util.spec_from_file_location("vina_dock", vina_module_path)
+        if spec is None or spec.loader is None:
+            return (False, "无法加载对接模块")
+        vina_dock = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(vina_dock)
+        with tempfile.NamedTemporaryFile(suffix=".pdbqt", delete=False) as f:
+            f.write(protein_bytes)
+            protein_path = f.name
         try:
-            n = int(lines[0])
-        except ValueError:
-            return xyz
-        out = [lines[0], lines[1] if len(lines) > 1 else ""]
-        for i in range(2, min(2 + n, len(lines))):
-            parts = lines[i].split()
-            if len(parts) >= 4:
-                x = float(parts[1]) + dx
-                out.append(f"{parts[0]} {x:.4f} {parts[2]} {parts[3]}")
-            else:
-                out.append(lines[i])
-        return "\n".join(out)
+            ref_mol = None
+            if ref_smi and ref_smi.strip():
+                ref_mol = Chem.MolFromSmiles(ref_smi.strip())
+                if ref_mol:
+                    ref_mol = Chem.AddHs(ref_mol)
+                    AllChem.EmbedMolecule(ref_mol, AllChem.ETKDG())
+            lig_mol = Chem.MolFromSmiles(lig_smi)
+            if not lig_mol:
+                return (False, "配体 SMILES 无效。")
+            lig_mol = Chem.AddHs(lig_mol)
+            AllChem.EmbedMolecule(lig_mol, AllChem.ETKDG())
+            if ref_mol is None:
+                ref_mol = lig_mol
+            score = vina_dock.vina_score(lig_mol, protein_path, ref_mol)
+            return (True, float(score))
+        finally:
+            try:
+                os.unlink(protein_path)
+            except Exception:
+                pass
+    except Exception as e:
+        return (False, str(e))
 
-    view = py3Dmol.view(width=width, height=height)
-    first1 = (xyz1.strip().split("\n")[0] or "").strip()
-    if first1.isdigit():
-        view.addModel(xyz1, "xyz")
-    else:
-        view.addModel(xyz1, "sdf")
-    xyz2_shifted = shift_xyz(xyz2, offset_second)
-    first2 = (xyz2_shifted.strip().split("\n")[0] or "").strip()
-    if first2.isdigit():
-        view.addModel(xyz2_shifted, "xyz")
-    else:
-        view.addModel(xyz2_shifted, "sdf")
-    view.setStyle({style: {}})
-    view.zoomTo()
-    return view.write_html()
+
+def mol_to_2d_image_bytes(sample_or_mol: Any, size: Tuple[int, int] = (200, 200)) -> Optional[bytes]:
+    """
+    将 sample 或 RDKit Mol 转为 2D 结构图 PNG 字节。
+    用于 Gallery 卡片展示；失败返回 None。
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Draw
+        mol = None
+        if hasattr(sample_or_mol, "GetNumAtoms"):
+            mol = sample_or_mol
+        elif isinstance(sample_or_mol, dict):
+            mol = sample_to_rdkit_mol(sample_or_mol)
+        if mol is None:
+            return None
+        img = Draw.MolToImage(mol, size=size)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
 
 
 def list_training_jobs() -> List[Tuple[str, str]]:
@@ -447,5 +514,3 @@ def list_core_data_dirs() -> List[Tuple[str, str]]:
                 rel = os.path.join("data", exp, sub)
                 out.append((rel, os.path.abspath(sub_path)))
     return out
-
-
