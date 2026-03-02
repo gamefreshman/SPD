@@ -431,7 +431,7 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
         conf_valid_samples: list of (sample_index, sample_dict) -- 仅 conf_valid=True 的样本
 
     返回:
-        cond_results: dict[sample_index] -> {cond_valid, cond_data}
+        cond_results: dict[sample_index] -> {cond_valid, sim_*}
         cond_summary, global_summary: 条件评估结果摘要
     """
     # 构建 generated_mols 列表，同时记录映射关系
@@ -453,7 +453,6 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
         return {}, None, None
 
     # 执行条件评估
-    # 注意：CondEval 使用 num_workers=1（单进程），避免嵌套多进程冲突
     cond_pipe = ConditionalEvalPipeline(
         ref_mol,
         generated_mols=generated_mols,
@@ -467,12 +466,54 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
         num_processes=NUM_PROCESSES,
         verbose=True
     )
+
+    # 调试：打印 pipeline 内部有效性统计
+    print(f"      [CondEval 内部] is_valid={cond_pipe.num_valid}/{cond_pipe.num_generated_mols}, "
+          f"is_valid_post_opt={cond_pipe.num_valid_post_opt}/{cond_pipe.num_generated_mols}")
+
+    # 提取 per-sample 结果
     properties_df, global_attr = cond_pipe.to_pandas()
 
-    # 将 properties_df 和 global_attr 转换为每个样本的条件评估数据
+    # 构建 cond_results：根据 per-sample 实际有效性判断 cond_valid
     cond_results = {}
 
-    # properties_df 通常是 Series（整组的汇总指标）
+    # 相似度指标键名（pipeline 中以 sims_* 为前缀存储在 DataFrame 列中）
+    SIM_KEYS = [
+        'sims_surf_target', 'sims_esp_target', 'sims_pharm_target',
+        'sims_surf_target_relax', 'sims_esp_target_relax', 'sims_pharm_target_relax',
+        'sims_surf_target_relax_optimal', 'sims_esp_target_relax_optimal',
+        'sims_pharm_target_relax_optimal',
+        'sims_surf_target_relax_esp_aligned', 'sims_pharm_target_relax_esp_aligned',
+    ]
+
+    for gen_idx, sample_idx in enumerate(index_mapping):
+        # 检查该样本在 pipeline 中是否有有效的相似度分数
+        # 判断标准：sims_surf_target 不是 NaN
+        has_valid_sims = False
+        sample_sims = {}
+
+        for key in SIM_KEYS:
+            arr = getattr(cond_pipe, key, None)
+            if arr is not None and gen_idx < len(arr):
+                val = arr[gen_idx]
+                if isinstance(val, (np.floating, float)) and not np.isnan(val):
+                    has_valid_sims = True
+                    sample_sims[key] = float(val)
+                else:
+                    sample_sims[key] = None
+
+        # rmsd
+        if hasattr(cond_pipe, 'rmsds') and gen_idx < len(cond_pipe.rmsds):
+            rmsd_val = cond_pipe.rmsds[gen_idx]
+            if isinstance(rmsd_val, (np.floating, float)) and not np.isnan(rmsd_val):
+                sample_sims['rmsd'] = float(rmsd_val)
+
+        cond_results[sample_idx] = {
+            'cond_valid': has_valid_sims,
+            **sample_sims,
+        }
+
+    # 汇总统计
     cond_summary = {}
     if hasattr(properties_df, 'items'):
         for key, value in properties_df.items():
@@ -486,12 +527,6 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
             global_summary[str(key)] = serialize_value(value)
     elif hasattr(global_attr, 'to_dict'):
         global_summary = {str(k): serialize_value(v) for k, v in global_attr.to_dict().items()}
-
-    # 对每个成功传入 CondEval 的样本标记为 cond_valid=True
-    for gen_idx, sample_idx in enumerate(index_mapping):
-        cond_results[sample_idx] = {
-            'cond_valid': True,
-        }
 
     return cond_results, cond_summary, global_summary
 
@@ -954,24 +989,6 @@ def main():
             print(f"     总样本: {group_data.get('num_samples', 'N/A')} | "
                   f"构象有效: {group_data.get('num_conf_valid', 'N/A')} | "
                   f"联合有效: {group_data.get('num_both_valid', 'N/A')}")
-
-            # 调试：显示 global_summary 的内容概况
-            gs = group_data.get('global_summary')
-            if gs is None:
-                print(f"     ⚠️ global_summary 为 None（可能需要删除 {COND_CACHE_FILE} 重跑 CondEval）")
-            elif isinstance(gs, dict):
-                gs_keys = [k for k in gs.keys() if 'sims_' in k or 'rmsd' in k.lower()]
-                print(f"     🔑 global_summary 相似度键: {gs_keys[:8]}...")
-                # 检查第一个 sims 键的数据
-                for k in gs_keys[:2]:
-                    v = gs[k]
-                    if isinstance(v, list):
-                        valid_count = sum(1 for x in v if isinstance(x, (int, float)) and not np.isnan(x))
-                        print(f"        {k}: 列表长度={len(v)}, 有效值={valid_count}")
-                    else:
-                        print(f"        {k}: 类型={type(v).__name__}, 值={v}")
-            else:
-                print(f"     ⚠️ global_summary 类型异常: {type(gs).__name__}")
 
             if group_data.get('error'):
                 print(f"     ❌ 错误: {group_data['error']}")
