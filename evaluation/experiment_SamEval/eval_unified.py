@@ -955,6 +955,24 @@ def main():
                   f"构象有效: {group_data.get('num_conf_valid', 'N/A')} | "
                   f"联合有效: {group_data.get('num_both_valid', 'N/A')}")
 
+            # 调试：显示 global_summary 的内容概况
+            gs = group_data.get('global_summary')
+            if gs is None:
+                print(f"     ⚠️ global_summary 为 None（可能需要删除 {COND_CACHE_FILE} 重跑 CondEval）")
+            elif isinstance(gs, dict):
+                gs_keys = [k for k in gs.keys() if 'sims_' in k or 'rmsd' in k.lower()]
+                print(f"     🔑 global_summary 相似度键: {gs_keys[:8]}...")
+                # 检查第一个 sims 键的数据
+                for k in gs_keys[:2]:
+                    v = gs[k]
+                    if isinstance(v, list):
+                        valid_count = sum(1 for x in v if isinstance(x, (int, float)) and not np.isnan(x))
+                        print(f"        {k}: 列表长度={len(v)}, 有效值={valid_count}")
+                    else:
+                        print(f"        {k}: 类型={type(v).__name__}, 值={v}")
+            else:
+                print(f"     ⚠️ global_summary 类型异常: {type(gs).__name__}")
+
             if group_data.get('error'):
                 print(f"     ❌ 错误: {group_data['error']}")
                 continue
