@@ -459,7 +459,7 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
         condition='all',
         num_surf_points=200,
         pharm_multi_vector=False,
-        solvent=None
+        solvent='water'  # 必须与 ConfEval 的 solvent 参数一致
     )
     cond_pipe.evaluate(
         num_workers=1,
