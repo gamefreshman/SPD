@@ -440,10 +440,18 @@ def run_cond_eval_group(ref_mol, conf_valid_samples):
 
     for sample_idx, sample in conf_valid_samples:
         try:
-            rdkit_mol = create_rdkit_molecule(sample)
-            if rdkit_mol is not None:
-                atoms = np.array([a.GetAtomicNum() for a in rdkit_mol.GetAtoms()])
-                positions = rdkit_mol.GetConformer().GetPositions()
+            # 直接使用原始样本数据（含氢原子），与独立 ConfEval 使用相同输入
+            # 注意：不能用 create_rdkit_molecule()，因为它会去掉氢原子，
+            # 导致 CondEval 内部 ConfEval 重新运行 xtb 时因原子数不完整而失败
+            atoms = sample['x1']['atoms']
+            positions = sample['x1']['positions']
+
+            if isinstance(atoms, np.ndarray):
+                atoms = atoms.flatten()
+            if isinstance(positions, list):
+                positions = np.array(positions)
+
+            if len(atoms) > 0 and positions.shape == (len(atoms), 3):
                 generated_mols.append((atoms, positions))
                 index_mapping.append(sample_idx)
         except Exception:
