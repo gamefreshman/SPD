@@ -1,8 +1,12 @@
 # Web 前端运行所需依赖（仅额外依赖，不含主项目已有 torch/rdkit 等）
 # 安装：pip install -r web/requirements_web.txt
 # 需在项目根目录或已安装 src 包的环境中运行 streamlit
+# 分子对接页还需：meeko（配体转 PDBQT）、vina（AutoDock Vina）
 
 streamlit>=1.28.0
 py3Dmol>=2.0.0
 pandas>=1.5.0
 openpyxl>=3.0.0
+meeko
+vina
+gemmi

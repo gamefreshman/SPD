@@ -388,6 +388,90 @@ def smiles_to_xyz(smiles: str) -> Optional[str]:
         return None
 
 
+# Open Babel 支持的蛋白结构格式 → obabel 输入后缀与 -i 参数
+_STRUCTURE_TO_PDBQT_FORMATS = {
+    "pdb": (".pdb", "pdb"),
+    "cif": (".cif", "cif"),
+}
+
+
+def structure_to_pdbqt(input_bytes: bytes, input_format: str) -> Tuple[bool, Optional[bytes], str]:
+    """
+    使用 Open Babel 将蛋白结构字节流（PDB、CIF 等）转为 PDBQT 字节流。
+    input_format: "pdb" 或 "cif"。
+    需系统已安装 Open Babel 且可执行 obabel。
+    Returns:
+        (True, pdbqt_bytes, "") 成功；(False, None, error_message) 失败。
+    """
+    import subprocess
+    import tempfile
+    fmt = input_format.lower().strip()
+    if fmt not in _STRUCTURE_TO_PDBQT_FORMATS:
+        return (False, None, f"暂不支持格式: {input_format}，仅支持 pdb / cif")
+    suffix, obabel_iformat = _STRUCTURE_TO_PDBQT_FORMATS[fmt]
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fp:
+            fp.write(input_bytes)
+            in_path = fp.name
+        out_path = in_path + ".pdbqt"
+        try:
+            ret = subprocess.run(
+                ["obabel", f"-i{obabel_iformat}", in_path, "-opdbqt", "-O", out_path],
+                capture_output=True,
+                timeout=90,
+                text=False,
+            )
+            if ret.returncode != 0:
+                err = (ret.stderr or ret.stdout or b"").decode("utf-8", errors="replace").strip()
+                return (False, None, err or "obabel 转换失败")
+            if not os.path.isfile(out_path):
+                return (False, None, "obabel 未生成 PDBQT 文件")
+            with open(out_path, "rb") as f:
+                pdbqt_bytes = f.read()
+            if len(pdbqt_bytes) < 80 or (b"ATOM" not in pdbqt_bytes and b"HETATM" not in pdbqt_bytes):
+                return (False, None, "转换结果中未发现 ATOM/HETATM 行，可能不是有效 PDBQT")
+            return (True, pdbqt_bytes, "")
+        finally:
+            try:
+                os.unlink(in_path)
+            except Exception:
+                pass
+            try:
+                os.unlink(out_path)
+            except Exception:
+                pass
+    except FileNotFoundError:
+        return (False, None, "未找到 obabel，请安装 Open Babel 并加入 PATH")
+    except subprocess.TimeoutExpired:
+        return (False, None, "转换超时")
+    except Exception as e:
+        return (False, None, str(e))
+
+
+def pdb_to_pdbqt(pdb_bytes: bytes) -> Tuple[bool, Optional[bytes], str]:
+    """兼容旧接口：将 PDB 字节流转为 PDBQT。"""
+    return structure_to_pdbqt(pdb_bytes, "pdb")
+
+
+# 受体 PDBQT 中不允许的配体用标签（Vina set_receptor 仅接受刚性受体）
+_RECEPTOR_PDBQT_SKIP_PREFIXES = (b"ROOT", b"ENDROOT", b"BRANCH", b"ENDBRANCH", b"TORS", b"ENDTORS", b"WARNING")
+
+
+def _filter_receptor_pdbqt(pdbqt_bytes: bytes) -> bytes:
+    """去掉 PDBQT 中仅用于配体的行，只保留刚性受体需要的 ATOM/HETATM/REMARK 等。"""
+    lines = []
+    for line in pdbqt_bytes.splitlines():
+        line_strip = line.strip()
+        if not line_strip:
+            lines.append(line)
+            continue
+        skip = any(line_strip.upper().startswith(p) for p in _RECEPTOR_PDBQT_SKIP_PREFIXES)
+        if skip:
+            continue
+        lines.append(line)
+    return b"\n".join(lines) if lines else pdbqt_bytes
+
+
 def run_docking(
     protein_bytes: bytes,
     ref_smi: str,
@@ -399,18 +483,46 @@ def run_docking(
     Returns:
         (True, score_float) 成功；(False, error_message_str) 失败。
     """
+    import sys
     import tempfile
     import importlib.util
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem
+        # 先在同一解释器下检测 meeko / vina，避免与 Streamlit 所用 Python 不一致
+        try:
+            import meeko  # noqa: F401
+            import vina   # noqa: F401
+        except ImportError as e:
+            cur = getattr(sys, "executable", "python")
+            err = str(e)
+            if "gemmi" in err:
+                cmd = f"{cur} -m pip install meeko vina gemmi"
+            else:
+                cmd = f"{cur} -m pip install meeko vina"
+            return (
+                False,
+                f"对接依赖未在当前 Python 中安装。当前解释器: {cur}；错误: {e}。"
+                f"请在该环境下执行: {cmd}"
+            )
         spec = importlib.util.spec_from_file_location("vina_dock", vina_module_path)
         if spec is None or spec.loader is None:
             return (False, "无法加载对接模块")
         vina_dock = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(vina_dock)
+        try:
+            spec.loader.exec_module(vina_dock)
+        except ImportError as e:
+            err = str(e)
+            cur = getattr(sys, "executable", "python")
+            if "meeko" in err or "vina" in err:
+                return (
+                    False,
+                    f"加载对接模块失败: {err}。请确认与 Streamlit 使用同一 Python，并执行: {cur} -m pip install meeko vina"
+                )
+            return (False, err)
+        protein_clean = _filter_receptor_pdbqt(protein_bytes)
         with tempfile.NamedTemporaryFile(suffix=".pdbqt", delete=False) as f:
-            f.write(protein_bytes)
+            f.write(protein_clean)
             protein_path = f.name
         try:
             ref_mol = None

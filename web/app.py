@@ -42,6 +42,7 @@ from backend_utils import (
     load_model_pl,
     mol_to_2d_image_bytes,
     mol_to_smiles,
+    structure_to_pdbqt,
     run_docking,
     run_inference,
     sample_to_rdkit_mol,
@@ -422,20 +423,91 @@ def page_docking() -> None:
 
     st.markdown(parameter_card_marker_html(), unsafe_allow_html=True)
     with st.container():
-        protein_file = st.file_uploader("蛋白结构 (PDBQT)", type=["pdbqt"], key="dock_protein")
+        protein_file = st.file_uploader("蛋白结构 (PDB / CIF / PDBQT / PKL)", type=["pdb", "cif", "pdbqt", "pkl"], key="dock_protein")
         ref_smi = st.text_input("参考分子 SMILES（用于确定盒子中心，可留空）", value="", key="dock_ref_smi")
         lig_smi = st.text_input("配体 SMILES", value="CCO", key="dock_lig_smi")
         if st.button("运行对接", type="primary", key="btn_dock", use_container_width=True):
             if not protein_file:
-                st.error("请上传蛋白 PDBQT 文件。")
+                st.error("请上传蛋白 PDB、CIF、PDBQT 或 PKL 文件。")
             else:
-                with st.spinner("对接中…"):
-                    ok, result = run_docking(
-                        protein_file.getvalue(),
-                        ref_smi or "",
-                        lig_smi or "",
-                        vina_module_path,
-                    )
+                raw = protein_file.getvalue()
+                fname = (protein_file.name or "").lower()
+                if fname.endswith(".pdb") or fname.endswith(".cif"):
+                    fmt = "pdb" if fname.endswith(".pdb") else "cif"
+                    with st.spinner(f"正在将 {fmt.upper()} 转为 PDBQT…"):
+                        ok_conv, pdbqt_bytes, err_msg = structure_to_pdbqt(raw, fmt)
+                    if not ok_conv:
+                        st.error(f"{fmt.upper()} 转换失败: {err_msg}")
+                        protein_bytes = None
+                    else:
+                        protein_bytes = pdbqt_bytes
+                elif fname.endswith(".pkl"):
+                    import pickle
+
+                    def _looks_like_pdbqt(b: bytes) -> bool:
+                        if len(b) < 80:
+                            return False
+                        text = b.decode("utf-8", errors="ignore")
+                        return "ATOM" in text or "HETATM" in text
+
+                    def _to_bytes(v) -> Optional[bytes]:
+                        if v is None:
+                            return None
+                        if isinstance(v, bytes):
+                            return v if _looks_like_pdbqt(v) else None
+                        if isinstance(v, str):
+                            b = v.encode("utf-8")
+                            return b if _looks_like_pdbqt(b) else None
+                        return None
+
+                    def _extract_pdbqt_from_obj(obj) -> Optional[bytes]:
+                        if isinstance(obj, bytes):
+                            return obj if _looks_like_pdbqt(obj) else None
+                        if isinstance(obj, str):
+                            return _to_bytes(obj)
+                        if isinstance(obj, dict):
+                            for key in ("pdbqt", "pdbqt_string", "protein", "receptor", "protein_pdbqt", "structure"):
+                                out = _to_bytes(obj.get(key))
+                                if out is not None:
+                                    return out
+                            for k, v in obj.items():
+                                if isinstance(k, str) and ("pdbqt" in k.lower() or "protein" in k.lower() or "receptor" in k.lower()):
+                                    out = _to_bytes(v)
+                                    if out is not None:
+                                        return out
+                            for v in obj.values():
+                                out = _to_bytes(v)
+                                if out is not None:
+                                    return out
+                            return None
+                        if isinstance(obj, (list, tuple)):
+                            for item in obj:
+                                out = _to_bytes(item) if isinstance(item, (str, bytes)) else _extract_pdbqt_from_obj(item)
+                                if out is not None:
+                                    return out
+                            return None
+                        if hasattr(obj, "__dict__"):
+                            return _extract_pdbqt_from_obj(obj.__dict__)
+                        return None
+
+                    try:
+                        obj = pickle.loads(raw)
+                        protein_bytes = _extract_pdbqt_from_obj(obj)
+                        if protein_bytes is None:
+                            st.error("PKL 中未找到可识别的 PDBQT 内容（需包含 ATOM/HETATM 行）。")
+                    except Exception as e:
+                        st.error(f"解析 PKL 失败: {e}")
+                        protein_bytes = None
+                else:
+                    protein_bytes = raw
+                if protein_bytes is not None:
+                    with st.spinner("对接中…"):
+                        ok, result = run_docking(
+                            protein_bytes,
+                            ref_smi or "",
+                            lig_smi or "",
+                            vina_module_path,
+                        )
                     if ok:
                         score = result
                         st.success(f"**对接分数**: {score:.2f} kcal/mol")
