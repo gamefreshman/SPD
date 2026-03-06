@@ -48,8 +48,8 @@ params = {
         'accumulate_grad_batches': 1,  # 不累积梯度
         'num_gpus': 2,  # 单GPU
         
-        'lr': 0.0001,  # 较小的学习率用于微调
-        'min_lr': 0.00001,
+        'lr': 0.00001,  # 降低学习率防止遗忘（1e-5）
+        'min_lr': 0.000001,  # 最低 1e-6
         'lr_steps': 1,
         
         'gradient_clip_val': 5.0,
@@ -66,16 +66,16 @@ params = {
         'enable_dpo': True,  # 启用DPO微调
         
         # DPO核心参数
-        'beta_dpo': 0.2,  # DPO温度参数
-        'dpo_ramp_up_epochs': 2,  # 较短的预热轮数
-        'dpo_max_weight': 0.6,  # 较高的DPO权重（因为是微调）
+        'beta_dpo': 0.5,  # 增大β限制与ref_model偏离
+        'dpo_ramp_up_epochs': 10,  # 更缓慢地增加DPO权重
+        'dpo_max_weight': 0.3,  # 降低DPO损失占比，避免过度偏离
         
         # 采样策略（针对小数据集调整）
         'dpo_sampling_ratio': 1.0,  # 每个epoch对所有3个分子采样（100%）
         'dpo_batch_ratio': 1,  # DPO batch占总batch的50%
         
         # 偏好对构建
-        'dpo_min_score_gap': 0.3,  # 降低最小分数差距阈值
+        'dpo_min_score_gap': 0.1,  # 适配3D相似度的小分差范围
         'dpo_keep_old_ratio': 0.5,  # 保留更多旧偏好对
         
         # checkpoint和采样控制
@@ -92,14 +92,14 @@ params = {
     # ==================== DPO采样配置 ====================
     'sampling': {
         'timesteps': 400,  # 采样步数（与训练T一致）
-        'num_samples_per_molecule': 4,  # 每个种子分子生成4个样本（快速调试）
+        'num_samples_per_molecule': 8,  # 增加采样数以获得更好的偏好对对比
         'fixed_n_atoms': 70,  # 固定生成的原子数（与预训练模型一致）
     },
     
     # ==================== DPO评分权重 ====================
     'dpo': {
         'sampling_ratio': 1.0,
-        'min_score_gap': 0.3,
+        'min_score_gap': 0.1,  # 适配3D相似度的小分差范围
     },
     
     

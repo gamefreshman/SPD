@@ -1009,6 +1009,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             print("  ⚠️  无参考分子，使用默认相似性分数")
             for item in all_evaluated:  # 包括有效和无效样本
                 item['cond_scores'] = {
+                    'sims_surf_target': 0.0,
                     'sims_esp_target': 0.0,   # ESP表面相似度
                     'sims_pharm_target': 0.0, # 药效团相似度
                 }
@@ -1018,6 +1019,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             try:
                 from shepherd_score.container import Molecule
                 from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
+                from shepherd_score.score.gaussian_overlap_np import get_overlap_np
                 from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
                 from shepherd_score.score.constants import ALPHA, LAM_SCALING
                 from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
@@ -1047,6 +1049,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     if item['conf_scores'].get('is_valid', True) == False:
                         print(f"    ⏩ 分子 {i+1}: 无效分子，跳过条件评估")
                         item['cond_scores'] = {
+                            'sims_surf_target': 0.0,
                             'sims_esp_target': 0.0,
                             'sims_pharm_target': 0.0,
                         }
@@ -1063,7 +1066,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                         if gen_mol is None:
                             print(f"    ⚠️ 分子 {i+1}: RDKit构建失败")
                             item['cond_scores'] = {
-                                'graph_sim': 0.0, 'sims_surf_target': 0.0,
+                                'sims_surf_target': 0.0,
                                 'sims_esp_target': 0.0, 'sims_pharm_target': 0.0,
                             }
                             continue
@@ -1087,7 +1090,14 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                             pharm_multi_vector=False
                         )
                         
-                        # 计算ESP相似度
+                        # 计算 Surface（shape）相似度 —— 核心指标
+                        sims_surf_target = 0.0
+                        if (gen_molec.surf_pos is not None and ref_molec.surf_pos is not None):
+                            sims_surf_target = float(get_overlap_np(
+                                gen_molec.surf_pos, ref_molec.surf_pos, alpha=alpha
+                            ))
+
+                        # 计算 ESP 相似度
                         sims_esp_target = 0.0
                         if (gen_molec.surf_pos is not None and gen_molec.surf_esp is not None and
                             ref_molec.surf_pos is not None and ref_molec.surf_esp is not None):
@@ -1108,21 +1118,23 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                                 similarity='tanimoto', extended_points=False, only_extended=False
                             ))
                         
-                        # 计算2D图相似度（Tanimoto）
-                        # 处理NaN值
+                        # 处理 NaN 值
+                        if np.isnan(sims_surf_target): sims_surf_target = 0.0
                         if np.isnan(sims_esp_target): sims_esp_target = 0.0
                         if np.isnan(sims_pharm_target): sims_pharm_target = 0.0
                         
                         item['cond_scores'] = {
+                            'sims_surf_target': sims_surf_target,
                             'sims_esp_target': sims_esp_target,
                             'sims_pharm_target': sims_pharm_target,
                         }
                         
-                        print(f"    ✓ 分子 {i+1}: ESP={sims_esp_target:.3f}, Pharm={sims_pharm_target:.3f}")
+                        print(f"    ✓ 分子 {i+1}: Surf={sims_surf_target:.3f}, ESP={sims_esp_target:.3f}, Pharm={sims_pharm_target:.3f}")
                         
                     except Exception as e:
                         print(f"    ⚠️ 分子 {i+1} 条件评估失败: {e}")
                         item['cond_scores'] = {
+                            'sims_surf_target': 0.0,
                             'sims_esp_target': 0.0,
                             'sims_pharm_target': 0.0,
                         }
@@ -1133,6 +1145,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 print(f"  ⚠️  ConditionalEval初始化失败: {e}, 使用默认相似性分数")
                 for item in all_evaluated:
                     item['cond_scores'] = {
+                        'sims_surf_target': 0.0,
                         'sims_esp_target': 0.0,
                         'sims_pharm_target': 0.0,
                     }
@@ -1147,31 +1160,25 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 # 无效分子赋予负无穷分
                 item['total_score'] = float('-inf')
             else:
-                # 综合评分（只使用SA Score、logP、ESP和药效团相似度）
+                # 综合评分 —— 3D 相似度为核心（约 80%）
                 try:
                     total_score = 0.0
                     
-                    # === Conf评估指标 ===
-                    # 1. SA Score - 合成可及性，越小越好 (范围1-10，1最好)
+                    # === 3D 相似度（核心，总权重 ≈ 80%）===
+                    total_score += cond['sims_surf_target'] * 5.0      # Surface: 最高权重
+                    total_score += cond['sims_esp_target'] * 3.0        # ESP
+                    total_score += cond['sims_pharm_target'] * 2.0      # Pharmacophore
+                    
+                    # === 化学性质（辅助约束，总权重 ≈ 20%）===
+                    # SA Score - 合成可及性，越小越好 (范围1-10)
                     sa_normalized = (conf['sa_score'] - 1.0) / 9.0
-                    total_score -= sa_normalized * 2.0
+                    total_score -= sa_normalized * 0.5
                     
-                    # 2. LogP - 亲脂性，目标范围1~5
+                    # LogP - 亲脂性，目标范围 0~6
                     logp = conf['logp']
-                    if logp < 1.0:
-                        logp_penalty = (1.0 - logp) * 0.5
-                    elif logp > 5.0:
-                        logp_penalty = (logp - 5.0) * 0.5
-                    else:
-                        logp_penalty = 0.0
-                    total_score -= min(logp_penalty, 2.0)
-                    
-                    # === Cond评估指标 ===
-                    # 3. ESP相似度 (范围0-1)
-                    total_score += cond['sims_esp_target'] * 3.0
-                    
-                    # 4. 药效团相似度 (范围0-1)
-                    total_score += cond['sims_pharm_target'] * 4.0
+                    if logp < 0.0 or logp > 6.0:
+                        logp_penalty = min(abs(logp - 3.0) * 0.2, 0.5)
+                        total_score -= logp_penalty
                     
                     if np.isnan(total_score) or np.isinf(total_score):
                         print(f"    ⚠️  分数计算产生NaN/Inf - conf: {conf}, cond: {cond}")
