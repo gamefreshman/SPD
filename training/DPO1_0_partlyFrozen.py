@@ -1487,8 +1487,15 @@ def main():
             self.round_metrics = []  # 每轮指标记录
             self.metrics_file = os.path.join(output_dir, 'dpo_round_metrics.json')  # 指标保存路径
         
-        def _collect_and_save_metrics(self, pairs, epoch, train_loss=None):
-            """收集偏好对指标并保存到 JSON 文件"""
+        def _collect_and_save_metrics(self, pairs, epoch, train_loss=None, extra_metrics=None):
+            """收集偏好对指标并保存到 JSON 文件
+            
+            Args:
+                pairs: 偏好对列表
+                epoch: 当前 epoch
+                train_loss: 训练总损失
+                extra_metrics: 额外的训练指标字典 (loss_dpo, implicit_acc 等)
+            """
             if len(pairs) == 0:
                 return
             
@@ -1527,6 +1534,7 @@ def main():
                 'loser': loser_avg,
                 'score_gap': winner_avg['total_score'] - loser_avg['total_score'],
                 'train_loss': train_loss,
+                'training_metrics': extra_metrics if extra_metrics else {},
             }
             
             # 同时记录每对的详细数据
@@ -1597,13 +1605,20 @@ def main():
                     self.dpo_dataset.update_preference_pairs(all_pairs)
                     print(f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 (保留{len(self.pairs_history)}轮, 将在下一epoch生效)")
                     
-                    # 收集并保存本轮指标
-                    train_loss = None
-                    if 'train_loss' in trainer.callback_metrics:
-                        train_loss = float(trainer.callback_metrics['train_loss'].item())
-                    elif 'loss' in trainer.callback_metrics:
-                        train_loss = float(trainer.callback_metrics['loss'].item())
-                    self._collect_and_save_metrics(new_pairs, trainer.current_epoch, train_loss)
+                    # 收集训练损失和 DPO 相关指标
+                    train_loss_dict = {}
+                    # 遍历所有 callback_metrics，收集所有可用的训练指标
+                    for key in ['train_loss', 'loss_dpo', 'loss_std_on_winner', 
+                                'implicit_acc', 'dpo_weight', 'model_loss_diff', 'ref_loss_diff']:
+                        if key in trainer.callback_metrics:
+                            try:
+                                val = trainer.callback_metrics[key]
+                                train_loss_dict[key] = float(val.item() if hasattr(val, 'item') else val)
+                            except Exception:
+                                pass
+                    
+                    train_loss = train_loss_dict.get('train_loss', None)
+                    self._collect_and_save_metrics(new_pairs, trainer.current_epoch, train_loss, train_loss_dict)
 
     sampling_callback = DPOSamplingCallback(
         params=params,

@@ -44,9 +44,16 @@ def plot_metrics(metrics: list, output_path: str):
     x_labels = [f"R{r}\n(E{e})" for r, e in zip(rounds, epochs)]
     
     # ==================== 图表配置 ====================
-    # 6 个子图：5 个指标 + 1 个 total_score + score_gap + train_loss = 8 个
-    # 布局：4 行 2 列
-    fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+    # 检查是否有 training_metrics 数据
+    has_training_metrics = any(m.get('training_metrics', {}) for m in metrics)
+    
+    if has_training_metrics:
+        # 5 行 2 列 = 10 个子图
+        fig, axes = plt.subplots(5, 2, figsize=(16, 25))
+    else:
+        # 4 行 2 列 = 8 个子图
+        fig, axes = plt.subplots(4, 2, figsize=(16, 20))
+    
     fig.suptitle('DPO Training Metrics per Round', fontsize=18, fontweight='bold', y=0.98)
     
     # 颜色方案
@@ -54,6 +61,8 @@ def plot_metrics(metrics: list, output_path: str):
     loser_color = '#F44336'    # 红色 - Loser
     gap_color = '#4CAF50'      # 绿色 - Gap
     loss_color = '#FF9800'     # 橙色 - Loss
+    dpo_color = '#9C27B0'      # 紫色 - DPO Loss
+    acc_color = '#00BCD4'      # 青色 - Accuracy
     
     # ==================== 1. Surface Similarity ====================
     ax = axes[0, 0]
@@ -152,20 +161,39 @@ def plot_metrics(metrics: list, output_path: str):
     ax.set_xticks(x)
     ax.set_xticklabels(x_labels, fontsize=8)
     
-    # ==================== 8. Train Loss ====================
+    # ==================== 8. Train Loss + DPO Loss ====================
     ax = axes[3, 1]
+    # 总训练损失
     losses = [m.get('train_loss', None) for m in metrics]
     valid_idx = [i for i, l in enumerate(losses) if l is not None]
     valid_losses = [losses[i] for i in valid_idx]
     
-    if len(valid_losses) > 0:
-        ax.plot([x[i] for i in valid_idx], valid_losses, 'o-', 
-                color=loss_color, linewidth=2, markersize=6)
-        ax.fill_between([x[i] for i in valid_idx], valid_losses, 
-                        alpha=0.15, color=loss_color)
-        ax.set_title('Training Loss', fontsize=12, fontweight='bold')
+    # DPO 损失
+    dpo_losses = [m.get('training_metrics', {}).get('loss_dpo', None) for m in metrics]
+    valid_dpo_idx = [i for i, l in enumerate(dpo_losses) if l is not None]
+    valid_dpo_losses = [dpo_losses[i] for i in valid_dpo_idx]
+    
+    # 标准损失
+    std_losses = [m.get('training_metrics', {}).get('loss_std_on_winner', None) for m in metrics]
+    valid_std_idx = [i for i, l in enumerate(std_losses) if l is not None]
+    valid_std_losses = [std_losses[i] for i in valid_std_idx]
+    
+    has_any_loss = len(valid_losses) > 0 or len(valid_dpo_losses) > 0
+    
+    if has_any_loss:
+        if len(valid_losses) > 0:
+            ax.plot([x[i] for i in valid_idx], valid_losses, 'o-', 
+                    color=loss_color, linewidth=2, markersize=6, label='Total Loss')
+        if len(valid_dpo_losses) > 0:
+            ax.plot([x[i] for i in valid_dpo_idx], valid_dpo_losses, 's--', 
+                    color=dpo_color, linewidth=2, markersize=6, label='DPO Loss')
+        if len(valid_std_losses) > 0:
+            ax.plot([x[i] for i in valid_std_idx], valid_std_losses, '^:', 
+                    color='#607D8B', linewidth=2, markersize=6, label='Std Loss')
+        ax.set_title('Training Losses', fontsize=12, fontweight='bold')
         ax.set_ylabel('Loss')
         ax.set_xlabel('Round (Epoch)')
+        ax.legend()
         ax.grid(True, alpha=0.3)
         ax.set_xticks(x)
         ax.set_xticklabels(x_labels, fontsize=8)
@@ -173,7 +201,61 @@ def plot_metrics(metrics: list, output_path: str):
         ax.text(0.5, 0.5, 'No loss data available\n(Round 0 has no loss)', 
                 transform=ax.transAxes, ha='center', va='center',
                 fontsize=14, color='gray')
-        ax.set_title('Training Loss', fontsize=12, fontweight='bold')
+        ax.set_title('Training Losses', fontsize=12, fontweight='bold')
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, fontsize=8)
+    
+    # ==================== 9-10. DPO 训练指标 (如果有) ====================
+    if has_training_metrics:
+        # 9. Implicit Accuracy + DPO Weight
+        ax = axes[4, 0]
+        accs = [m.get('training_metrics', {}).get('implicit_acc', None) for m in metrics]
+        valid_acc_idx = [i for i, a in enumerate(accs) if a is not None]
+        valid_accs = [accs[i] for i in valid_acc_idx]
+        
+        weights = [m.get('training_metrics', {}).get('dpo_weight', None) for m in metrics]
+        valid_w_idx = [i for i, w in enumerate(weights) if w is not None]
+        valid_weights = [weights[i] for i in valid_w_idx]
+        
+        has_any = len(valid_accs) > 0 or len(valid_weights) > 0
+        if has_any:
+            if len(valid_accs) > 0:
+                ax.plot([x[i] for i in valid_acc_idx], valid_accs, 'o-', 
+                        color=acc_color, linewidth=2, markersize=6, label='Implicit Accuracy')
+            if len(valid_weights) > 0:
+                ax.plot([x[i] for i in valid_w_idx], valid_weights, 's--', 
+                        color='#E91E63', linewidth=2, markersize=6, label='DPO Weight')
+            ax.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5, label='50% baseline')
+            ax.set_ylim(-0.05, 1.05)
+            ax.legend()
+        ax.set_title('Implicit Accuracy & DPO Weight', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Value')
+        ax.set_xlabel('Round (Epoch)')
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, fontsize=8)
+        
+        # 10. Model vs Ref Loss Diff
+        ax = axes[4, 1]
+        model_diffs = [m.get('training_metrics', {}).get('model_loss_diff', None) for m in metrics]
+        ref_diffs = [m.get('training_metrics', {}).get('ref_loss_diff', None) for m in metrics]
+        valid_md_idx = [i for i, d in enumerate(model_diffs) if d is not None]
+        valid_rd_idx = [i for i, d in enumerate(ref_diffs) if d is not None]
+        
+        has_any = len(valid_md_idx) > 0 or len(valid_rd_idx) > 0
+        if has_any:
+            if len(valid_md_idx) > 0:
+                ax.plot([x[i] for i in valid_md_idx], [model_diffs[i] for i in valid_md_idx], 'o-', 
+                        color='#FF5722', linewidth=2, markersize=6, label='Model Diff (w-l)')
+            if len(valid_rd_idx) > 0:
+                ax.plot([x[i] for i in valid_rd_idx], [ref_diffs[i] for i in valid_rd_idx], 's--', 
+                        color='#795548', linewidth=2, markersize=6, label='Ref Diff (w-l)')
+            ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+            ax.legend()
+        ax.set_title('Model vs Ref Loss Diff', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Loss Diff')
+        ax.set_xlabel('Round (Epoch)')
+        ax.grid(True, alpha=0.3)
         ax.set_xticks(x)
         ax.set_xticklabels(x_labels, fontsize=8)
     
@@ -182,20 +264,25 @@ def plot_metrics(metrics: list, output_path: str):
     print(f"✅ 图表已保存到: {output_path}")
     
     # 同时打印数据摘要表格
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 110)
     print(f"{'Round':>6} {'Epoch':>6} {'Pairs':>6} {'W_Surf':>8} {'L_Surf':>8} "
-          f"{'W_Total':>8} {'L_Total':>8} {'Gap':>8} {'Loss':>10}")
-    print("-" * 90)
+          f"{'W_Total':>8} {'L_Total':>8} {'Gap':>8} {'Loss':>10} {'DPO_Loss':>10} {'Acc':>6}")
+    print("-" * 110)
     for m in metrics:
         loss_str = f"{m['train_loss']:.4f}" if m.get('train_loss') is not None else "N/A"
+        tm = m.get('training_metrics', {})
+        dpo_str = f"{tm['loss_dpo']:.4f}" if tm.get('loss_dpo') is not None else "N/A"
+        acc_str = f"{tm['implicit_acc']:.3f}" if tm.get('implicit_acc') is not None else "N/A"
         print(f"{m['round']:>6} {m['epoch']:>6} {m['num_pairs']:>6} "
               f"{m['winner'].get('sims_surf_target', 0):>8.4f} "
               f"{m['loser'].get('sims_surf_target', 0):>8.4f} "
               f"{m['winner'].get('total_score', 0):>8.3f} "
               f"{m['loser'].get('total_score', 0):>8.3f} "
               f"{m.get('score_gap', 0):>8.3f} "
-              f"{loss_str:>10}")
-    print("=" * 90)
+              f"{loss_str:>10} "
+              f"{dpo_str:>10} "
+              f"{acc_str:>6}")
+    print("=" * 110)
 
 
 def main():
