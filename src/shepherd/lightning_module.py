@@ -325,7 +325,15 @@ class LightningModule(pl.LightningModule):
 
             input_winner = self.get_training_input_dict(batch_winner)
             output_winner = self.forward_training(input_winner)
-            loss_std, _, _, _ = self.x1_denoising_loss(input_winner, output_winner)
+            loss_std_x1, _, _, _ = self.x1_denoising_loss(input_winner, output_winner)
+            
+            # 标准损失：x1 + x4（防止 x4 药效团解码器在 DPO 训练中退化）
+            loss_std = loss_std_x1
+            loss_std_x4 = torch.tensor(0.0, device=self.device)
+            if self.train_x4_denoising and 'x4' in input_winner:
+                loss_x4, _, _, _ = self.x4_denoising_loss(input_winner, output_winner)
+                loss_std = loss_std + loss_x4
+                loss_std_x4 = loss_x4
 
             loss_dpo, implicit_acc, model_diff, ref_diff = self.compute_dpo_loss(
                 batch_winner, batch_loser, shared_noise, shared_timestep
@@ -341,6 +349,8 @@ class LightningModule(pl.LightningModule):
             self.log('ref_loss_diff', ref_diff)
             self.log('loss_dpo', loss_dpo)
             self.log('loss_std_on_winner', loss_std)
+            self.log('loss_std_x1_on_winner', loss_std_x1)
+            self.log('loss_std_x4_on_winner', loss_std_x4)
             self.log('train_loss', loss)
             
             # 每隔一定步数打印DPO训练指标
@@ -350,7 +360,7 @@ class LightningModule(pl.LightningModule):
                 print(f"  学习率: {lr:.2e}")
                 print(f"  总损失: {loss:.4f}")
                 print(f"  DPO权重: {dpo_weight:.3f}")
-                print(f"  标准损失: {loss_std:.4f}")
+                print(f"  标准损失(x1+x4): {loss_std:.4f} (x1: {loss_std_x1:.4f}, x4: {loss_std_x4:.4f})")
                 print(f"  DPO损失: {loss_dpo:.4f}")
                 print(f"  隐式准确率: {implicit_acc:.3f}")
                 print(f"  模型损失差: {model_diff:.4f}")
