@@ -1484,6 +1484,71 @@ def main():
             self.pairs_history = []  # 存储每轮的偏好对列表
             self.max_rounds = 2  # 只保留最近两轮
             self.epoch_counter = 0  # 用于追踪采样次数
+            self.round_metrics = []  # 每轮指标记录
+            self.metrics_file = os.path.join(output_dir, 'dpo_round_metrics.json')  # 指标保存路径
+        
+        def _collect_and_save_metrics(self, pairs, epoch, train_loss=None):
+            """收集偏好对指标并保存到 JSON 文件"""
+            if len(pairs) == 0:
+                return
+            
+            # 收集所有 winner 和 loser 的指标
+            metric_keys = ['sa_score', 'logp', 'sims_surf_target', 'sims_esp_target', 'sims_pharm_target', 'total_score']
+            
+            winner_metrics = {k: [] for k in metric_keys}
+            loser_metrics = {k: [] for k in metric_keys}
+            
+            for pair in pairs:
+                # pair = (winner_mol, loser_mol, winner_scores_dict, loser_scores_dict)
+                w_scores = pair[2]
+                l_scores = pair[3]
+                for k in metric_keys:
+                    if k in w_scores:
+                        val = w_scores[k]
+                        if val is not None and val != float('-inf') and val != float('inf'):
+                            winner_metrics[k].append(float(val))
+                    if k in l_scores:
+                        val = l_scores[k]
+                        if val is not None and val != float('-inf') and val != float('inf'):
+                            loser_metrics[k].append(float(val))
+            
+            # 计算平均值
+            def safe_mean(vals):
+                return sum(vals) / len(vals) if len(vals) > 0 else 0.0
+            
+            winner_avg = {k: safe_mean(winner_metrics[k]) for k in metric_keys}
+            loser_avg = {k: safe_mean(loser_metrics[k]) for k in metric_keys}
+            
+            round_data = {
+                'round': self.epoch_counter,
+                'epoch': epoch,
+                'num_pairs': len(pairs),
+                'winner': winner_avg,
+                'loser': loser_avg,
+                'score_gap': winner_avg['total_score'] - loser_avg['total_score'],
+                'train_loss': train_loss,
+            }
+            
+            # 同时记录每对的详细数据
+            round_data['pairs_detail'] = []
+            for pair in pairs:
+                w_scores = pair[2]
+                l_scores = pair[3]
+                detail = {
+                    'winner': {k: float(w_scores.get(k, 0.0)) for k in metric_keys if k in w_scores},
+                    'loser': {k: float(l_scores.get(k, 0.0)) for k in metric_keys if k in l_scores},
+                }
+                round_data['pairs_detail'].append(detail)
+            
+            self.round_metrics.append(round_data)
+            
+            # 保存到 JSON
+            try:
+                with open(self.metrics_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.round_metrics, f, ensure_ascii=False, indent=2)
+                print(f"📊 指标已保存到: {self.metrics_file}")
+            except Exception as e:
+                print(f"⚠️  保存指标文件失败: {e}")
             
         def on_train_epoch_end(self, trainer, pl_module):
             """每个epoch结束时进行采样和评估，为下一个epoch准备数据
@@ -1531,6 +1596,14 @@ def main():
                     # 会重建DataLoader和DistributedSampler，使用更新后的数据集大小
                     self.dpo_dataset.update_preference_pairs(all_pairs)
                     print(f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 (保留{len(self.pairs_history)}轮, 将在下一epoch生效)")
+                    
+                    # 收集并保存本轮指标
+                    train_loss = None
+                    if 'train_loss' in trainer.callback_metrics:
+                        train_loss = float(trainer.callback_metrics['train_loss'].item())
+                    elif 'loss' in trainer.callback_metrics:
+                        train_loss = float(trainer.callback_metrics['loss'].item())
+                    self._collect_and_save_metrics(new_pairs, trainer.current_epoch, train_loss)
 
     sampling_callback = DPOSamplingCallback(
         params=params,
@@ -1538,6 +1611,10 @@ def main():
         dpo_dataset=dpo_dataset,
         molblocks_and_charges=molblocks_and_charges
     )
+    
+    # 记录初始偏好对的指标（round 0，训练前的采样）
+    if len(initial_pairs) > 0 and not is_ddp_subprocess:
+        sampling_callback._collect_and_save_metrics(initial_pairs, epoch=0, train_loss=None)
     
     callbacks = [checkpoint_callback, sampling_callback]
     print("✅ 回调配置完成")
