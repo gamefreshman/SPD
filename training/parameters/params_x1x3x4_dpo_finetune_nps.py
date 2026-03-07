@@ -50,7 +50,7 @@ params = {
         
         'lr': 0.00001,  # 降低学习率防止遗忘（1e-5）
         'min_lr': 0.000001,  # 最低 1e-6
-        'lr_steps': 1,
+        'lr_steps': 10000,  # 缓慢衰减，原值为1会导致学习率瞬间降到min_lr
         
         'gradient_clip_val': 5.0,
         
