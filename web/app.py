@@ -56,7 +56,7 @@ NAV_RADIO_KEY = "nav_radio"
 
 # ---------- 页面配置 ----------
 st.set_page_config(
-    page_title="SPD 分子生成与评估",
+    page_title="MolFlow 分子生成与评估",
     page_icon="🧪",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -89,7 +89,7 @@ def sidebar_nav() -> str:
     st.sidebar.markdown(
         '<div style="text-align:center; padding:0.5rem 0 1rem 0;">'
         f'<span style="font-size:{LAYOUT["sidebar_logo_emoji_size"]};">🧪</span><br/>'
-        f'<strong style="font-size:{LAYOUT["sidebar_logo_title_size"]}; color:{COLORS["primary"]};">SPD</strong><br/>'
+        f'<strong style="font-size:{LAYOUT["sidebar_logo_title_size"]}; color:{COLORS["primary"]};">MolFlow</strong><br/>'
         f'<span style="font-size:{LAYOUT["sidebar_subtitle_size"]}; color:{COLORS["subtitle_gray"]};">分子生成与评估平台</span>'
         '</div>',
         unsafe_allow_html=True,

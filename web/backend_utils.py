@@ -472,6 +472,29 @@ def _filter_receptor_pdbqt(pdbqt_bytes: bytes) -> bytes:
     return b"\n".join(lines) if lines else pdbqt_bytes
 
 
+def _is_mol_safe_for_docking(mol: Any) -> Tuple[bool, str]:
+    """
+    检查分子是否适合用于对接（无自由基、非片段），避免传入 meeko/vina 时触发 C++ 内部错误。
+    Returns:
+        (True, "") 可安全使用；(False, reason) 不宜对接。
+    """
+    try:
+        from rdkit import Chem
+        if mol is None:
+            return (False, "分子为空")
+        n_rad = sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms())
+        if n_rad > 0:
+            return (False, f"分子含有 {n_rad} 个自由基电子，无法安全对接，请使用无自由基的 SMILES。")
+        frags = Chem.GetMolFrags(mol, asMols=True)
+        if len(frags) > 1:
+            return (False, "分子为多片段，请使用单一连通分子。")
+        if mol.GetNumHeavyAtoms() == 0:
+            return (False, "分子无重原子，请使用有效配体 SMILES。")
+        return (True, "")
+    except Exception:
+        return (False, "分子检查异常")
+
+
 def run_docking(
     protein_bytes: bytes,
     ref_smi: str,
@@ -479,17 +502,17 @@ def run_docking(
     vina_module_path: str,
 ) -> Tuple[bool, Any]:
     """
-    执行分子对接：写入临时蛋白文件、加载 vina 模块、计算对接分数。
+    执行分子对接：写入临时蛋白文件，在子进程中调用 vina 计算对接分数。
+    子进程隔离 meeko/vina 的 C++ 异常（如 internal_error），避免主进程被 Aborted 拖垮。
     Returns:
         (True, score_float) 成功；(False, error_message_str) 失败。
     """
-    import sys
+    import subprocess
     import tempfile
-    import importlib.util
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem
-        # 先在同一解释器下检测 meeko / vina，避免与 Streamlit 所用 Python 不一致
+        # 本进程内只做依赖检测与配体/参考分子校验，不加载 vina/meeko，减少主进程崩溃风险
         try:
             import meeko  # noqa: F401
             import vina   # noqa: F401
@@ -505,46 +528,77 @@ def run_docking(
                 f"对接依赖未在当前 Python 中安装。当前解释器: {cur}；错误: {e}。"
                 f"请在该环境下执行: {cmd}"
             )
-        spec = importlib.util.spec_from_file_location("vina_dock", vina_module_path)
-        if spec is None or spec.loader is None:
-            return (False, "无法加载对接模块")
-        vina_dock = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(vina_dock)
-        except ImportError as e:
-            err = str(e)
-            cur = getattr(sys, "executable", "python")
-            if "meeko" in err or "vina" in err:
-                return (
-                    False,
-                    f"加载对接模块失败: {err}。请确认与 Streamlit 使用同一 Python，并执行: {cur} -m pip install meeko vina"
-                )
-            return (False, err)
+        lig_mol = Chem.MolFromSmiles(lig_smi)
+        if not lig_mol:
+            return (False, "配体 SMILES 无效。")
+        lig_mol = Chem.AddHs(lig_mol)
+        AllChem.EmbedMolecule(lig_mol, AllChem.ETKDG())
+        ref_mol = None
+        if ref_smi and ref_smi.strip():
+            ref_mol = Chem.MolFromSmiles(ref_smi.strip())
+            if ref_mol:
+                ref_mol = Chem.AddHs(ref_mol)
+                AllChem.EmbedMolecule(ref_mol, AllChem.ETKDG())
+        if ref_mol is None:
+            ref_mol = lig_mol
+        ok_lig, err_lig = _is_mol_safe_for_docking(lig_mol)
+        if not ok_lig:
+            return (False, "配体: " + err_lig)
+        ok_ref, err_ref = _is_mol_safe_for_docking(ref_mol)
+        if not ok_ref:
+            return (False, "参考分子: " + err_ref)
+
         protein_clean = _filter_receptor_pdbqt(protein_bytes)
         with tempfile.NamedTemporaryFile(suffix=".pdbqt", delete=False) as f:
             f.write(protein_clean)
             protein_path = f.name
         try:
-            ref_mol = None
-            if ref_smi and ref_smi.strip():
-                ref_mol = Chem.MolFromSmiles(ref_smi.strip())
-                if ref_mol:
-                    ref_mol = Chem.AddHs(ref_mol)
-                    AllChem.EmbedMolecule(ref_mol, AllChem.ETKDG())
-            lig_mol = Chem.MolFromSmiles(lig_smi)
-            if not lig_mol:
-                return (False, "配体 SMILES 无效。")
-            lig_mol = Chem.AddHs(lig_mol)
-            AllChem.EmbedMolecule(lig_mol, AllChem.ETKDG())
-            if ref_mol is None:
-                ref_mol = lig_mol
-            score = vina_dock.vina_score(lig_mol, protein_path, ref_mol)
-            return (True, float(score))
+            subprocess_script = os.path.join(_WEB_DIR, "run_docking_subprocess.py")
+            if not os.path.isfile(subprocess_script):
+                return (False, "未找到对接子进程脚本 run_docking_subprocess.py")
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".score", delete=False) as sf:
+                score_file = sf.name
+            try:
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        subprocess_script,
+                        protein_path,
+                        ref_smi or "",
+                        lig_smi,
+                        vina_module_path,
+                        score_file,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=_PROJECT_ROOT,
+                )
+                if proc.returncode == 0 and os.path.isfile(score_file):
+                    try:
+                        with open(score_file, "r") as f:
+                            score = float(f.read().strip())
+                        return (True, score)
+                    except (ValueError, OSError):
+                        pass
+            finally:
+                try:
+                    os.unlink(score_file)
+                except Exception:
+                    pass
+            err_msg = (proc.stderr or proc.stdout or "").strip() or "对接异常退出，请检查配体/蛋白是否合理。"
+            if proc.returncode == 0:
+                err_msg = "子进程未写入有效分数，请检查配体/蛋白或重试。"
+            elif proc.returncode == 134 or "Aborted" in err_msg or "internal_error" in err_msg:
+                err_msg = "对接过程异常退出（可能为配体或蛋白不兼容导致依赖库内部错误）。请尝试更换配体 SMILES 或蛋白文件，并确保分子无自由基、非片段。"
+            return (False, err_msg)
         finally:
             try:
                 os.unlink(protein_path)
             except Exception:
                 pass
+    except subprocess.TimeoutExpired:
+        return (False, "对接超时（120 秒）")
     except Exception as e:
         return (False, str(e))
 
