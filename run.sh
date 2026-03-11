@@ -17,6 +17,7 @@ nohup python DPO2.py params_x1x3x4_dpo_finetune_pdb 0 > logs/dpo_pdb.log 2>&1 &
 
 nohup python DPO3.py params_x1x3x4_dpo_fragment_merging 0 > logs/dpo_fragment_merging.log 2>&1 & 
 
+nohup python DPO2_0_surfOnly.py params_x1x3x4_dpo_finetune_nps 0 > logs/dpo_surfOnly.log 2>&1 &
 ---
 
 cd /home1/zhh/workspace/SPD/evaluation/experiment
