@@ -66,7 +66,18 @@ class LightningModule(pl.LightningModule):
         # 调用父类（torch.nn.Module）的 load_state_dict 方法，但强制 strict=False
         # 这样可以加载所有匹配的权重，并静默地忽略不匹配的权重（例如 x3_decoder 的权重）。
         print("正在以非严格模式加载模型状态，将忽略检查点中不匹配的键...")
-        return super().load_state_dict(state_dict, strict=False)
+        result = super().load_state_dict(state_dict, strict=False)
+        
+        # 【关键修复】将已加载的预训练权重同步到 ref_model
+        # DPO 要求 ref_model 是微调前的模型副本，用于 KL 约束
+        if self.enable_dpo and hasattr(self, 'ref_model'):
+            self.ref_model.load_state_dict(self.model.state_dict())
+            self.ref_model.eval()
+            for param in self.ref_model.parameters():
+                param.requires_grad = False
+            print("✅ ref_model 已同步为预训练模型的权重副本（DPO KL 基准）")
+        
+        return result
     
     
     def configure_optimizers(self):
@@ -558,7 +569,7 @@ class LightningModule(pl.LightningModule):
             
             # DPO核心公式：鼓励 model_diff < ref_diff
             # beta_dpo 控制与参考模型的偏离程度（越大越保守）
-            inside_term_cont = -0.5 * self.beta_dpo * (model_diff_cont - ref_diff_cont)
+            inside_term_cont = -self.beta_dpo * (model_diff_cont - ref_diff_cont)
             loss_dpo_continuous = -torch.log(torch.sigmoid(inside_term_cont) + 1e-8)
             
             # 记录连续特征的准确率（模型在winner上损失更小 → 正确）
@@ -588,7 +599,7 @@ class LightningModule(pl.LightningModule):
             # 应用相同的DPO公式到离散特征
             model_diff_disc = model_loss_w_disc - model_loss_l_disc
             ref_diff_disc = ref_loss_w_disc - ref_loss_l_disc
-            inside_term_disc = -0.5 * self.beta_dpo * (model_diff_disc - ref_diff_disc)
+            inside_term_disc = -self.beta_dpo * (model_diff_disc - ref_diff_disc)
             loss_dpo_discrete = -torch.log(torch.sigmoid(inside_term_disc) + 1e-8)
             
             # 记录离散特征的准确率
