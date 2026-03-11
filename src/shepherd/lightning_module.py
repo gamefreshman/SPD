@@ -364,6 +364,17 @@ class LightningModule(pl.LightningModule):
             self.log('loss_std_x4_on_winner', loss_std_x4)
             self.log('train_loss', loss)
             
+            # 【修复】缓存 DPO 指标到模块上，确保 callback 可以可靠读取
+            self._last_dpo_metrics = {
+                'train_loss': float(loss.item()),
+                'loss_dpo': float(loss_dpo.item()),
+                'loss_std_on_winner': float(loss_std.item()),
+                'implicit_acc': float(implicit_acc.item()),
+                'dpo_weight': float(dpo_weight),
+                'model_loss_diff': float(model_diff.item()),
+                'ref_loss_diff': float(ref_diff.item()),
+            }
+            
             # 每隔一定步数打印DPO训练指标
             if batch_idx % 50 == 0:
                 lr = self.optimizers().param_groups[0]['lr']

@@ -1056,7 +1056,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             winner_score = winner['total_score']
             loser_score = loser['total_score']
             score_gap = winner_score - loser_score
-            min_gap = params.get('dpo', {}).get('min_score_gap', 0.3)
+            min_gap = params.get('dpo', {}).get('min_score_gap', 0.05)  # 【修复】默认值降低到 0.05
             
             if score_gap >= min_gap:
                 winner_mol = create_rdkit_molecule(winner['sample'])
@@ -1322,7 +1322,7 @@ def main():
             self.dpo_dataset = dpo_dataset  # 直接引用DPO数据集
             self.molblocks_and_charges = molblocks_and_charges
             self.pairs_history = []  # 存储每轮的偏好对列表
-            self.max_rounds = 2  # 只保留最近两轮
+            self.max_rounds = 4  # 【修复】保留最近 4 轮（原来 2 轮太少）
             self.epoch_counter = 0  # 用于追踪采样次数
             self.round_metrics = []  # 每轮指标记录
             self.metrics_file = os.path.join(output_dir, 'dpo_round_metrics.json')  # 指标保存路径
@@ -1445,17 +1445,10 @@ def main():
                     self.dpo_dataset.update_preference_pairs(all_pairs)
                     print(f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 (保留{len(self.pairs_history)}轮, 将在下一epoch生效)")
                     
-                    # 收集训练损失和 DPO 相关指标
+                    # 【修复】从 pl_module._last_dpo_metrics 读取（不再依赖 callback_metrics）
                     train_loss_dict = {}
-                    # 遍历所有 callback_metrics，收集所有可用的训练指标
-                    for key in ['train_loss', 'loss_dpo', 'loss_std_on_winner', 
-                                'implicit_acc', 'dpo_weight', 'model_loss_diff', 'ref_loss_diff']:
-                        if key in trainer.callback_metrics:
-                            try:
-                                val = trainer.callback_metrics[key]
-                                train_loss_dict[key] = float(val.item() if hasattr(val, 'item') else val)
-                            except Exception:
-                                pass
+                    if hasattr(pl_module, '_last_dpo_metrics') and pl_module._last_dpo_metrics:
+                        train_loss_dict = pl_module._last_dpo_metrics.copy()
                     
                     train_loss = train_loss_dict.get('train_loss', None)
                     self._collect_and_save_metrics(new_pairs, trainer.current_epoch, train_loss, train_loss_dict)
@@ -1527,8 +1520,18 @@ def main():
         print(f"\n✅ 发现当前任务checkpoint: {ckpt_path}")
         print(f"   将继续当前任务的训练")
         resume_ckpt_path = ckpt_path
-        # 恢复训练时，模型权重会被Trainer自动加载，这里只需初始化
-        model_pl = LightningModule(params)
+        # 【修复】使用 load_from_checkpoint 而非随机初始化
+        # 这样 load_state_dict 会被调用，ref_model 会自动同步
+        try:
+            model_pl = LightningModule.load_from_checkpoint(
+                ckpt_path, 
+                params=params, 
+                strict=False
+            )
+            print("   ✅ 从 checkpoint 加载模型权重成功")
+        except Exception as e:
+            print(f"   ⚠️ 加载 checkpoint 失败: {e}，回退到随机初始化")
+            model_pl = LightningModule(params)
         
         # 备份当前checkpoint (仅主进程)
         if trainer.global_rank == 0:
