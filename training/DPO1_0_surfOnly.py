@@ -1541,12 +1541,10 @@ def main():
         print(f"\n✅ 发现当前任务checkpoint: {ckpt_path}")
         print(f"   将继续当前任务的训练")
         resume_ckpt_path = ckpt_path
-        # 【修复】使用 load_from_checkpoint 而非随机初始化
-        # 这样 load_state_dict 会被调用，ref_model 会自动同步
         try:
             model_pl = LightningModule.load_from_checkpoint(
-                ckpt_path, 
-                params=params, 
+                ckpt_path,
+                params=params,
                 strict=False
             )
             print("   ✅ 从 checkpoint 加载模型权重成功")

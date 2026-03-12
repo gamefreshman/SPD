@@ -84,13 +84,10 @@ class LightningModule(pl.LightningModule):
     
     
     def configure_optimizers(self):
-        # 排除 ref_model 的参数：其 requires_grad=False 不会更新，
-        # 但 Adam 仍会为其分配一阶/二阶矩状态占用额外内存
-        trainable_params = [
-            p for name, p in self.named_parameters()
-            if not name.startswith('ref_model.')
-        ]
-        optimizer = torch.optim.Adam(trainable_params, lr=self.lr)
+        # 传入全部参数（包含 ref_model）以保证 checkpoint optimizer state 兼容性。
+        # ref_model 的参数已设置 requires_grad=False，Adam 在 step() 时会因
+        # grad 为 None 而自动跳过，不会实际更新，仅占用 m/v 的额外显存。
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         
         # exponential lr decay from self.lr to self.min_lr in self.lr_steps steps
         gamma = (self.min_lr / self.lr) ** (1.0 / self.lr_steps)

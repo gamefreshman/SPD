@@ -1230,8 +1230,16 @@ def main():
         print(f"\n✅ 发现当前任务checkpoint: {ckpt_path}")
         print(f"   将继续当前任务的训练")
         resume_ckpt_path = ckpt_path
-        # 恢复训练时，模型权重会被Trainer自动加载，这里只需初始化
-        model_pl = LightningModule(params)
+        try:
+            model_pl = LightningModule.load_from_checkpoint(
+                ckpt_path,
+                params=params,
+                strict=False
+            )
+            print("   ✅ 从 checkpoint 加载模型权重成功")
+        except Exception as e:
+            print(f"   ⚠️ 加载 checkpoint 失败: {e}，回退到随机初始化")
+            model_pl = LightningModule(params)
         
         # 备份当前checkpoint (仅主进程)
         if trainer.global_rank == 0:
