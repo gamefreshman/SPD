@@ -36,3 +36,5 @@ nohup python sample_fragment.py > fragDPO.log 2>&1 &
 git fetch origin new-clean-branch
 
 python visualize_dpo_metrics.py /home1/zhh/workspace/SPD/training/jobs/33/x1x3x4_dpo_finetune_nps/dpo_round_metrics.json --output dpo_metrics.png
+
+pkill -f nohup
