@@ -1565,7 +1565,12 @@ def main():
             DistributedSampler的total_size与实际数据集大小不一致的断言错误。
             reload_dataloaders_every_n_epochs=1会在下一个epoch开始时重建DataLoader。
             """
-            if trainer.current_epoch % params['training'].get('dpo_sampling_every_n_epochs', 1) != 0:
+            # 【修复】跳过 epoch 0（初始采样刚结束，还没像样地训练）
+            sampling_interval = params['training'].get('dpo_sampling_every_n_epochs', 5)
+            if trainer.current_epoch == 0:
+                print(f"  ⏩ 跳过 epoch 0 的重新采样（待训练 {sampling_interval} 个 epoch 后再采样）")
+                return
+            if trainer.current_epoch % sampling_interval != 0:
                 return
             
             if trainer.global_rank == 0:  # 只在主进程执行
@@ -1605,19 +1610,30 @@ def main():
                     self.dpo_dataset.update_preference_pairs(all_pairs)
                     print(f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 (保留{len(self.pairs_history)}轮, 将在下一epoch生效)")
                     
-                    # 收集训练损失和 DPO 相关指标
+                    # 从 pl_module._last_dpo_metrics 读取 DPO 训练指标
+                    # 【修复】优先读取模块缓存（每个 training_step 都会更新），
+                    # 这比 trainer.callback_metrics 更可靠
                     train_loss_dict = {}
-                    # 遍历所有 callback_metrics，收集所有可用的训练指标
-                    for key in ['train_loss', 'loss_dpo', 'loss_std_on_winner', 
-                                'implicit_acc', 'dpo_weight', 'model_loss_diff', 'ref_loss_diff']:
-                        if key in trainer.callback_metrics:
-                            try:
-                                val = trainer.callback_metrics[key]
-                                train_loss_dict[key] = float(val.item() if hasattr(val, 'item') else val)
-                            except Exception:
-                                pass
+                    
+                    # 优先读取模块缓存（每个 training_step 都会更新）
+                    cached = getattr(pl_module, '_last_dpo_metrics', {})
+                    if cached:
+                        train_loss_dict = cached.copy()
+                    
+                    # 如果缓存为空，再尝试从 trainer.callback_metrics 读取
+                    if not train_loss_dict:
+                        cb_metrics = trainer.callback_metrics
+                        for key in ['train_loss', 'loss_dpo', 'loss_std_on_winner',
+                                    'implicit_acc', 'dpo_weight', 'model_loss_diff', 'ref_loss_diff']:
+                            if key in cb_metrics:
+                                try:
+                                    val = cb_metrics[key]
+                                    train_loss_dict[key] = float(val.item() if hasattr(val, 'item') else val)
+                                except Exception:
+                                    pass
                     
                     train_loss = train_loss_dict.get('train_loss', None)
+                    print(f"  📊 保存指标: train_loss={train_loss}, keys={list(train_loss_dict.keys())}")
                     self._collect_and_save_metrics(new_pairs, trainer.current_epoch, train_loss, train_loss_dict)
 
     sampling_callback = DPOSamplingCallback(
