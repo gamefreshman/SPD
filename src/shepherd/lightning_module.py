@@ -81,10 +81,7 @@ class LightningModule(pl.LightningModule):
     
     
     def configure_optimizers(self):
-        # 【修复】只对可训练参数创建 optimizer，避免冻结参数占用 Adam 状态内存
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-        print(f"\n⚙️ Optimizer: 可训练参数 {len(trainable_params)} 个张量, lr={self.lr}")
-        optimizer = torch.optim.Adam(trainable_params, lr=self.lr)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         
         # exponential lr decay from self.lr to self.min_lr in self.lr_steps steps
         gamma = (self.min_lr / self.lr) ** (1.0 / self.lr_steps)

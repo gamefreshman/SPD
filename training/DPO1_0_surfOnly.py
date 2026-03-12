@@ -472,15 +472,19 @@ def create_dataset(params, molblocks_and_charges, marginals):
 
 
 def create_dpo_dataloader(params, dataset, dpo_dataset):
-    """创建DPO DataLoader（使用自定义 collate_fn）"""
-    print("🎯 创建 DPO DataLoader (collate_fn=collate_dpo_batch)...")
+    """创建DPO DataLoader（使用标准 torch DataLoader + 自定义 collate_fn）
     
-    train_loader = torch_geometric.loader.DataLoader(
+    注意：必须使用 torch.utils.data.DataLoader 而非 PyG DataLoader，
+    因为 PyG DataLoader 会覆盖 collate_fn 为其内部的 Collater。
+    """
+    print("🎯 创建 DPO DataLoader (使用 torch DataLoader + collate_dpo_batch)...")
+    
+    train_loader = torch.utils.data.DataLoader(
         dataset=dpo_dataset,
         num_workers=0,
         batch_size=params['training']['batch_size'],
         shuffle=True,
-        collate_fn=collate_dpo_batch,  # 【关键修复】确保 DPO dict 被正确 batch 化
+        collate_fn=collate_dpo_batch,  # 【关键】确保 DPO dict 被正确 batch 化
     )
     
     return train_loader
@@ -1404,7 +1408,12 @@ def main():
             DistributedSampler的total_size与实际数据集大小不一致的断言错误。
             reload_dataloaders_every_n_epochs=1会在下一个epoch开始时重建DataLoader。
             """
-            if trainer.current_epoch % params['training'].get('dpo_sampling_every_n_epochs', 10) != 0:
+            # 【修复】跳过 epoch 0（初始采样刚结束，还没像样地训练）
+            sampling_interval = params['training'].get('dpo_sampling_every_n_epochs', 10)
+            if trainer.current_epoch == 0:
+                print(f"  ⏩ 跳过 epoch 0 的重新采样（待训练 {sampling_interval} 个 epoch 后再采样）")
+                return
+            if trainer.current_epoch % sampling_interval != 0:
                 return
             
             if trainer.global_rank == 0:  # 只在主进程执行
