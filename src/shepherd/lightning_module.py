@@ -238,20 +238,22 @@ class LightningModule(pl.LightningModule):
     
     def training_step(self, train_batch, batch_idx):
 
-        if isinstance(train_batch, dict) and 'batch_type' in train_batch:
-            
-            batch_type = train_batch['batch_type']
-        
+        # 【防弹化】DPO batch 检测：优先检查 winner/loser 键是否存在
+        # 不再仅依赖 batch_type 字符串（collation 可能将其变为列表）
+        if isinstance(train_batch, dict) and 'winner' in train_batch and 'loser' in train_batch:
+            batch_type = 'dpo'
+        elif isinstance(train_batch, dict) and train_batch.get('batch_type') == 'dpo':
+            batch_type = 'dpo'
         else:
-            
             batch_type = 'standard'
         
-        # 【调试】首次训练时打印 batch_type，确认数据流正确
-        if batch_idx == 0 and self.current_epoch == 0:
-            print(f"\n📊 [DEBUG] training_step: batch_type={batch_type}, "
-                  f"train_batch type={type(train_batch).__name__}")
-            if isinstance(train_batch, dict):
-                print(f"   keys={list(train_batch.keys())}")
+        # 【调试】每个 epoch 首步打印 batch_type（不再限制 epoch 0）
+        if batch_idx == 0:
+            bt_raw = train_batch.get('batch_type', 'N/A') if isinstance(train_batch, dict) else 'N/A'
+            keys = list(train_batch.keys()) if isinstance(train_batch, dict) else 'not_dict'
+            print(f"\n📊 [DEBUG] Epoch {self.current_epoch}, Step 0: "
+                  f"batch_type={batch_type}, raw_bt={bt_raw}, "
+                  f"type={type(train_batch).__name__}, keys={keys}")
         if batch_type == 'standard':
 
             data = train_batch

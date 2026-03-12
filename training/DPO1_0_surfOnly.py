@@ -1395,6 +1395,7 @@ def main():
             
             # 保存到 JSON
             try:
+                os.makedirs(os.path.dirname(self.metrics_file), exist_ok=True)
                 with open(self.metrics_file, 'w', encoding='utf-8') as f:
                     json.dump(self.round_metrics, f, ensure_ascii=False, indent=2)
                 print(f"📊 指标已保存到: {self.metrics_file}")
