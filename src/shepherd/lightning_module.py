@@ -42,6 +42,9 @@ class LightningModule(pl.LightningModule):
         self.beta_dpo = params['training'].get('beta_dpo', 0.2)
         self.dpo_ramp_up_epochs = params['training'].get('dpo_ramp_up_epochs', 5)
         self.dpo_max_weight = params['training'].get('dpo_max_weight', 0.5)
+
+        # 缓存最近一步的 DPO 训练指标，供 callback 在 epoch_end 读取
+        self._last_dpo_metrics = {}
         
     def get_dpo_weight(self):
         if not self.enable_dpo:
@@ -81,7 +84,13 @@ class LightningModule(pl.LightningModule):
     
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        # 排除 ref_model 的参数：其 requires_grad=False 不会更新，
+        # 但 Adam 仍会为其分配一阶/二阶矩状态占用额外内存
+        trainable_params = [
+            p for name, p in self.named_parameters()
+            if not name.startswith('ref_model.')
+        ]
+        optimizer = torch.optim.Adam(trainable_params, lr=self.lr)
         
         # exponential lr decay from self.lr to self.min_lr in self.lr_steps steps
         gamma = (self.min_lr / self.lr) ** (1.0 / self.lr_steps)
@@ -354,8 +363,11 @@ class LightningModule(pl.LightningModule):
                 loss_std = loss_std + loss_x4
                 loss_std_x4 = loss_x4
 
+            # 传入已计算好的 input_winner/output_winner，避免在 compute_dpo_loss 内再次前向计算 winner
             loss_dpo, implicit_acc, model_diff, ref_diff = self.compute_dpo_loss(
-                batch_winner, batch_loser, shared_noise, shared_timestep
+                batch_winner, batch_loser, shared_noise, shared_timestep,
+                input_winner_precomputed=input_winner,
+                output_model_winner_precomputed=output_winner,
             )
 
             dpo_weight = self.get_dpo_weight()
@@ -506,7 +518,8 @@ class LightningModule(pl.LightningModule):
         
         return loss, feature_loss, pos_loss, direction_loss
         
-    def compute_dpo_loss(self, batch_winner, batch_loser, shared_noise, shared_timestep):
+    def compute_dpo_loss(self, batch_winner, batch_loser, shared_noise, shared_timestep,
+                         input_winner_precomputed=None, output_model_winner_precomputed=None):
         """
         计算DPO (Direct Preference Optimization) 损失
         
@@ -523,6 +536,8 @@ class LightningModule(pl.LightningModule):
             batch_loser: 评分较低的分子批次数据
             shared_noise: 共享的噪声（由 dataset 端通过 seed 机制保证）
             shared_timestep: 共享的时间步（由 dataset 端保证 winner/loser 使用相同值）
+            input_winner_precomputed: training_step 中已计算好的 winner 输入字典（避免重复前向）
+            output_model_winner_precomputed: training_step 中已计算好的 winner 模型输出（避免重复前向）
             
         Returns:
             loss_dpo_total: 总的DPO损失
@@ -531,12 +546,18 @@ class LightningModule(pl.LightningModule):
             ref_diff: 参考模型在winner和loser上的损失差异（连续+离散）
         """
         
-        # 准备输入数据
-        input_winner = self.get_training_input_dict(batch_winner)
+        # 准备输入数据：若调用方已预计算 winner，直接复用，避免二次前向
+        if input_winner_precomputed is not None:
+            input_winner = input_winner_precomputed
+        else:
+            input_winner = self.get_training_input_dict(batch_winner)
         input_loser = self.get_training_input_dict(batch_loser)
 
-        # 获取当前模型的预测
-        output_model_winner = self.model.forward(input_winner)[1]
+        # 获取当前模型的预测：若调用方已预计算 winner 输出，直接复用
+        if output_model_winner_precomputed is not None:
+            output_model_winner = output_model_winner_precomputed
+        else:
+            output_model_winner = self.model.forward(input_winner)[1]
         output_model_loser = self.model.forward(input_loser)[1] 
 
         # 获取参考模型（冻结的初始模型）的预测

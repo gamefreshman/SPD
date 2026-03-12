@@ -279,21 +279,42 @@ class DPODataset(Dataset):
             data_dict['x2'] = x2_data
         
         # === x3模态：使用真实的get_x3_data方法（如果启用）===
-        if self.params['dataset'].get('compute_x3', False) and 'x2' in data_dict:
-            # x3依赖于x2的表面点
-            # 使用零电荷作为默认值（如果没有提供电荷信息）
+        if self.params['dataset'].get('compute_x3', False):
+            from shepherd.shepherd_score_utils.generate_point_cloud import get_atomic_vdw_radii
             charges = np.zeros(mol.GetNumAtoms())
             charge_centers = mol_coordinates
-            
+            num_points_x3 = self.params['dataset']['x3']['num_points']
+            radii_x3 = get_atomic_vdw_radii(mol)
+
+            # x3 需要先生成表面点云（与 x2 相同步骤），再计算静电势
+            # 独立于 compute_x2，不依赖 data_dict['x2']
+            x3_surface_data, x3_pos, x3_virtual_node_mask = self.data_generator.get_x2_data(
+                radii=radii_x3,
+                atom_centers=charge_centers,
+                num_points=num_points_x3,
+                recenter=self.params['dataset']['x3']['recenter'],
+                add_virtual_node=self.params['dataset']['x3']['add_virtual_node'],
+                remove_noise_COM=self.params['dataset']['x3']['remove_noise_COM'],
+                t=timestep,
+                alpha_dash_t=alpha_dash_t,
+                sigma_dash_t=sigma_dash_t,
+                virtual_node_pos=None
+            )
+            # 在 x3_surface_data 基础上叠加静电势特征
             x3_data = self.data_generator.get_x3_data_electrostatics_only(
                 charges=charges,
                 charge_centers=charge_centers,
-                data=data_dict['x2'],
-                pos=data_dict['x2']['pos'],
+                data=x3_surface_data,
+                pos=x3_pos,
                 t=timestep,
                 alpha_dash_t=alpha_dash_t,
                 sigma_dash_t=sigma_dash_t
             )
+            # 补充噪声调度参数
+            x3_data['alpha_t'] = torch.tensor([alpha_t], dtype=torch.float)
+            x3_data['sigma_t'] = torch.tensor([sigma_t], dtype=torch.float)
+            x3_data['alpha_dash_t'] = torch.tensor([alpha_dash_t], dtype=torch.float)
+            x3_data['sigma_dash_t'] = torch.tensor([sigma_dash_t], dtype=torch.float)
             data_dict['x3'] = x3_data
         
         # === x4模态：使用真实的get_x4_data方法（如果启用）===

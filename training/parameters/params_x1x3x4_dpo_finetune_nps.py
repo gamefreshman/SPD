@@ -81,6 +81,7 @@ params = {
         # checkpoint和采样控制
         'dpo_skip_first_epoch': False,  # 从epoch 0就开始采样
         'dpo_load_weights_only': True,  # 从旧checkpoint只加载权重
+        'dpo_sampling_every_n_epochs': 5,  # 每5个epoch重新采样偏好对（防止小数据集过拟合）
         
         # 预训练模型路径（从MOSES_aq模型开始微调）
         'pretrained_checkpoint_path': '/home1/zhh/workspace/SPD/evaluation/ckpt/last_33epoch.ckpt',
