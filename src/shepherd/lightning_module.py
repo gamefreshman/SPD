@@ -81,7 +81,10 @@ class LightningModule(pl.LightningModule):
     
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr = self.lr)
+        # 【修复】只对可训练参数创建 optimizer，避免冻结参数占用 Adam 状态内存
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        print(f"\n⚙️ Optimizer: 可训练参数 {len(trainable_params)} 个张量, lr={self.lr}")
+        optimizer = torch.optim.Adam(trainable_params, lr=self.lr)
         
         # exponential lr decay from self.lr to self.min_lr in self.lr_steps steps
         gamma = (self.min_lr / self.lr) ** (1.0 / self.lr_steps)
@@ -245,7 +248,13 @@ class LightningModule(pl.LightningModule):
         else:
             
             batch_type = 'standard'
-
+        
+        # 【调试】首次训练时打印 batch_type，确认数据流正确
+        if batch_idx == 0 and self.current_epoch == 0:
+            print(f"\n📊 [DEBUG] training_step: batch_type={batch_type}, "
+                  f"train_batch type={type(train_batch).__name__}")
+            if isinstance(train_batch, dict):
+                print(f"   keys={list(train_batch.keys())}")
         if batch_type == 'standard':
 
             data = train_batch

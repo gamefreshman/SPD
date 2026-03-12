@@ -49,7 +49,7 @@ from lightning_fabric.utilities.seed import seed_everything
 from shepherd.model.model import Model
 from shepherd.lightning_module import LightningModule
 from shepherd.new_datasets import HeteroDataset
-from shepherd.dpo_dataset import DPODataset
+from shepherd.dpo_dataset import DPODataset, collate_dpo_batch
 from shepherd.inference import inference_sample
 from shepherd.extract import create_rdkit_molecule
 from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
@@ -472,16 +472,15 @@ def create_dataset(params, molblocks_and_charges, marginals):
 
 
 def create_dpo_dataloader(params, dataset, dpo_dataset):
-    """创建纯DPO DataLoader（不混合标准数据）"""
-    print("🎯 创建纯DPO DataLoader...")
+    """创建DPO DataLoader（使用自定义 collate_fn）"""
+    print("🎯 创建 DPO DataLoader (collate_fn=collate_dpo_batch)...")
     
-    # DPO训练使用num_workers=0避免多进程缓存问题
-    # 当preference_pairs动态更新时，多进程worker不会同步更新
     train_loader = torch_geometric.loader.DataLoader(
         dataset=dpo_dataset,
-        num_workers=0,  # 避免多进程缓存导致的索引越界
+        num_workers=0,
         batch_size=params['training']['batch_size'],
         shuffle=True,
+        collate_fn=collate_dpo_batch,  # 【关键修复】确保 DPO dict 被正确 batch 化
     )
     
     return train_loader
@@ -1405,7 +1404,7 @@ def main():
             DistributedSampler的total_size与实际数据集大小不一致的断言错误。
             reload_dataloaders_every_n_epochs=1会在下一个epoch开始时重建DataLoader。
             """
-            if trainer.current_epoch % params['training'].get('dpo_sampling_every_n_epochs', 1) != 0:
+            if trainer.current_epoch % params['training'].get('dpo_sampling_every_n_epochs', 10) != 0:
                 return
             
             if trainer.global_rank == 0:  # 只在主进程执行
