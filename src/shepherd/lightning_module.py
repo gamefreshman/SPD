@@ -346,17 +346,10 @@ class LightningModule(pl.LightningModule):
                 return torch.tensor(0.0, device=self.device, requires_grad=True)
             
             # 检查batch是否有有效的x1数据
-            has_x1 = hasattr(batch_winner, 'x1')
-            x1_val = batch_winner['x1'] if has_x1 else None
-            if not has_x1 or x1_val is None:
-                # 打印详细诊断
+            # 【根因修复】hasattr() 在 HeteroDataBatch 上不可靠，必须用 node_types 检查
+            if 'x1' not in getattr(batch_winner, 'node_types', []):
                 print(f"⚠️ [DPO] Epoch {self.current_epoch} Step {batch_idx}: "
-                      f"x1 检查失败! has_x1={has_x1}, x1_val={x1_val}")
-                print(f"   batch_winner type={type(batch_winner).__name__}")
-                if hasattr(batch_winner, 'node_types'):
-                    print(f"   node_types={batch_winner.node_types}")
-                if hasattr(batch_winner, 'keys'):
-                    print(f"   keys={list(batch_winner.keys())[:10]}")
+                      f"x1 不在 node_types 中! node_types={getattr(batch_winner, 'node_types', 'N/A')}")
                 return torch.tensor(0.0, device=self.device, requires_grad=True)
 
             try:
