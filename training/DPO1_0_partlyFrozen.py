@@ -46,7 +46,7 @@ from lightning_fabric.utilities.seed import seed_everything
 from shepherd.model.model import Model
 from shepherd.lightning_module import LightningModule
 from shepherd.new_datasets import HeteroDataset
-from shepherd.dpo_dataset import DPODataset
+from shepherd.dpo_dataset import DPODataset, collate_dpo_batch
 from shepherd.inference import inference_sample
 from shepherd.extract import create_rdkit_molecule
 from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
@@ -469,16 +469,22 @@ def create_dataset(params, molblocks_and_charges, marginals):
 
 
 def create_dpo_dataloader(params, dataset, dpo_dataset):
-    """创建纯DPO DataLoader（不混合标准数据）"""
-    print("🎯 创建纯DPO DataLoader...")
+    """创建DPO DataLoader（使用标准 torch DataLoader + 自定义 collate_fn）
     
-    # DPO训练使用num_workers=0避免多进程缓存问题
-    # 当preference_pairs动态更新时，多进程worker不会同步更新
-    train_loader = torch_geometric.loader.DataLoader(
+    注意：必须使用 torch.utils.data.DataLoader 而非 PyG DataLoader，
+    因为 PyG DataLoader 会覆盖 collate_fn 为其内部的 Collater，
+    导致 DPO batch 的格式不正确（batch_type 变成列表而非字符串）。
+    """
+    print("🎯 创建 DPO DataLoader (使用 torch DataLoader + collate_dpo_batch)...")
+    
+    # 【关键修复】使用标准的 torch DataLoader + collate_dpo_batch
+    # 而非 PyG DataLoader，确保 DPO dict 被正确 batch 化
+    train_loader = torch.utils.data.DataLoader(
         dataset=dpo_dataset,
         num_workers=0,  # 避免多进程缓存导致的索引越界
         batch_size=params['training']['batch_size'],
         shuffle=True,
+        collate_fn=collate_dpo_batch,  # 【关键】确保 DPO dict 被正确 batch 化
     )
     
     return train_loader
@@ -1565,12 +1571,7 @@ def main():
             DistributedSampler的total_size与实际数据集大小不一致的断言错误。
             reload_dataloaders_every_n_epochs=1会在下一个epoch开始时重建DataLoader。
             """
-            # 【修复】跳过 epoch 0（初始采样刚结束，还没像样地训练）
-            sampling_interval = params['training'].get('dpo_sampling_every_n_epochs', 5)
-            if trainer.current_epoch == 0:
-                print(f"  ⏩ 跳过 epoch 0 的重新采样（待训练 {sampling_interval} 个 epoch 后再采样）")
-                return
-            if trainer.current_epoch % sampling_interval != 0:
+            if trainer.current_epoch % params['training'].get('dpo_sampling_every_n_epochs', 1) != 0:
                 return
             
             if trainer.global_rank == 0:  # 只在主进程执行

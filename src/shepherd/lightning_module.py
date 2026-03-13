@@ -341,71 +341,83 @@ class LightningModule(pl.LightningModule):
             
             # DDP安全检查：验证批次数据有效性
             if batch_winner is None or batch_loser is None:
-                # 某些rank可能没有数据，返回零损失以保持DDP同步
+                print(f"⚠️ [DPO] Epoch {self.current_epoch} Step {batch_idx}: "
+                      f"winner={batch_winner is not None}, loser={batch_loser is not None} → 跳过")
                 return torch.tensor(0.0, device=self.device, requires_grad=True)
             
             # 检查batch是否有有效的x1数据
-            if not hasattr(batch_winner, 'x1') or batch_winner['x1'] is None:
+            has_x1 = hasattr(batch_winner, 'x1')
+            x1_val = batch_winner['x1'] if has_x1 else None
+            if not has_x1 or x1_val is None:
+                # 打印详细诊断
+                print(f"⚠️ [DPO] Epoch {self.current_epoch} Step {batch_idx}: "
+                      f"x1 检查失败! has_x1={has_x1}, x1_val={x1_val}")
+                print(f"   batch_winner type={type(batch_winner).__name__}")
+                if hasattr(batch_winner, 'node_types'):
+                    print(f"   node_types={batch_winner.node_types}")
+                if hasattr(batch_winner, 'keys'):
+                    print(f"   keys={list(batch_winner.keys())[:10]}")
                 return torch.tensor(0.0, device=self.device, requires_grad=True)
 
-            input_winner = self.get_training_input_dict(batch_winner)
-            output_winner = self.forward_training(input_winner)
-            loss_std_x1, _, _, _ = self.x1_denoising_loss(input_winner, output_winner)
-            
-            # 标准损失：x1 + x4（防止 x4 药效团解码器在 DPO 训练中退化）
-            loss_std = loss_std_x1
-            loss_std_x4 = torch.tensor(0.0, device=self.device)
-            if self.train_x4_denoising and 'x4' in input_winner:
-                loss_x4, _, _, _ = self.x4_denoising_loss(input_winner, output_winner)
-                loss_std = loss_std + loss_x4
-                loss_std_x4 = loss_x4
+            try:
+                input_winner = self.get_training_input_dict(batch_winner)
+                output_winner = self.forward_training(input_winner)
+                loss_std_x1, _, _, _ = self.x1_denoising_loss(input_winner, output_winner)
+                
+                # 标准损失：x1 + x4（防止 x4 药效团解码器在 DPO 训练中退化）
+                loss_std = loss_std_x1
+                loss_std_x4 = torch.tensor(0.0, device=self.device)
+                if self.train_x4_denoising and 'x4' in input_winner:
+                    loss_x4, _, _, _ = self.x4_denoising_loss(input_winner, output_winner)
+                    loss_std = loss_std + loss_x4
+                    loss_std_x4 = loss_x4
 
-            # 传入已计算好的 input_winner/output_winner，避免在 compute_dpo_loss 内再次前向计算 winner
-            loss_dpo, implicit_acc, model_diff, ref_diff = self.compute_dpo_loss(
-                batch_winner, batch_loser, shared_noise, shared_timestep,
-                input_winner_precomputed=input_winner,
-                output_model_winner_precomputed=output_winner,
-            )
+                # 传入已计算好的 input_winner/output_winner，避免在 compute_dpo_loss 内再次前向计算 winner
+                loss_dpo, implicit_acc, model_diff, ref_diff = self.compute_dpo_loss(
+                    batch_winner, batch_loser, shared_noise, shared_timestep,
+                    input_winner_precomputed=input_winner,
+                    output_model_winner_precomputed=output_winner,
+                )
 
-            dpo_weight = self.get_dpo_weight()
+                dpo_weight = self.get_dpo_weight()
 
-            loss = (1 - dpo_weight) * loss_std + dpo_weight * loss_dpo
+                loss = (1 - dpo_weight) * loss_std + dpo_weight * loss_dpo
 
-            self.log('dpo_weight', dpo_weight)
-            self.log('implicit_acc', implicit_acc)
-            self.log('model_loss_diff', model_diff)
-            self.log('ref_loss_diff', ref_diff)
-            self.log('loss_dpo', loss_dpo)
-            self.log('loss_std_on_winner', loss_std)
-            self.log('loss_std_x1_on_winner', loss_std_x1)
-            self.log('loss_std_x4_on_winner', loss_std_x4)
-            self.log('train_loss', loss)
-            
-            # 【修复】缓存 DPO 指标到模块上，确保 callback 可以可靠读取
-            self._last_dpo_metrics = {
-                'train_loss': float(loss.item()),
-                'loss_dpo': float(loss_dpo.item()),
-                'loss_std_on_winner': float(loss_std.item()),
-                'implicit_acc': float(implicit_acc.item()),
-                'dpo_weight': float(dpo_weight),
-                'model_loss_diff': float(model_diff.item()),
-                'ref_loss_diff': float(ref_diff.item()),
-            }
-            
-            # 每隔一定步数打印DPO训练指标
-            if batch_idx % 50 == 0:
+                self.log('dpo_weight', dpo_weight)
+                self.log('implicit_acc', implicit_acc)
+                self.log('model_loss_diff', model_diff)
+                self.log('ref_loss_diff', ref_diff)
+                self.log('loss_dpo', loss_dpo)
+                self.log('loss_std_on_winner', loss_std)
+                self.log('loss_std_x1_on_winner', loss_std_x1)
+                self.log('loss_std_x4_on_winner', loss_std_x4)
+                self.log('train_loss', loss)
+                
+                # 缓存 DPO 指标到模块上，确保 callback 可以可靠读取
+                self._last_dpo_metrics = {
+                    'train_loss': float(loss.item()),
+                    'loss_dpo': float(loss_dpo.item()),
+                    'loss_std_on_winner': float(loss_std.item()),
+                    'implicit_acc': float(implicit_acc.item()),
+                    'dpo_weight': float(dpo_weight),
+                    'model_loss_diff': float(model_diff.item()),
+                    'ref_loss_diff': float(ref_diff.item()),
+                }
+                
+                # 【调试】每步都打印 DPO 训练指标
                 lr = self.optimizers().param_groups[0]['lr']
-                print(f"\n[Epoch {self.current_epoch}, Step {batch_idx}] DPO训练:")
-                print(f"  学习率: {lr:.2e}")
-                print(f"  总损失: {loss:.4f}")
-                print(f"  DPO权重: {dpo_weight:.3f}")
-                print(f"  标准损失(x1+x4): {loss_std:.4f} (x1: {loss_std_x1:.4f}, x4: {loss_std_x4:.4f})")
-                print(f"  DPO损失: {loss_dpo:.4f}")
-                print(f"  隐式准确率: {implicit_acc:.3f}")
-                print(f"  模型损失差: {model_diff:.4f}")
-                print(f"  参考损失差: {ref_diff:.4f}")
-            
-            return loss
+                print(f"\n✅ [Epoch {self.current_epoch}, Step {batch_idx}] DPO训练:")
+                print(f"  lr={lr:.2e}, 总损失={loss:.4f}, DPO损失={loss_dpo:.4f}, "
+                      f"DPO权重={dpo_weight:.3f}, Acc={implicit_acc:.3f}")
+                
+                return loss
+                
+            except Exception as e:
+                print(f"\n❌ [DPO] Epoch {self.current_epoch} Step {batch_idx}: 计算异常!")
+                print(f"   错误: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         # DDP模式下的安全回退：如果batch_type未知或批次无效，返回零损失
         # 这避免了在分布式训练中因返回None而导致的RuntimeError
