@@ -966,8 +966,8 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             try:
                 from shepherd_score.container import Molecule
                 from shepherd_score.score.gaussian_overlap_np import get_overlap_np
-                from shepherd_score.score.electrostatics_np import get_overlap_esp_np
-                from shepherd_score.score.pharmacophore_np import get_overlap_pharm_np
+                from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
+                from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
                 from shepherd_score.score.constants import ALPHA, LAM_SCALING
                 from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
                 from rdkit.Chem import AllChem
