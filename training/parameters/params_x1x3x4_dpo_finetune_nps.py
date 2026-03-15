@@ -48,7 +48,7 @@ params = {
         'accumulate_grad_batches': 1,  # 不累积梯度
         'num_gpus': 2,  # 单GPU
         
-        'lr': 0.00001,  # 降低学习率防止遗忘（1e-5）
+        'lr': 0.000005,  # 降低学习率防止遗忘（5e-6）
         'min_lr': 0.000001,  # 最低 1e-6
         'lr_steps': 10000,  # 缓慢衰减，原值为1会导致学习率瞬间降到min_lr
         
@@ -66,7 +66,7 @@ params = {
         'enable_dpo': True,  # 启用DPO微调
         
         # DPO核心参数
-        'beta_dpo': 0.5,  # 增大β限制与ref_model偏离
+        'beta_dpo': 1.0,  # 增大β限制与ref_model偏离 (1.0)
         'dpo_ramp_up_epochs': 10,  # 更缓慢地增加DPO权重
         'dpo_max_weight': 0.3,  # 降低DPO损失占比，避免过度偏离
         

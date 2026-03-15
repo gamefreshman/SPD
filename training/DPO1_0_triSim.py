@@ -1090,19 +1090,36 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                         'sims_pharm_target': 0.0,
                     }
         
-        # 3. 计算综合分数: Surface×5 + ESP×3 + Pharmacophore×2
+        # 3. 计算综合分数: ESP、Pharmacophore、SA、logP 和 有效性
         for item in all_evaluated:
             conf = item['conf_scores']
             cond = item['cond_scores']
             
+            # 分子有效性作为最核心指标：无效分子得分为极低负数，而不是 -inf，给模型一点梯度（虽然排序会在最后）
             if conf.get('is_valid', True) == False:
-                item['total_score'] = float('-inf')
+                item['total_score'] = -100.0
             else:
                 try:
                     total_score = 0.0
-                    total_score += cond['sims_surf_target'] * 5.0      # Surface: 最高权重
-                    total_score += cond['sims_esp_target'] * 3.0       # ESP
-                    total_score += cond['sims_pharm_target'] * 2.0     # Pharmacophore
+                    
+                    # === 3D 特征目标 ===
+                    total_score += cond['sims_esp_target'] * 3.0       # ESP相似度
+                    total_score += cond['sims_pharm_target'] * 2.0     # 药效团相似度
+                    
+                    # === 化学性质与成药性目标 ===
+                    # SA Score - 合成可及性 (1最易，10最难)。越容易合成得分越高
+                    sa_score = conf.get('sa_score', 10.0)
+                    sa_normalized = (sa_score - 1.0) / 9.0
+                    total_score -= sa_normalized * 1.0  # 惩罚难以合成的分子
+                    
+                    # LogP - 脂水分配系数 (通常类药性良好区间为 0~5)
+                    logp = conf.get('logp', 0.0)
+                    if logp < 0.0 or logp > 5.0:
+                        logp_penalty = min(abs(logp - 2.5) * 0.2, 1.0)
+                        total_score -= logp_penalty
+                    
+                    # 分子有效性加成
+                    total_score += 2.0  # 有效分子自带2.0的基础得分奖励
                     
                     if np.isnan(total_score) or np.isinf(total_score):
                         total_score = -100.0
@@ -1385,13 +1402,11 @@ def main():
     # 设置回调
     print("\n⚙️  设置训练回调...")
     checkpoint_callback = ModelCheckpoint(
-        save_top_k=0,
+        save_top_k=-1,       # 保存所有的 checkpoint
         save_last=True,
-        monitor="train_loss",
-        mode="min",
+        every_n_epochs=10,   # 每 10 个 epoch 保存一次
         dirpath=output_dir,
-        filename="best-{step:09d}",
-        every_n_train_steps=params['training']['log_every_n_steps'],
+        filename="epoch-{epoch:03d}",
     )
     
     # 自定义DPO采样回调（基于dpo_sample_and_evaluation.py）
