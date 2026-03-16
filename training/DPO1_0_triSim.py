@@ -1103,7 +1103,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     total_score = 0.0
                     
                     # === 3D 特征目标 ===
-                    total_score += cond['sims_esp_target'] * 3.0       # ESP相似度
+                    # 仅保留药效团相似度
                     total_score += cond['sims_pharm_target'] * 2.0     # 药效团相似度
                     
                     # === 化学性质与成药性目标 ===
@@ -1111,12 +1111,6 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     sa_score = conf.get('sa_score', 10.0)
                     sa_normalized = (sa_score - 1.0) / 9.0
                     total_score -= sa_normalized * 1.0  # 惩罚难以合成的分子
-                    
-                    # LogP - 脂水分配系数 (通常类药性良好区间为 0~5)
-                    logp = conf.get('logp', 0.0)
-                    if logp < 0.0 or logp > 5.0:
-                        logp_penalty = min(abs(logp - 2.5) * 0.2, 1.0)
-                        total_score -= logp_penalty
                     
                     # 分子有效性加成
                     total_score += 2.0  # 有效分子自带2.0的基础得分奖励
