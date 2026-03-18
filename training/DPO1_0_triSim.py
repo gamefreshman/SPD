@@ -817,7 +817,7 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     print("="*80)
     
     # 使用ConfEval和ConditionalEvalPipeline评估
-    preference_pairs = evaluate_and_build_pairs(
+    preference_pairs, avg_score = evaluate_and_build_pairs(
         all_generated_samples,
         all_reference_mols,
         molblocks_and_charges,
@@ -826,7 +826,7 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     
     model_pl.train()
     
-    return preference_pairs
+    return preference_pairs, avg_score
 
 
 def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_charges, params):
@@ -1243,10 +1243,19 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     l_group = loser.get('group_id', '?')
                     print(f"  ✅ 跨组偏好对: 组{w_group}(Winner={winner_score:.3f}) vs 组{l_group}(Loser={loser_score:.3f}), Gap={score_gap:.3f}")
     
+    # === 计算所有有效分子的综合平均分（用于 Best-past-policy Anchor） ===
+    if len(all_valid_molecules_across_groups) > 0:
+        valid_scores = [item['total_score'] for item in all_valid_molecules_across_groups
+                        if item['total_score'] > -100.0]  # 排除无效分子的极低惩罚分
+        avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else -float('inf')
+    else:
+        avg_score = -float('inf')
+    
     print(f"\n{'='*50}")
     print(f"✅ 偏好对构建汇总: {len(all_preference_pairs)} 对 (来自 {len(grouped_samples)} 组)")
+    print(f"   📊 有效分子综合平均分: {avg_score:.4f}")
     print(f"{'='*50}")
-    return all_preference_pairs
+    return all_preference_pairs, avg_score
 
 
 def main():
@@ -1373,7 +1382,7 @@ def main():
                 print(f"\n🔄 第 {sample_attempt} 次尝试采样...")
             
             with torch.no_grad():
-                initial_pairs = sample_and_evaluate_molecules(
+                initial_pairs, initial_avg_score = sample_and_evaluate_molecules(
                     temp_model_pl,
                     params,
                     molblocks_and_charges,
@@ -1384,6 +1393,7 @@ def main():
             
             if len(initial_pairs) > 0:
                 print(f"   ✅ 成功生成 {len(initial_pairs)} 个偏好对")
+                print(f"   📊 首次采样综合平均分: {initial_avg_score:.4f}")
                 break
             
             print("   ⚠️  本次采样未生成任何有效偏好对，继续尝试...")
@@ -1439,7 +1449,8 @@ def main():
     
     # 自定义DPO采样回调（基于dpo_sample_and_evaluation.py）
     class DPOSamplingCallback(pl.Callback):
-        def __init__(self, params, dataset, dpo_dataset, molblocks_and_charges):
+        def __init__(self, params, dataset, dpo_dataset, molblocks_and_charges,
+                     initial_best_score=-float('inf')):
             super().__init__()
             self.params = params
             self.dataset = dataset
@@ -1450,8 +1461,20 @@ def main():
             self.epoch_counter = 0  # 用于追踪采样次数
             self.round_metrics = []  # 每轮指标记录
             self.metrics_file = os.path.join(output_dir, 'dpo_round_metrics.json')  # 指标保存路径
+            
+            # ==================== Iterative DPO: Best-past-policy Anchor ====================
+            self.best_score = initial_best_score  # 历史最高综合平均分
+            self.best_score_epoch = -1             # 取得最高分的 epoch（-1 表示初始采样）
+            self.ref_update_history = []           # 参考模型更新历史
+            self.iterative_dpo_enabled = params['training'].get('iterative_dpo_enabled', True)
+            self.score_threshold = params['training'].get('iterative_dpo_score_threshold', 0.0)
+            print(f"\n🏗️  Iterative DPO 配置:")
+            print(f"   启用: {self.iterative_dpo_enabled}")
+            print(f"   初始 best_score: {self.best_score:.4f}")
+            print(f"   最低提升阈值: {self.score_threshold}")
         
-        def _collect_and_save_metrics(self, pairs, epoch, train_loss=None, extra_metrics=None):
+        def _collect_and_save_metrics(self, pairs, epoch, train_loss=None, extra_metrics=None,
+                                      current_avg_score=None, ref_model_updated=None):
             """收集偏好对指标并保存到 JSON 文件
             
             Args:
@@ -1459,6 +1482,8 @@ def main():
                 epoch: 当前 epoch
                 train_loss: 训练总损失
                 extra_metrics: 额外的训练指标字典 (loss_dpo, implicit_acc 等)
+                current_avg_score: 当前轮次的综合平均分（Iterative DPO）
+                ref_model_updated: 本轮是否更新了参考模型（Iterative DPO）
             """
             if len(pairs) == 0:
                 return
@@ -1499,6 +1524,11 @@ def main():
                 'score_gap': winner_avg['total_score'] - loser_avg['total_score'],
                 'train_loss': train_loss,
                 'training_metrics': extra_metrics if extra_metrics else {},
+                # Iterative DPO 指标
+                'current_avg_score': current_avg_score,
+                'best_score': self.best_score,
+                'ref_model_updated': ref_model_updated,
+                'best_score_epoch': self.best_score_epoch,
             }
             
             # 同时记录每对的详细数据
@@ -1546,7 +1576,7 @@ def main():
                 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
                 
                 # 调用新的采样评估函数
-                new_pairs = sample_and_evaluate_molecules(
+                new_pairs, avg_score = sample_and_evaluate_molecules(
                     pl_module,
                     self.params,
                     self.molblocks_and_charges,
@@ -1554,6 +1584,32 @@ def main():
                     num_samples_per_mol=num_samples,
                     device=device
                 )
+                
+                # ==================== Iterative DPO: Best-past-policy Anchor ====================
+                ref_model_updated = False
+                if self.iterative_dpo_enabled and len(new_pairs) > 0:
+                    score_improvement = avg_score - self.best_score
+                    if score_improvement > self.score_threshold:
+                        # 当前模型优于历史最佳 → 更新参考模型
+                        self.best_score = avg_score
+                        self.best_score_epoch = trainer.current_epoch
+                        pl_module.ref_model.load_state_dict(pl_module.model.state_dict())
+                        pl_module.ref_model.eval()
+                        for p in pl_module.ref_model.parameters():
+                            p.requires_grad = False
+                        ref_model_updated = True
+                        self.ref_update_history.append({
+                            'epoch': trainer.current_epoch,
+                            'score': avg_score,
+                            'improvement': score_improvement,
+                        })
+                        print(f"\n🏆 参考模型已更新! 新最高分: {avg_score:.4f} (提升: +{score_improvement:.4f})")
+                        print(f"   历史更新次数: {len(self.ref_update_history)}")
+                    else:
+                        print(f"\n⏸️  参考模型保持不变")
+                        print(f"   当前分: {avg_score:.4f}, 历史最佳: {self.best_score:.4f} @ epoch {self.best_score_epoch}")
+                        if self.score_threshold > 0:
+                            print(f"   最低提升阈值: {self.score_threshold}, 实际差值: {score_improvement:.4f}")
                 
                 # 更新偏好对
                 if len(new_pairs) > 0:
@@ -1593,18 +1649,30 @@ def main():
                     
                     train_loss = train_loss_dict.get('train_loss', None)
                     print(f"  📊 保存指标: train_loss={train_loss}, keys={list(train_loss_dict.keys())}")
-                    self._collect_and_save_metrics(new_pairs, trainer.current_epoch, train_loss, train_loss_dict)
+                    self._collect_and_save_metrics(
+                        new_pairs, trainer.current_epoch, train_loss, train_loss_dict,
+                        current_avg_score=avg_score,
+                        ref_model_updated=ref_model_updated,
+                    )
 
+    # 首次采样的 avg_score 作为 best_score 初始值
+    _initial_best_score = initial_avg_score if ('initial_avg_score' in dir() and initial_avg_score is not None) else -float('inf')
+    
     sampling_callback = DPOSamplingCallback(
         params=params,
         dataset=dataset,
         dpo_dataset=dpo_dataset,
-        molblocks_and_charges=molblocks_and_charges
+        molblocks_and_charges=molblocks_and_charges,
+        initial_best_score=_initial_best_score,
     )
     
     # 记录初始偏好对的指标（round 0，训练前的采样）
     if len(initial_pairs) > 0 and not is_ddp_subprocess:
-        sampling_callback._collect_and_save_metrics(initial_pairs, epoch=0, train_loss=None)
+        sampling_callback._collect_and_save_metrics(
+            initial_pairs, epoch=0, train_loss=None,
+            current_avg_score=_initial_best_score,
+            ref_model_updated=False,
+        )
     
     callbacks = [checkpoint_callback, sampling_callback]
     print("✅ 回调配置完成")
