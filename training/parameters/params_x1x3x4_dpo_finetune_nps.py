@@ -45,7 +45,7 @@ params = {
         
         # 调整批次大小（因为只有3个分子）
         'batch_size': 2,  # 小批次，适合3个分子的微调
-        'accumulate_grad_batches': 1,  # 不累积梯度
+        'accumulate_grad_batches': 4,  # 累积4步梯度再更新，平滑DPO噪声
         'num_gpus': 2,  # 单GPU
         
         'lr': 0.000005,  # 降低学习率防止遗忘（5e-6）

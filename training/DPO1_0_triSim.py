@@ -914,6 +914,40 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 conf_scores = {'is_valid': True}
                 print(f"  🔬 样本 {i+1}: ✓ 分子有效")
                 
+                # 提取 SA Score 和 LogP（用于偏好对评分）
+                try:
+                    # 尝试从 ConfEval 获取
+                    if hasattr(conf_eval, 'sa_score') and conf_eval.sa_score is not None:
+                        conf_scores['sa_score'] = float(conf_eval.sa_score)
+                    if hasattr(conf_eval, 'logp') and conf_eval.logp is not None:
+                        conf_scores['logp'] = float(conf_eval.logp)
+                    
+                    # 如果 ConfEval 没有，用 RDKit 直接计算
+                    if 'sa_score' not in conf_scores or conf_scores['sa_score'] == 0:
+                        try:
+                            from rdkit.Chem import Descriptors
+                            from rdkit.Contrib.SA_Score import sascorer
+                            gen_mol = conf_eval.mol if hasattr(conf_eval, 'mol') else None
+                            if gen_mol is None:
+                                from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
+                                gen_mol, _, _ = get_mol_from_atom_pos(atoms, positions, bonds=bonds)
+                            if gen_mol is not None:
+                                conf_scores['sa_score'] = float(sascorer.calculateScore(gen_mol))
+                                conf_scores['logp'] = float(Descriptors.MolLogP(gen_mol))
+                        except Exception as sa_e:
+                            print(f"    ⚠️ SA/LogP 计算失败: {sa_e}")
+                    
+                    # 如果仍然没有值，给默认值
+                    conf_scores.setdefault('sa_score', 5.0)   # 中等难度
+                    conf_scores.setdefault('logp', 2.5)        # 中等亲脂性
+                    
+                    print(f"    📊 SA={conf_scores['sa_score']:.2f}, LogP={conf_scores['logp']:.2f}")
+                    
+                except Exception as prop_e:
+                    print(f"    ⚠️ 属性提取异常: {prop_e}")
+                    conf_scores['sa_score'] = 5.0
+                    conf_scores['logp'] = 2.5
+                
             except Exception as e:
                 print(f"  🔬 样本 {i+1}: ✗ ConfEval失败 ({type(e).__name__}: {str(e)[:50]})")
                 invalid_samples.append({

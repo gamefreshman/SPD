@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-DPO 训练指标可视化脚本
+DPO 训练指标可视化脚本 (v2)
 
-读取 dpo_round_metrics.json，绘制每轮训练的 winner/loser 指标对比图、
-total score 变化、score gap 趋势和训练损失曲线。
+优化改进:
+  1. EMA 平滑曲线 —— 为折线图叠加指数移动平均虚线
+  2. 平坦/缺失指标自动检测 —— 方差接近 0 的子图标注警告
+  3. Model vs Ref Loss Diff 使用 Symlog 坐标
+  4. 评分曲线背景叠加 Pair 计数灰色柱形 —— 标示置信度
 
 使用方式:
     python visualize_dpo_metrics.py <json_path> [--output <output_png>]
-
-示例:
-    python visualize_dpo_metrics.py jobs/33/dpo_output/dpo_round_metrics.json
-    python visualize_dpo_metrics.py dpo_round_metrics.json --output my_plot.png
 """
 
 import json
 import argparse
 import sys
+import os
 
 import matplotlib
-matplotlib.use('Agg')  # 无需 GUI 后端
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
@@ -34,236 +34,265 @@ def load_metrics(json_path: str) -> list:
     return data
 
 
+def ema(values, alpha=0.3):
+    """指数移动平均"""
+    result = []
+    s = values[0] if len(values) > 0 else 0
+    for v in values:
+        s = alpha * v + (1 - alpha) * s
+        result.append(s)
+    return result
+
+
+def is_flat(values, tol=1e-4):
+    """检测数据是否平坦/全为 0（缺失数据）"""
+    if len(values) == 0:
+        return True
+    arr = np.array(values, dtype=float)
+    return np.std(arr) < tol
+
+
+def add_pair_count_bars(ax, x, pair_counts, max_y=None):
+    """在子图背景添加淡灰色 Pair 计数柱状图"""
+    if max_y is None:
+        max_y = ax.get_ylim()[1]
+    # 将柱状高度归一化到 y 轴的约 30%
+    max_pairs = max(pair_counts) if max(pair_counts) > 0 else 1
+    bar_heights = [p / max_pairs * 0.3 * max_y for p in pair_counts]
+    ax.bar(x, bar_heights, color='#BDBDBD', alpha=0.25, width=0.8,
+           bottom=ax.get_ylim()[0], zorder=0)
+
+
+def mark_flat(ax, label="(Data Missing / Flat)"):
+    """在子图上叠加半透明蒙版和警告文字"""
+    ax.patch.set_facecolor('#FFEBEE')
+    ax.patch.set_alpha(0.5)
+    ax.text(0.5, 0.5, label, transform=ax.transAxes,
+            ha='center', va='center', fontsize=16, color='#B71C1C',
+            fontweight='bold', alpha=0.6, zorder=10)
+
+
+def plot_winner_loser(ax, x, x_labels, w_vals, l_vals, title, ylabel,
+                      winner_color, loser_color, pair_counts=None,
+                      target_band=None, ema_alpha=0.3):
+    """通用的 Winner/Loser 折线图绘制（含 EMA 和平坦检测）"""
+    ax.plot(x, w_vals, 'o-', color=winner_color, label='Winner', linewidth=2, markersize=5)
+    ax.plot(x, l_vals, 's--', color=loser_color, label='Loser', linewidth=2, markersize=5)
+
+    # EMA 平滑线
+    if len(w_vals) >= 3:
+        ax.plot(x, ema(w_vals, ema_alpha), '-', color=winner_color,
+                alpha=0.35, linewidth=3, label='Winner EMA')
+        ax.plot(x, ema(l_vals, ema_alpha), '-', color=loser_color,
+                alpha=0.35, linewidth=3, label='Loser EMA')
+
+    # 目标范围
+    if target_band:
+        ax.axhspan(*target_band, alpha=0.08, color='green', label=f'Target range {target_band}')
+
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_ylabel(ylabel)
+    ax.legend(fontsize=7, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, fontsize=7)
+
+    # 平坦检测
+    if is_flat(w_vals) and is_flat(l_vals):
+        mark_flat(ax)
+
+    # 背景 Pair 计数
+    if pair_counts is not None:
+        add_pair_count_bars(ax, x, pair_counts)
+
+
 def plot_metrics(metrics: list, output_path: str):
     """绘制所有指标图表"""
     rounds = [m['round'] for m in metrics]
     epochs = [m['epoch'] for m in metrics]
-    
-    # 使用 round 作为 x 轴标签
+    pair_counts = [m.get('num_pairs', 1) for m in metrics]
+
     x = np.arange(len(rounds))
     x_labels = [f"R{r}\n(E{e})" for r, e in zip(rounds, epochs)]
-    
-    # ==================== 图表配置 ====================
-    # 检查是否有 training_metrics 数据
-    has_training_metrics = any(m.get('training_metrics', {}) for m in metrics)
-    
-    if has_training_metrics:
-        # 5 行 2 列 = 10 个子图
-        fig, axes = plt.subplots(5, 2, figsize=(16, 25))
-    else:
-        # 4 行 2 列 = 8 个子图
-        fig, axes = plt.subplots(4, 2, figsize=(16, 20))
-    
-    fig.suptitle('DPO Training Metrics per Round', fontsize=18, fontweight='bold', y=0.98)
-    
+
     # 颜色方案
-    winner_color = '#2196F3'   # 蓝色 - Winner
-    loser_color = '#F44336'    # 红色 - Loser
-    gap_color = '#4CAF50'      # 绿色 - Gap
-    loss_color = '#FF9800'     # 橙色 - Loss
-    dpo_color = '#9C27B0'      # 紫色 - DPO Loss
-    acc_color = '#00BCD4'      # 青色 - Accuracy
-    
+    W = '#2196F3'   # 蓝色 - Winner
+    L = '#F44336'   # 红色 - Loser
+    gap_color = '#4CAF50'
+    loss_color = '#FF9800'
+    dpo_color = '#9C27B0'
+    acc_color = '#00BCD4'
+
+    has_training_metrics = any(m.get('training_metrics', {}) for m in metrics)
+
+    rows = 5 if has_training_metrics else 4
+    fig, axes = plt.subplots(rows, 2, figsize=(17, 5.5 * rows))
+    fig.suptitle('DPO Training Metrics per Round', fontsize=18, fontweight='bold', y=0.98)
+
     # ==================== 1. Surface Similarity ====================
-    ax = axes[0, 0]
-    w_vals = [m['winner'].get('sims_surf_target', 0) for m in metrics]
-    l_vals = [m['loser'].get('sims_surf_target', 0) for m in metrics]
-    ax.plot(x, w_vals, 'o-', color=winner_color, label='Winner', linewidth=2, markersize=6)
-    ax.plot(x, l_vals, 's--', color=loser_color, label='Loser', linewidth=2, markersize=6)
-    ax.set_title('Surface Similarity (sims_surf_target)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Score')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=8)
-    
+    plot_winner_loser(
+        axes[0, 0], x, x_labels,
+        [m['winner'].get('sims_surf_target', 0) for m in metrics],
+        [m['loser'].get('sims_surf_target', 0) for m in metrics],
+        'Surface Similarity (sims_surf_target)', 'Score', W, L,
+        pair_counts=pair_counts,
+    )
+
     # ==================== 2. ESP Similarity ====================
-    ax = axes[0, 1]
-    w_vals = [m['winner'].get('sims_esp_target', 0) for m in metrics]
-    l_vals = [m['loser'].get('sims_esp_target', 0) for m in metrics]
-    ax.plot(x, w_vals, 'o-', color=winner_color, label='Winner', linewidth=2, markersize=6)
-    ax.plot(x, l_vals, 's--', color=loser_color, label='Loser', linewidth=2, markersize=6)
-    ax.set_title('ESP Similarity (sims_esp_target)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Score')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=8)
-    
+    plot_winner_loser(
+        axes[0, 1], x, x_labels,
+        [m['winner'].get('sims_esp_target', 0) for m in metrics],
+        [m['loser'].get('sims_esp_target', 0) for m in metrics],
+        'ESP Similarity (sims_esp_target)', 'Score', W, L,
+        pair_counts=pair_counts,
+    )
+
     # ==================== 3. Pharmacophore Similarity ====================
-    ax = axes[1, 0]
-    w_vals = [m['winner'].get('sims_pharm_target', 0) for m in metrics]
-    l_vals = [m['loser'].get('sims_pharm_target', 0) for m in metrics]
-    ax.plot(x, w_vals, 'o-', color=winner_color, label='Winner', linewidth=2, markersize=6)
-    ax.plot(x, l_vals, 's--', color=loser_color, label='Loser', linewidth=2, markersize=6)
-    ax.set_title('Pharmacophore Similarity (sims_pharm_target)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Score')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=8)
-    
+    plot_winner_loser(
+        axes[1, 0], x, x_labels,
+        [m['winner'].get('sims_pharm_target', 0) for m in metrics],
+        [m['loser'].get('sims_pharm_target', 0) for m in metrics],
+        'Pharmacophore Similarity (sims_pharm_target)', 'Score', W, L,
+        pair_counts=pair_counts,
+    )
+
     # ==================== 4. SA Score ====================
-    ax = axes[1, 1]
-    w_vals = [m['winner'].get('sa_score', 0) for m in metrics]
-    l_vals = [m['loser'].get('sa_score', 0) for m in metrics]
-    ax.plot(x, w_vals, 'o-', color=winner_color, label='Winner', linewidth=2, markersize=6)
-    ax.plot(x, l_vals, 's--', color=loser_color, label='Loser', linewidth=2, markersize=6)
-    ax.set_title('SA Score (lower is better)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('SA Score')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=8)
-    
+    plot_winner_loser(
+        axes[1, 1], x, x_labels,
+        [m['winner'].get('sa_score', 0) for m in metrics],
+        [m['loser'].get('sa_score', 0) for m in metrics],
+        'SA Score (lower is better)', 'SA Score', W, L,
+        pair_counts=pair_counts,
+    )
+
     # ==================== 5. LogP ====================
-    ax = axes[2, 0]
-    w_vals = [m['winner'].get('logp', 0) for m in metrics]
-    l_vals = [m['loser'].get('logp', 0) for m in metrics]
-    ax.plot(x, w_vals, 'o-', color=winner_color, label='Winner', linewidth=2, markersize=6)
-    ax.plot(x, l_vals, 's--', color=loser_color, label='Loser', linewidth=2, markersize=6)
-    # 目标范围标注
-    ax.axhspan(0.0, 6.0, alpha=0.08, color='green', label='Target range (0~6)')
-    ax.set_title('LogP', fontsize=12, fontweight='bold')
-    ax.set_ylabel('LogP')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=8)
-    
+    plot_winner_loser(
+        axes[2, 0], x, x_labels,
+        [m['winner'].get('logp', 0) for m in metrics],
+        [m['loser'].get('logp', 0) for m in metrics],
+        'LogP', 'LogP', W, L,
+        pair_counts=pair_counts,
+        target_band=(0.0, 6.0),
+    )
+
     # ==================== 6. Total Score ====================
     ax = axes[2, 1]
     w_vals = [m['winner'].get('total_score', 0) for m in metrics]
     l_vals = [m['loser'].get('total_score', 0) for m in metrics]
-    ax.plot(x, w_vals, 'o-', color=winner_color, label='Winner', linewidth=2, markersize=6)
-    ax.plot(x, l_vals, 's--', color=loser_color, label='Loser', linewidth=2, markersize=6)
-    ax.fill_between(x, w_vals, l_vals, alpha=0.15, color=gap_color)
+    ax.plot(x, w_vals, 'o-', color=W, label='Winner', linewidth=2, markersize=5)
+    ax.plot(x, l_vals, 's--', color=L, label='Loser', linewidth=2, markersize=5)
+    if len(w_vals) >= 3:
+        ax.plot(x, ema(w_vals), '-', color=W, alpha=0.35, linewidth=3, label='Winner EMA')
+        ax.plot(x, ema(l_vals), '-', color=L, alpha=0.35, linewidth=3, label='Loser EMA')
+    ax.fill_between(x, w_vals, l_vals, alpha=0.12, color=gap_color)
     ax.set_title('Total Score', fontsize=12, fontweight='bold')
     ax.set_ylabel('Score')
-    ax.legend()
+    ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
     ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=8)
-    
-    # ==================== 7. Score Gap ====================
+    ax.set_xticklabels(x_labels, fontsize=7)
+    add_pair_count_bars(ax, x, pair_counts)
+
+    # ==================== 7. Score Gap + Pair Count ====================
     ax = axes[3, 0]
     gaps = [m.get('score_gap', 0) for m in metrics]
-    ax.bar(x, gaps, color=gap_color, alpha=0.7, edgecolor='white', linewidth=0.5)
-    ax.plot(x, gaps, 'o-', color=gap_color, linewidth=2, markersize=6)
-    # 在柱上标注数值
+    # 主柱：Gap（绿色）
+    ax.bar(x, gaps, color=gap_color, alpha=0.7, edgecolor='white', linewidth=0.5, label='Score Gap')
+    ax.plot(x, gaps, 'o-', color=gap_color, linewidth=2, markersize=5)
     for i, g in enumerate(gaps):
         ax.annotate(f'{g:.2f}', (x[i], g), textcoords="offset points",
-                    xytext=(0, 8), ha='center', fontsize=8, fontweight='bold')
-    ax.set_title('Score Gap (Winner - Loser)', fontsize=12, fontweight='bold')
+                    xytext=(0, 8), ha='center', fontsize=7, fontweight='bold')
+    # 双轴：Pair 计数
+    ax2 = ax.twinx()
+    ax2.bar(x + 0.3, pair_counts, width=0.25, color='#90A4AE', alpha=0.5, label='Num Pairs')
+    ax2.set_ylabel('Num Pairs', color='#607D8B', fontsize=9)
+    ax2.tick_params(axis='y', labelcolor='#607D8B')
+    ax.set_title('Score Gap & Pair Count', fontsize=12, fontweight='bold')
     ax.set_ylabel('Gap')
     ax.set_xlabel('Round (Epoch)')
     ax.grid(True, alpha=0.3, axis='y')
     ax.set_xticks(x)
-    ax.set_xticklabels(x_labels, fontsize=8)
-    
-    # ==================== 8. Train Loss + DPO Loss ====================
+    ax.set_xticklabels(x_labels, fontsize=7)
+    # 合并图例
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, fontsize=7, loc='upper right')
+
+    # ==================== 8. Training Losses ====================
     ax = axes[3, 1]
-    # 总训练损失
     losses = [m.get('train_loss', None) for m in metrics]
-    valid_idx = [i for i, l in enumerate(losses) if l is not None]
-    valid_losses = [losses[i] for i in valid_idx]
-    
-    # DPO 损失
     dpo_losses = [m.get('training_metrics', {}).get('loss_dpo', None) for m in metrics]
-    valid_dpo_idx = [i for i, l in enumerate(dpo_losses) if l is not None]
-    valid_dpo_losses = [dpo_losses[i] for i in valid_dpo_idx]
-    
-    # 标准损失
     std_losses = [m.get('training_metrics', {}).get('loss_std_on_winner', None) for m in metrics]
-    valid_std_idx = [i for i, l in enumerate(std_losses) if l is not None]
-    valid_std_losses = [std_losses[i] for i in valid_std_idx]
-    
-    has_any_loss = len(valid_losses) > 0 or len(valid_dpo_losses) > 0
-    
+
+    def plot_series(ax, vals, color, label, marker='o-'):
+        idx = [i for i, v in enumerate(vals) if v is not None]
+        if len(idx) > 0:
+            ys = [vals[i] for i in idx]
+            ax.plot([x[i] for i in idx], ys, marker, color=color, linewidth=2, markersize=5, label=label)
+            if len(ys) >= 3:
+                ax.plot([x[i] for i in idx], ema(ys), '-', color=color, alpha=0.3, linewidth=3)
+
+    plot_series(ax, losses, loss_color, 'Total Loss')
+    plot_series(ax, dpo_losses, dpo_color, 'DPO Loss', 's--')
+    plot_series(ax, std_losses, '#607D8B', 'Std Loss', '^:')
+
+    has_any_loss = any(v is not None for v in losses + dpo_losses)
     if has_any_loss:
-        if len(valid_losses) > 0:
-            ax.plot([x[i] for i in valid_idx], valid_losses, 'o-', 
-                    color=loss_color, linewidth=2, markersize=6, label='Total Loss')
-        if len(valid_dpo_losses) > 0:
-            ax.plot([x[i] for i in valid_dpo_idx], valid_dpo_losses, 's--', 
-                    color=dpo_color, linewidth=2, markersize=6, label='DPO Loss')
-        if len(valid_std_losses) > 0:
-            ax.plot([x[i] for i in valid_std_idx], valid_std_losses, '^:', 
-                    color='#607D8B', linewidth=2, markersize=6, label='Std Loss')
         ax.set_title('Training Losses', fontsize=12, fontweight='bold')
         ax.set_ylabel('Loss')
         ax.set_xlabel('Round (Epoch)')
-        ax.legend()
+        ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
-        ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, fontsize=8)
     else:
-        ax.text(0.5, 0.5, 'No loss data available\n(Round 0 has no loss)', 
-                transform=ax.transAxes, ha='center', va='center',
-                fontsize=14, color='gray')
+        ax.text(0.5, 0.5, 'No loss data available\n(Round 0 has no loss)',
+                transform=ax.transAxes, ha='center', va='center', fontsize=14, color='gray')
         ax.set_title('Training Losses', fontsize=12, fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, fontsize=8)
-    
-    # ==================== 9-10. DPO 训练指标 (如果有) ====================
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, fontsize=7)
+
+    # ==================== 9-10. DPO 训练指标 ====================
     if has_training_metrics:
         # 9. Implicit Accuracy + DPO Weight
         ax = axes[4, 0]
         accs = [m.get('training_metrics', {}).get('implicit_acc', None) for m in metrics]
-        valid_acc_idx = [i for i, a in enumerate(accs) if a is not None]
-        valid_accs = [accs[i] for i in valid_acc_idx]
-        
         weights = [m.get('training_metrics', {}).get('dpo_weight', None) for m in metrics]
-        valid_w_idx = [i for i, w in enumerate(weights) if w is not None]
-        valid_weights = [weights[i] for i in valid_w_idx]
-        
-        has_any = len(valid_accs) > 0 or len(valid_weights) > 0
-        if has_any:
-            if len(valid_accs) > 0:
-                ax.plot([x[i] for i in valid_acc_idx], valid_accs, 'o-', 
-                        color=acc_color, linewidth=2, markersize=6, label='Implicit Accuracy')
-            if len(valid_weights) > 0:
-                ax.plot([x[i] for i in valid_w_idx], valid_weights, 's--', 
-                        color='#E91E63', linewidth=2, markersize=6, label='DPO Weight')
-            ax.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5, label='50% baseline')
-            ax.set_ylim(-0.05, 1.05)
-            ax.legend()
+
+        plot_series(ax, accs, acc_color, 'Implicit Accuracy')
+        plot_series(ax, weights, '#E91E63', 'DPO Weight', 's--')
+        ax.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5, label='50% baseline')
+        ax.set_ylim(-0.05, 1.05)
         ax.set_title('Implicit Accuracy & DPO Weight', fontsize=12, fontweight='bold')
         ax.set_ylabel('Value')
         ax.set_xlabel('Round (Epoch)')
+        ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
         ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, fontsize=8)
-        
-        # 10. Model vs Ref Loss Diff
+        ax.set_xticklabels(x_labels, fontsize=7)
+
+        # 10. Model vs Ref Loss Diff — 使用 Symlog
         ax = axes[4, 1]
         model_diffs = [m.get('training_metrics', {}).get('model_loss_diff', None) for m in metrics]
         ref_diffs = [m.get('training_metrics', {}).get('ref_loss_diff', None) for m in metrics]
-        valid_md_idx = [i for i, d in enumerate(model_diffs) if d is not None]
-        valid_rd_idx = [i for i, d in enumerate(ref_diffs) if d is not None]
-        
-        has_any = len(valid_md_idx) > 0 or len(valid_rd_idx) > 0
-        if has_any:
-            if len(valid_md_idx) > 0:
-                ax.plot([x[i] for i in valid_md_idx], [model_diffs[i] for i in valid_md_idx], 'o-', 
-                        color='#FF5722', linewidth=2, markersize=6, label='Model Diff (w-l)')
-            if len(valid_rd_idx) > 0:
-                ax.plot([x[i] for i in valid_rd_idx], [ref_diffs[i] for i in valid_rd_idx], 's--', 
-                        color='#795548', linewidth=2, markersize=6, label='Ref Diff (w-l)')
-            ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
-            ax.legend()
-        ax.set_title('Model vs Ref Loss Diff', fontsize=12, fontweight='bold')
+
+        plot_series(ax, model_diffs, '#FF5722', 'Model Diff (w-l)')
+        plot_series(ax, ref_diffs, '#795548', 'Ref Diff (w-l)', 's--')
+        ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+
+        # Symlog 坐标：压缩异常尖峰，保留 0 附近细节
+        ax.set_yscale('symlog', linthresh=1.0)
+        ax.set_title('Model vs Ref Loss Diff (symlog)', fontsize=12, fontweight='bold')
         ax.set_ylabel('Loss Diff')
         ax.set_xlabel('Round (Epoch)')
+        ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
         ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, fontsize=8)
-    
+        ax.set_xticklabels(x_labels, fontsize=7)
+
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"✅ 图表已保存到: {output_path}")
-    
-    # 同时打印数据摘要表格
+
+    # ==================== 数据摘要表格 ====================
     print("\n" + "=" * 110)
     print(f"{'Round':>6} {'Epoch':>6} {'Pairs':>6} {'W_Surf':>8} {'L_Surf':>8} "
           f"{'W_Total':>8} {'L_Total':>8} {'Gap':>8} {'Loss':>10} {'DPO_Loss':>10} {'Acc':>6}")
@@ -294,20 +323,16 @@ def main():
     parser.add_argument('--output', '-o', type=str, default=None,
                         help='输出图片路径（默认与 JSON 同目录，后缀改为 .png）')
     args = parser.parse_args()
-    
-    # 确定输出路径
+
     if args.output is None:
-        import os
         base = os.path.splitext(args.json_path)[0]
         output_path = base + '.png'
     else:
         output_path = args.output
-    
-    # 加载数据
+
     metrics = load_metrics(args.json_path)
     print(f"📊 加载了 {len(metrics)} 轮的指标数据")
-    
-    # 绘制图表
+
     plot_metrics(metrics, output_path)
 
 

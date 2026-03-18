@@ -46,15 +46,28 @@ class LightningModule(pl.LightningModule):
         # 缓存最近一步的 DPO 训练指标，供 callback 在 epoch_end 读取
         self._last_dpo_metrics = {}
         
+        # DPO Margin: 防止对分数过于接近的偏好对施加过大梯度
+        self.dpo_margin = params['training'].get('dpo_margin', 0.1)
+        # 后期 DPO 权重增长的起始 epoch
+        self.dpo_late_phase_epoch = params['training'].get('dpo_late_phase_epoch', 30)
+        
     def get_dpo_weight(self):
         if not self.enable_dpo:
             return 0.0
         
         epoch = self.current_epoch
         if epoch < self.dpo_ramp_up_epochs:
+            # 预热期：线性从 0 增长到 dpo_max_weight
             return  (epoch + 1) * self.dpo_max_weight / self.dpo_ramp_up_epochs
-        else:
+        elif epoch < self.dpo_late_phase_epoch:
+            # 稳定期：维持 dpo_max_weight
             return self.dpo_max_weight
+        else:
+            # 后期：DPO 权重从 dpo_max_weight 线性增长到 2 × dpo_max_weight
+            # 让模型更多地被偏好信号驱动，Std Loss 逐渐退居二线
+            late_epochs = epoch - self.dpo_late_phase_epoch
+            growth = min(late_epochs / 30.0, 1.0)  # 30 epochs 内增长到上限
+            return self.dpo_max_weight * (1.0 + growth)
 
     def load_state_dict(self, state_dict, strict: bool = True):
         """
@@ -609,10 +622,15 @@ class LightningModule(pl.LightningModule):
             model_diff_cont = model_loss_w_cont - model_loss_l_cont
             ref_diff_cont = ref_loss_w_cont - ref_loss_l_cont
             
-            # DPO核心公式：鼓励 model_diff < ref_diff
+            # DPO核心公式（含 Margin）：鼓励 model_diff < ref_diff
             # beta_dpo 控制与参考模型的偏离程度（越大越保守）
+            # margin: 当 inside_term 绝对值低于 margin 时，梯度被截断，避免对微弱偏好施加过大更新
             inside_term_cont = -self.beta_dpo * (model_diff_cont - ref_diff_cont)
-            loss_dpo_continuous = -torch.log(torch.sigmoid(inside_term_cont) + 1e-8)
+            if abs(inside_term_cont.item()) < self.dpo_margin:
+                # 偏好信号太弱，使用截断的 loss 以防不稳定
+                loss_dpo_continuous = torch.tensor(0.0, device=self.device)
+            else:
+                loss_dpo_continuous = -torch.log(torch.sigmoid(inside_term_cont) + 1e-8)
             
             # 记录连续特征的准确率（模型在winner上损失更小 → 正确）
             acc_results.append((model_diff_cont < 0).float())
@@ -642,7 +660,11 @@ class LightningModule(pl.LightningModule):
             model_diff_disc = model_loss_w_disc - model_loss_l_disc
             ref_diff_disc = ref_loss_w_disc - ref_loss_l_disc
             inside_term_disc = -self.beta_dpo * (model_diff_disc - ref_diff_disc)
-            loss_dpo_discrete = -torch.log(torch.sigmoid(inside_term_disc) + 1e-8)
+            # DPO Margin: 偏好信号太弱时截断梯度
+            if abs(inside_term_disc.item()) < self.dpo_margin:
+                loss_dpo_discrete = torch.tensor(0.0, device=self.device)
+            else:
+                loss_dpo_discrete = -torch.log(torch.sigmoid(inside_term_disc) + 1e-8)
             
             # 记录离散特征的准确率
             acc_results.append((model_diff_disc < 0).float())
