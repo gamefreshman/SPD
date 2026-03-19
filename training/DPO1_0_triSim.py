@@ -1474,20 +1474,19 @@ def main():
             print(f"   最低提升阈值: {self.score_threshold}")
         
         def _collect_and_save_metrics(self, pairs, epoch, train_loss=None, extra_metrics=None,
-                                      current_avg_score=None, ref_model_updated=None):
+                                      current_avg_score=None, ref_model_updated=None,
+                                      sampling_error=None):
             """收集偏好对指标并保存到 JSON 文件
             
             Args:
-                pairs: 偏好对列表
+                pairs: 偏好对列表（可以为空）
                 epoch: 当前 epoch
                 train_loss: 训练总损失
                 extra_metrics: 额外的训练指标字典 (loss_dpo, implicit_acc 等)
                 current_avg_score: 当前轮次的综合平均分（Iterative DPO）
                 ref_model_updated: 本轮是否更新了参考模型（Iterative DPO）
+                sampling_error: 采样过程中的异常信息（如果有）
             """
-            if len(pairs) == 0:
-                return
-            
             # 收集所有 winner 和 loser 的指标
             metric_keys = ['sims_surf_target', 'sims_esp_target', 'sims_pharm_target', 'total_score']
             
@@ -1495,7 +1494,6 @@ def main():
             loser_metrics = {k: [] for k in metric_keys}
             
             for pair in pairs:
-                # pair = (winner_mol, loser_mol, winner_scores_dict, loser_scores_dict)
                 w_scores = pair[2]
                 l_scores = pair[3]
                 for k in metric_keys:
@@ -1508,16 +1506,24 @@ def main():
                         if val is not None and val != float('-inf') and val != float('inf'):
                             loser_metrics[k].append(float(val))
             
-            # 计算平均值
             def safe_mean(vals):
                 return sum(vals) / len(vals) if len(vals) > 0 else 0.0
             
             winner_avg = {k: safe_mean(winner_metrics[k]) for k in metric_keys}
             loser_avg = {k: safe_mean(loser_metrics[k]) for k in metric_keys}
             
+            # 确定本轮状态
+            if sampling_error:
+                status = "error"
+            elif len(pairs) == 0:
+                status = "empty"
+            else:
+                status = "ok"
+            
             round_data = {
                 'round': self.epoch_counter,
                 'epoch': epoch,
+                'status': status,
                 'num_pairs': len(pairs),
                 'winner': winner_avg,
                 'loser': loser_avg,
@@ -1526,12 +1532,14 @@ def main():
                 'training_metrics': extra_metrics if extra_metrics else {},
                 # Iterative DPO 指标
                 'current_avg_score': current_avg_score,
-                'best_score': self.best_score,
+                'best_score': self.best_score if self.best_score > -float('inf') else None,
                 'ref_model_updated': ref_model_updated,
                 'best_score_epoch': self.best_score_epoch,
+                # 错误信息（如果有）
+                'sampling_error': sampling_error,
             }
             
-            # 同时记录每对的详细数据
+            # 记录每对的详细数据
             round_data['pairs_detail'] = []
             for pair in pairs:
                 w_scores = pair[2]
@@ -1549,7 +1557,7 @@ def main():
                 os.makedirs(os.path.dirname(self.metrics_file), exist_ok=True)
                 with open(self.metrics_file, 'w', encoding='utf-8') as f:
                     json.dump(self.round_metrics, f, ensure_ascii=False, indent=2)
-                print(f"📊 指标已保存到: {self.metrics_file}")
+                print(f"📊 指标已保存到: {self.metrics_file} (status={status})")
             except Exception as e:
                 print(f"⚠️  保存指标文件失败: {e}")
             
@@ -1560,7 +1568,7 @@ def main():
             DistributedSampler的total_size与实际数据集大小不一致的断言错误。
             reload_dataloaders_every_n_epochs=1会在下一个epoch开始时重建DataLoader。
             """
-            # 【修复】跳过 epoch 0（初始采样刚结束，还没像样地训练）
+            # 跳过 epoch 0（初始采样刚结束，还没像样地训练）
             sampling_interval = params['training'].get('dpo_sampling_every_n_epochs', 10)
             if trainer.current_epoch == 0:
                 print(f"  ⏩ 跳过 epoch 0 的重新采样（待训练 {sampling_interval} 个 epoch 后再采样）")
@@ -1570,24 +1578,52 @@ def main():
             
             if trainer.global_rank == 0:  # 只在主进程执行
                 self.epoch_counter += 1
-                print(f"\n🔄 Epoch {trainer.current_epoch} 结束: 开始DPO采样 (第{self.epoch_counter}次)")
+                print(f"\n{'='*80}")
+                print(f"🔄 Epoch {trainer.current_epoch} 结束: 开始DPO重采样 (第{self.epoch_counter}次)")
+                print(f"{'='*80}")
                 
-                num_samples = params.get('sampling', {}).get('num_samples_per_molecule', 4)
-                device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+                # ========== 读取本轮训练指标（在采样之前读取，避免被采样过程覆盖） ==========
+                train_loss_dict = {}
+                cached = getattr(pl_module, '_last_dpo_metrics', {})
+                if cached:
+                    train_loss_dict = cached.copy()
+                if not train_loss_dict:
+                    cb_metrics = trainer.callback_metrics
+                    for key in ['train_loss', 'loss_dpo', 'loss_std_on_winner',
+                                'implicit_acc', 'dpo_weight', 'model_loss_diff', 'ref_loss_diff']:
+                        if key in cb_metrics:
+                            train_loss_dict[key] = float(cb_metrics[key].item())
+                train_loss = train_loss_dict.get('train_loss', None)
                 
-                # 调用新的采样评估函数
-                new_pairs, avg_score = sample_and_evaluate_molecules(
-                    pl_module,
-                    self.params,
-                    self.molblocks_and_charges,
-                    self.dataset,
-                    num_samples_per_mol=num_samples,
-                    device=device
-                )
+                # ========== 执行采样与评估（包裹在 try-except 中防止静默失败） ==========
+                new_pairs = []
+                avg_score = -float('inf')
+                ref_model_updated = False
+                sampling_error = None
+                
+                try:
+                    num_samples = params.get('sampling', {}).get('num_samples_per_molecule', 4)
+                    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+                    
+                    new_pairs, avg_score = sample_and_evaluate_molecules(
+                        pl_module,
+                        self.params,
+                        self.molblocks_and_charges,
+                        self.dataset,
+                        num_samples_per_mol=num_samples,
+                        device=device
+                    )
+                    print(f"✅ 采样完成: {len(new_pairs)} 个偏好对, 平均分: {avg_score:.4f}")
+                    
+                except Exception as e:
+                    sampling_error = f"{type(e).__name__}: {str(e)}"
+                    print(f"\n❌ DPO 重采样失败!")
+                    print(f"   错误: {sampling_error}")
+                    traceback.print_exc()
+                    print(f"   训练将继续，但本轮不更新偏好对和参考模型")
                 
                 # ==================== Iterative DPO: Best-past-policy Anchor ====================
-                ref_model_updated = False
-                if self.iterative_dpo_enabled and len(new_pairs) > 0:
+                if self.iterative_dpo_enabled and len(new_pairs) > 0 and sampling_error is None:
                     score_improvement = avg_score - self.best_score
                     if score_improvement > self.score_threshold:
                         # 当前模型优于历史最佳 → 更新参考模型
@@ -1611,52 +1647,35 @@ def main():
                         if self.score_threshold > 0:
                             print(f"   最低提升阈值: {self.score_threshold}, 实际差值: {score_improvement:.4f}")
                 
-                # 更新偏好对
+                # ========== 更新偏好对 ==========
                 if len(new_pairs) > 0:
-                    # 添加新一轮的偏好对
                     self.pairs_history.append(new_pairs)
                     
-                    # 只保留最近两轮
                     if len(self.pairs_history) > self.max_rounds:
                         self.pairs_history = self.pairs_history[-self.max_rounds:]
                     
-                    # 合并所有保留轮次的偏好对
                     all_pairs = []
                     for round_pairs in self.pairs_history:
                         all_pairs.extend(round_pairs)
                     
-                    # 直接更新DPO数据集的偏好对
-                    # 下一个epoch开始时，reload_dataloaders_every_n_epochs=1
-                    # 会重建DataLoader和DistributedSampler，使用更新后的数据集大小
                     self.dpo_dataset.update_preference_pairs(all_pairs)
                     print(f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 (保留{len(self.pairs_history)}轮, 将在下一epoch生效)")
-                    
-                    # 从 pl_module._last_dpo_metrics 读取 DPO 训练指标
-                    train_loss_dict = {}
-                    
-                    # 优先读取模块缓存（每个 training_step 都会更新）
-                    cached = getattr(pl_module, '_last_dpo_metrics', {})
-                    if cached:
-                        train_loss_dict = cached.copy()
-                    
-                    # 如果缓存为空，再尝试从 trainer.callback_metrics 读取
-                    if not train_loss_dict:
-                        cb_metrics = trainer.callback_metrics
-                        for key in ['train_loss', 'loss_dpo', 'loss_std_on_winner',
-                                    'implicit_acc', 'dpo_weight', 'model_loss_diff', 'ref_loss_diff']:
-                            if key in cb_metrics:
-                                train_loss_dict[key] = float(cb_metrics[key].item())
-                    
-                    train_loss = train_loss_dict.get('train_loss', None)
-                    print(f"  📊 保存指标: train_loss={train_loss}, keys={list(train_loss_dict.keys())}")
-                    self._collect_and_save_metrics(
-                        new_pairs, trainer.current_epoch, train_loss, train_loss_dict,
-                        current_avg_score=avg_score,
-                        ref_model_updated=ref_model_updated,
-                    )
+                
+                # ========== 【关键修复】无论成功/失败/空结果，都保存指标 ==========
+                print(f"  📊 保存指标: train_loss={train_loss}, avg_score={avg_score:.4f}, pairs={len(new_pairs)}")
+                self._collect_and_save_metrics(
+                    new_pairs, trainer.current_epoch, train_loss, train_loss_dict,
+                    current_avg_score=avg_score if avg_score > -float('inf') else None,
+                    ref_model_updated=ref_model_updated,
+                    sampling_error=sampling_error,
+                )
 
     # 首次采样的 avg_score 作为 best_score 初始值
-    _initial_best_score = initial_avg_score if ('initial_avg_score' in dir() and initial_avg_score is not None) else -float('inf')
+    _initial_best_score = getattr(main, '_initial_avg_score', None)  # 占位，下面立刻赋值
+    try:
+        _initial_best_score = initial_avg_score  # 主进程中已定义
+    except NameError:
+        _initial_best_score = -float('inf')  # DDP 子进程中 initial_avg_score 未定义
     
     sampling_callback = DPOSamplingCallback(
         params=params,

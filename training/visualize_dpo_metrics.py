@@ -293,16 +293,31 @@ def plot_metrics(metrics: list, output_path: str):
     print(f"✅ 图表已保存到: {output_path}")
 
     # ==================== 数据摘要表格 ====================
-    print("\n" + "=" * 110)
-    print(f"{'Round':>6} {'Epoch':>6} {'Pairs':>6} {'W_Surf':>8} {'L_Surf':>8} "
-          f"{'W_Total':>8} {'L_Total':>8} {'Gap':>8} {'Loss':>10} {'DPO_Loss':>10} {'Acc':>6}")
-    print("-" * 110)
+    print("\n" + "=" * 150)
+    print(f"{'Round':>6} {'Epoch':>6} {'Status':>7} {'Pairs':>6} {'W_Surf':>8} {'L_Surf':>8} "
+          f"{'W_Total':>8} {'L_Total':>8} {'Gap':>8} {'Loss':>10} {'DPO_Loss':>10} {'Acc':>6} "
+          f"{'AvgScore':>9} {'BestScore':>10} {'RefUpd':>7}")
+    print("-" * 150)
     for m in metrics:
         loss_str = f"{m['train_loss']:.4f}" if m.get('train_loss') is not None else "N/A"
         tm = m.get('training_metrics', {})
         dpo_str = f"{tm['loss_dpo']:.4f}" if tm.get('loss_dpo') is not None else "N/A"
         acc_str = f"{tm['implicit_acc']:.3f}" if tm.get('implicit_acc') is not None else "N/A"
-        print(f"{m['round']:>6} {m['epoch']:>6} {m['num_pairs']:>6} "
+        
+        # Iterative DPO 字段
+        status = m.get('status', 'ok')
+        avg_score = m.get('current_avg_score')
+        avg_str = f"{avg_score:.4f}" if avg_score is not None else "N/A"
+        best_score = m.get('best_score')
+        best_str = f"{best_score:.4f}" if best_score is not None else "N/A"
+        ref_upd = m.get('ref_model_updated')
+        ref_str = "✓" if ref_upd else ("✗" if ref_upd is not None else "N/A")
+        
+        # 状态标记
+        status_str = status.upper() if status != 'ok' else 'OK'
+        error_info = m.get('sampling_error', '')
+        
+        print(f"{m['round']:>6} {m['epoch']:>6} {status_str:>7} {m['num_pairs']:>6} "
               f"{m['winner'].get('sims_surf_target', 0):>8.4f} "
               f"{m['loser'].get('sims_surf_target', 0):>8.4f} "
               f"{m['winner'].get('total_score', 0):>8.3f} "
@@ -310,8 +325,24 @@ def plot_metrics(metrics: list, output_path: str):
               f"{m.get('score_gap', 0):>8.3f} "
               f"{loss_str:>10} "
               f"{dpo_str:>10} "
-              f"{acc_str:>6}")
-    print("=" * 110)
+              f"{acc_str:>6} "
+              f"{avg_str:>9} "
+              f"{best_str:>10} "
+              f"{ref_str:>7}")
+        if error_info:
+            print(f"       ⚠️  ERROR: {error_info}")
+    print("=" * 150)
+    
+    # Iterative DPO 汇总
+    ref_updates = [m for m in metrics if m.get('ref_model_updated') == True]
+    errors = [m for m in metrics if m.get('status') == 'error']
+    if ref_updates or errors:
+        print(f"\n📊 Iterative DPO 汇总:")
+        print(f"   参考模型更新次数: {len(ref_updates)}")
+        if ref_updates:
+            print(f"   更新 epochs: {[m['epoch'] for m in ref_updates]}")
+        if errors:
+            print(f"   ⚠️  采样失败次数: {len(errors)} (epochs: {[m['epoch'] for m in errors]})")
 
 
 def main():
