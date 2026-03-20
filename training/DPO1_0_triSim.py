@@ -833,10 +833,10 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
     """
     评估生成的分子并构建偏好对 —— 仅基于 Surface Similarity
     
-    评分规则：total_score = sims_surf_target
-    不考虑 ESP、药效团、SA Score、LogP 等指标
+    评分规则：total_score = surf*1 + esp*3 + pharm*3 - sa*0.5 + 2.0
+    ESP和药效团为主导信号，Surface辅助，SA轻微惩罚
     """
-    print(f"\n🔍 [SurfOnly] 评估 {len(generated_samples)} 个生成样本 (仅Surface Similarity)...")
+    print(f"\n🔍 [TriSim] 评估 {len(generated_samples)} 个生成样本 (Surf*1 + ESP*3 + Pharm*3)...")
     
     # 按采样组ID分组（而不是按源分子分组），这样每个采样组都能独立构建偏好对
     from collections import defaultdict
@@ -1135,16 +1135,18 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             else:
                 try:
                     total_score = 0.0
-                    
+
                     # === 3D 特征目标 ===
-                    # 仅保留药效团相似度
-                    total_score += cond['sims_pharm_target'] * 2.0     # 药效团相似度
-                    
+                    # Surface形状（辅助）、ESP和药效团（主导）
+                    total_score += cond['sims_surf_target'] * 1.0     # Surface形状相似度
+                    total_score += cond['sims_esp_target'] * 3.0      # 静电势相似度
+                    total_score += cond['sims_pharm_target'] * 3.0    # 药效团相似度
+
                     # === 化学性质与成药性目标 ===
                     # SA Score - 合成可及性 (1最易，10最难)。越容易合成得分越高
                     sa_score = conf.get('sa_score', 10.0)
                     sa_normalized = (sa_score - 1.0) / 9.0
-                    total_score -= sa_normalized * 1.0  # 惩罚难以合成的分子
+                    total_score -= sa_normalized * 0.5  # 降低SA惩罚权重，避免主导评分
                     
                     # 分子有效性加成
                     total_score += 2.0  # 有效分子自带2.0的基础得分奖励
@@ -1175,33 +1177,39 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
             item['group_id'] = source_idx
         all_valid_molecules_across_groups.extend(valid_molecules)
         
-        # 尝试在组内构建偏好对（需要至少2个有效分子）
+        # 尝试在组内构建多个偏好对（top半 vs bottom半的所有满足gap的组合）
         if len(valid_molecules) >= 2:
-            winner = valid_molecules[0]
-            loser = valid_molecules[-1]
-            winner_score = winner['total_score']
-            loser_score = loser['total_score']
-            score_gap = winner_score - loser_score
-            min_gap = params.get('dpo', {}).get('min_score_gap', 0.05)  # 【修复】默认值降低到 0.05
-            
-            if score_gap >= min_gap:
-                winner_mol = create_rdkit_molecule(winner['sample'])
-                loser_mol = create_rdkit_molecule(loser['sample'])
-                
-                if winner_mol is not None and loser_mol is not None:
-                    pair = (
-                        winner_mol,
-                        loser_mol,
-                        {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner_score},
-                        {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser_score},
-                    )
-                    all_preference_pairs.append(pair)
-                    groups_with_pairs.add(source_idx)
-                    print(f"  ✅ 组 {source_idx} 偏好对构建成功: Winner={winner_score:.3f}, Loser={loser_score:.3f}, Gap={score_gap:.3f}")
-                else:
-                    print(f"  ❌ 组 {source_idx} 偏好对构建失败: 分子重构失败")
+            min_gap = params.get('dpo', {}).get('min_score_gap', 0.05)
+            mid = max(1, len(valid_molecules) // 2)
+            group_pair_count = 0
+
+            for w_idx in range(mid):
+                for l_idx in range(mid, len(valid_molecules)):
+                    winner = valid_molecules[w_idx]
+                    loser = valid_molecules[l_idx]
+                    winner_score = winner['total_score']
+                    loser_score = loser['total_score']
+                    score_gap = winner_score - loser_score
+
+                    if score_gap >= min_gap:
+                        winner_mol = create_rdkit_molecule(winner['sample'])
+                        loser_mol = create_rdkit_molecule(loser['sample'])
+
+                        if winner_mol is not None and loser_mol is not None:
+                            pair = (
+                                winner_mol,
+                                loser_mol,
+                                {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner_score},
+                                {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser_score},
+                            )
+                            all_preference_pairs.append(pair)
+                            group_pair_count += 1
+
+            if group_pair_count > 0:
+                groups_with_pairs.add(source_idx)
+                print(f"  ✅ 组 {source_idx} 构建了 {group_pair_count} 个偏好对 (top{mid} vs bottom{len(valid_molecules)-mid})")
             else:
-                print(f"  ⚠️  组 {source_idx} 组内分差不足 ({score_gap:.3f} < {min_gap})，等待跨组匹配")
+                print(f"  ⚠️  组 {source_idx} 组内分差不足 (min_gap={min_gap})，等待跨组匹配")
         else:
             print(f"  ⚠️  组 {source_idx} 有效分子不足 ({len(valid_molecules)}<2)，等待跨组匹配")
     
@@ -1468,10 +1476,13 @@ def main():
             self.ref_update_history = []           # 参考模型更新历史
             self.iterative_dpo_enabled = params['training'].get('iterative_dpo_enabled', True)
             self.score_threshold = params['training'].get('iterative_dpo_score_threshold', 0.0)
+            self.force_update_every_n_rounds = params['training'].get('iterative_dpo_force_update_every_n_rounds', 10)
+            self.rounds_since_last_update = 0  # 距离上次参考模型更新的轮数
             print(f"\n🏗️  Iterative DPO 配置:")
             print(f"   启用: {self.iterative_dpo_enabled}")
             print(f"   初始 best_score: {self.best_score:.4f}")
             print(f"   最低提升阈值: {self.score_threshold}")
+            print(f"   强制更新间隔: 每 {self.force_update_every_n_rounds} 轮")
         
         def _collect_and_save_metrics(self, pairs, epoch, train_loss=None, extra_metrics=None,
                                       current_avg_score=None, ref_model_updated=None,
@@ -1624,7 +1635,11 @@ def main():
                 
                 # ==================== Iterative DPO: Best-past-policy Anchor ====================
                 if self.iterative_dpo_enabled and len(new_pairs) > 0 and sampling_error is None:
+                    self.rounds_since_last_update += 1
                     score_improvement = avg_score - self.best_score
+                    force_update = (self.force_update_every_n_rounds > 0 and
+                                    self.rounds_since_last_update >= self.force_update_every_n_rounds)
+
                     if score_improvement > self.score_threshold:
                         # 当前模型优于历史最佳 → 更新参考模型
                         self.best_score = avg_score
@@ -1634,15 +1649,34 @@ def main():
                         for p in pl_module.ref_model.parameters():
                             p.requires_grad = False
                         ref_model_updated = True
+                        self.rounds_since_last_update = 0
                         self.ref_update_history.append({
                             'epoch': trainer.current_epoch,
                             'score': avg_score,
                             'improvement': score_improvement,
+                            'reason': 'score_improved',
                         })
                         print(f"\n🏆 参考模型已更新! 新最高分: {avg_score:.4f} (提升: +{score_improvement:.4f})")
                         print(f"   历史更新次数: {len(self.ref_update_history)}")
+                    elif force_update:
+                        # 超过N轮未更新 → 强制用当前模型作为新参考，防止参考模型过时
+                        pl_module.ref_model.load_state_dict(pl_module.model.state_dict())
+                        pl_module.ref_model.eval()
+                        for p in pl_module.ref_model.parameters():
+                            p.requires_grad = False
+                        ref_model_updated = True
+                        self.rounds_since_last_update = 0
+                        self.ref_update_history.append({
+                            'epoch': trainer.current_epoch,
+                            'score': avg_score,
+                            'improvement': score_improvement,
+                            'reason': 'force_update',
+                        })
+                        print(f"\n🔄 参考模型强制更新! (连续 {self.force_update_every_n_rounds} 轮未提升)")
+                        print(f"   当前分: {avg_score:.4f}, 历史最佳: {self.best_score:.4f}")
+                        print(f"   历史更新次数: {len(self.ref_update_history)}")
                     else:
-                        print(f"\n⏸️  参考模型保持不变")
+                        print(f"\n⏸️  参考模型保持不变 (距下次强制更新还有 {self.force_update_every_n_rounds - self.rounds_since_last_update} 轮)")
                         print(f"   当前分: {avg_score:.4f}, 历史最佳: {self.best_score:.4f} @ epoch {self.best_score_epoch}")
                         if self.score_threshold > 0:
                             print(f"   最低提升阈值: {self.score_threshold}, 实际差值: {score_improvement:.4f}")

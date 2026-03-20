@@ -66,16 +66,16 @@ params = {
         'enable_dpo': True,  # 启用DPO微调
         
         # DPO核心参数
-        'beta_dpo': 1.0,  # 增大β限制与ref_model偏离 (1.0)
+        'beta_dpo': 0.3,  # 降低β允许更大探索空间 (原1.0→0.3)
         'dpo_ramp_up_epochs': 10,  # 更缓慢地增加DPO权重
-        'dpo_max_weight': 0.3,  # 降低DPO损失占比，避免过度偏离
+        'dpo_max_weight': 0.5,  # 增加DPO损失权重，使偏好信号更强 (原0.3→0.5)
         
         # 采样策略（针对小数据集调整）
         'dpo_sampling_ratio': 1.0,  # 每个epoch对所有3个分子采样（100%）
         'dpo_batch_ratio': 1,  # DPO batch占总batch的50%
         
         # 偏好对构建
-        'dpo_min_score_gap': 0.1,  # 适配3D相似度的小分差范围
+        'dpo_min_score_gap': 0.05,  # 降低阈值接受更多偏好对 (原0.1→0.05)
         'dpo_keep_old_ratio': 0.5,  # 保留更多旧偏好对
         
         # checkpoint和采样控制
@@ -92,6 +92,7 @@ params = {
         # ==================== Iterative DPO: Best-past-policy Anchor ====================
         'iterative_dpo_enabled': True,           # 启用 Best-past-policy Anchor（动态更新 ref_model）
         'iterative_dpo_score_threshold': 0.0,    # 最低分数提升阈值（避免微小噪声触发更新，0.0 = 只要超过就更新）
+        'iterative_dpo_force_update_every_n_rounds': 10,  # 最多10轮必须强制更新参考模型，防止过时
     },
     
     # ==================== DPO采样配置 ====================
@@ -104,7 +105,7 @@ params = {
     # ==================== DPO评分权重 ====================
     'dpo': {
         'sampling_ratio': 1.0,
-        'min_score_gap': 0.1,  # 适配3D相似度的小分差范围
+        'min_score_gap': 0.05,  # 降低阈值接受更多偏好对 (原0.1→0.05)
     },
     
     
