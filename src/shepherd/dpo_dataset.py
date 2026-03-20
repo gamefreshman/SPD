@@ -171,12 +171,14 @@ class DPODataset(Dataset):
         """
         winner_mol, loser_mol, score_w, score_l = self.preference_pairs[idx]
         
-        # 生成共享的噪声和时间步（DPO的关键：winner和loser使用相同的噪声）
+        # 生成共享的时间步（DPO的关键：winner和loser使用相同的时间步）
         shared_timestep = np.random.uniform(0, 1)
-        
-        # 将分子转换为HeteroData格式（使用相同的seed确保相同噪声）
-        winner_data = self._mol_to_hetero_data(winner_mol, shared_timestep, seed=idx)
-        loser_data = self._mol_to_hetero_data(loser_mol, shared_timestep, seed=idx)
+
+        # 将分子转换为HeteroData格式
+        # Winner和Loser使用不同的seed，确保噪声独立（但时间步相同）
+        # 使用相同seed会导致两个不同结构的分子得到相同的随机数序列，不是有意义的"共享噪声"
+        winner_data = self._mol_to_hetero_data(winner_mol, shared_timestep, seed=idx * 2)
+        loser_data = self._mol_to_hetero_data(loser_mol, shared_timestep, seed=idx * 2 + 1)
         
         # 构造返回的batch
         batch = {
@@ -281,7 +283,20 @@ class DPODataset(Dataset):
         # === x3模态：使用真实的get_x3_data方法（如果启用）===
         if self.params['dataset'].get('compute_x3', False):
             from shepherd.shepherd_score_utils.generate_point_cloud import get_atomic_vdw_radii
-            charges = np.zeros(mol.GetNumAtoms())
+            from shepherd.new_datasets import get_atomic_partial_charges
+            # 使用MMFF94计算真实电荷（与预训练一致），避免全零导致x3特征退化
+            try:
+                charges = get_atomic_partial_charges(mol)
+            except Exception:
+                # MMFF94失败时使用Gasteiger电荷作为后备
+                try:
+                    import rdkit.Chem.AllChem
+                    rdkit.Chem.AllChem.ComputeGasteigerCharges(mol)
+                    charges = np.array([a.GetDoubleProp('_GasteigerCharge') for a in mol.GetAtoms()])
+                    # 处理NaN值
+                    charges = np.nan_to_num(charges, nan=0.0)
+                except Exception:
+                    charges = np.zeros(mol.GetNumAtoms())
             charge_centers = mol_coordinates
             num_points_x3 = self.params['dataset']['x3']['num_points']
             radii_x3 = get_atomic_vdw_radii(mol)

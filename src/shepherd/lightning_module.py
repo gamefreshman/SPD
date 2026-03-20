@@ -581,17 +581,18 @@ class LightningModule(pl.LightningModule):
             output_ref_winner = self.ref_model.forward(input_winner)[1]
             output_ref_loser = self.ref_model.forward(input_loser)[1]
 
-        loss_dpo_continuous = torch.tensor(0.0, device=self.device)
-        loss_dpo_discrete = torch.tensor(0.0, device=self.device)
-        
+        # 使用 requires_grad=True 的零tensor初始化，避免断开计算图
+        loss_dpo_continuous = torch.zeros(1, device=self.device, requires_grad=False).squeeze()
+        loss_dpo_discrete = torch.zeros(1, device=self.device, requires_grad=False).squeeze()
+
         # 用于汇总 implicit_acc 的列表
         acc_results = []
-        
+
         # 分别记录连续和离散特征的 diff，避免变量覆盖
-        model_diff_cont = torch.tensor(0.0, device=self.device)
-        ref_diff_cont = torch.tensor(0.0, device=self.device)
-        model_diff_disc = torch.tensor(0.0, device=self.device)
-        ref_diff_disc = torch.tensor(0.0, device=self.device)
+        model_diff_cont = torch.zeros(1, device=self.device).squeeze()
+        ref_diff_cont = torch.zeros(1, device=self.device).squeeze()
+        model_diff_disc = torch.zeros(1, device=self.device).squeeze()
+        ref_diff_disc = torch.zeros(1, device=self.device).squeeze()
 
         if self.train_x1_denoising:
             # ========== 计算连续特征（原子位置）的DPO损失 ==========
@@ -606,32 +607,29 @@ class LightningModule(pl.LightningModule):
             noise_true_w = input_winner['x1']['decoder']['pos_noise']
             noise_true_l = input_loser['x1']['decoder']['pos_noise']
             
-            # MSE损失：衡量模型去噪能力
-            model_loss_w_cont = torch.mean((noise_pred_w[mask_w] - noise_true_w[mask_w]) ** 2)
-            model_loss_l_cont = torch.mean((noise_pred_l[mask_l] - noise_true_l[mask_l]) ** 2)
-            
+            # MSE损失：使用 sum/n_atoms 归一化，确保不同原子数的分子可公平比较
+            n_atoms_w = mask_w.sum().clamp(min=1)
+            n_atoms_l = mask_l.sum().clamp(min=1)
+            model_loss_w_cont = torch.sum((noise_pred_w[mask_w] - noise_true_w[mask_w]) ** 2) / n_atoms_w
+            model_loss_l_cont = torch.sum((noise_pred_l[mask_l] - noise_true_l[mask_l]) ** 2) / n_atoms_l
+
             # 计算参考模型的位置预测损失（作为基准）
-            noise_ref_w = output_ref_winner['x1']['decoder']['denoiser']['pos_out']
-            noise_ref_l = output_ref_loser['x1']['decoder']['denoiser']['pos_out']
-            
-            ref_loss_w_cont = torch.mean((noise_ref_w[mask_w] - noise_true_w[mask_w]) ** 2)
-            ref_loss_l_cont = torch.mean((noise_ref_l[mask_l] - noise_true_l[mask_l]) ** 2)
-            
+            noise_ref_w = output_ref_winner['x1']['decoder']['denoiser']['pos_out'].detach()
+            noise_ref_l = output_ref_loser['x1']['decoder']['denoiser']['pos_out'].detach()
+
+            ref_loss_w_cont = torch.sum((noise_ref_w[mask_w] - noise_true_w[mask_w]) ** 2) / n_atoms_w
+            ref_loss_l_cont = torch.sum((noise_ref_l[mask_l] - noise_true_l[mask_l]) ** 2) / n_atoms_l
+
             # DPO损失计算（基于Bradley-Terry偏好模型）
             # model_diff < 0 表示模型在winner上表现更好（损失更小），这是我们期望的
             model_diff_cont = model_loss_w_cont - model_loss_l_cont
             ref_diff_cont = ref_loss_w_cont - ref_loss_l_cont
-            
-            # DPO核心公式（含 Margin）：鼓励 model_diff < ref_diff
-            # beta_dpo 控制与参考模型的偏离程度（越大越保守）
-            # margin: 当 inside_term 绝对值低于 margin 时，梯度被截断，避免对微弱偏好施加过大更新
+
+            # DPO核心公式：鼓励 model_diff < ref_diff
+            # inside_term > 0 时 sigmoid > 0.5，loss 较小（正确偏好方向）
             inside_term_cont = -self.beta_dpo * (model_diff_cont - ref_diff_cont)
-            if abs(inside_term_cont.item()) < self.dpo_margin:
-                # 偏好信号太弱，使用截断的 loss 以防不稳定
-                loss_dpo_continuous = torch.tensor(0.0, device=self.device)
-            else:
-                loss_dpo_continuous = -torch.log(torch.sigmoid(inside_term_cont) + 1e-8)
-            
+            loss_dpo_continuous = -torch.log(torch.sigmoid(inside_term_cont) + 1e-8)
+
             # 记录连续特征的准确率（模型在winner上损失更小 → 正确）
             acc_results.append((model_diff_cont < 0).float())
 
@@ -639,33 +637,32 @@ class LightningModule(pl.LightningModule):
             # ========== 计算离散特征（原子类型）的DPO损失 ==========
             mask_w = ~input_winner['x1']['decoder']['virtual_node_mask']
             mask_l = ~input_loser['x1']['decoder']['virtual_node_mask']
-            
+
             # 获取原子类型预测
             logits_w = output_model_winner['x1']['decoder']['denoiser']['x_out']
             logits_l = output_model_loser['x1']['decoder']['denoiser']['x_out']
             true_labels_w = torch.argmax(input_winner['x1']['decoder']['true_atom_types_t0'], dim=1)
             true_labels_l = torch.argmax(input_loser['x1']['decoder']['true_atom_types_t0'], dim=1)
-            
-            model_loss_w_disc = F.cross_entropy(logits_w[mask_w], true_labels_w[mask_w])
-            model_loss_l_disc = F.cross_entropy(logits_l[mask_l], true_labels_l[mask_l])
-            
-            # Ref losses
-            logits_ref_w = output_ref_winner['x1']['decoder']['denoiser']['x_out']
-            logits_ref_l = output_ref_loser['x1']['decoder']['denoiser']['x_out']
-            
-            ref_loss_w_disc = F.cross_entropy(logits_ref_w[mask_w], true_labels_w[mask_w])
-            ref_loss_l_disc = F.cross_entropy(logits_ref_l[mask_l], true_labels_l[mask_l])
-            
-            # 应用相同的DPO公式到离散特征
+
+            # 使用 sum + 归一化，确保不同原子数可公平比较
+            n_atoms_w_disc = mask_w.sum().clamp(min=1).float()
+            n_atoms_l_disc = mask_l.sum().clamp(min=1).float()
+            model_loss_w_disc = F.cross_entropy(logits_w[mask_w], true_labels_w[mask_w], reduction='sum') / n_atoms_w_disc
+            model_loss_l_disc = F.cross_entropy(logits_l[mask_l], true_labels_l[mask_l], reduction='sum') / n_atoms_l_disc
+
+            # Ref losses（显式 detach 确保无梯度流向 ref_model）
+            logits_ref_w = output_ref_winner['x1']['decoder']['denoiser']['x_out'].detach()
+            logits_ref_l = output_ref_loser['x1']['decoder']['denoiser']['x_out'].detach()
+
+            ref_loss_w_disc = F.cross_entropy(logits_ref_w[mask_w], true_labels_w[mask_w], reduction='sum') / n_atoms_w_disc
+            ref_loss_l_disc = F.cross_entropy(logits_ref_l[mask_l], true_labels_l[mask_l], reduction='sum') / n_atoms_l_disc
+
+            # DPO公式：直接计算，不截断梯度
             model_diff_disc = model_loss_w_disc - model_loss_l_disc
             ref_diff_disc = ref_loss_w_disc - ref_loss_l_disc
             inside_term_disc = -self.beta_dpo * (model_diff_disc - ref_diff_disc)
-            # DPO Margin: 偏好信号太弱时截断梯度
-            if abs(inside_term_disc.item()) < self.dpo_margin:
-                loss_dpo_discrete = torch.tensor(0.0, device=self.device)
-            else:
-                loss_dpo_discrete = -torch.log(torch.sigmoid(inside_term_disc) + 1e-8)
-            
+            loss_dpo_discrete = -torch.log(torch.sigmoid(inside_term_disc) + 1e-8)
+
             # 记录离散特征的准确率
             acc_results.append((model_diff_disc < 0).float())
 
