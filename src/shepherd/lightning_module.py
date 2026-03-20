@@ -54,20 +54,15 @@ class LightningModule(pl.LightningModule):
     def get_dpo_weight(self):
         if not self.enable_dpo:
             return 0.0
-        
+
         epoch = self.current_epoch
         if epoch < self.dpo_ramp_up_epochs:
             # 预热期：线性从 0 增长到 dpo_max_weight
-            return  (epoch + 1) * self.dpo_max_weight / self.dpo_ramp_up_epochs
-        elif epoch < self.dpo_late_phase_epoch:
-            # 稳定期：维持 dpo_max_weight
-            return self.dpo_max_weight
+            return (epoch + 1) * self.dpo_max_weight / self.dpo_ramp_up_epochs
         else:
-            # 后期：DPO 权重从 dpo_max_weight 线性增长到 2 × dpo_max_weight
-            # 让模型更多地被偏好信号驱动，Std Loss 逐渐退居二线
-            late_epochs = epoch - self.dpo_late_phase_epoch
-            growth = min(late_epochs / 30.0, 1.0)  # 30 epochs 内增长到上限
-            return self.dpo_max_weight * (1.0 + growth)
+            # 稳定期：维持 dpo_max_weight（不再随epoch无限增长）
+            # 之前的 late_phase 策略会导致DPO权重增长到2x，破坏训练稳定性
+            return self.dpo_max_weight
 
     def load_state_dict(self, state_dict, strict: bool = True):
         """

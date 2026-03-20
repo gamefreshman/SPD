@@ -66,22 +66,22 @@ params = {
         'enable_dpo': True,  # 启用DPO微调
         
         # DPO核心参数
-        'beta_dpo': 0.3,  # 降低β允许更大探索空间 (原1.0→0.3)
-        'dpo_ramp_up_epochs': 10,  # 更缓慢地增加DPO权重
-        'dpo_max_weight': 0.5,  # 增加DPO损失权重，使偏好信号更强 (原0.3→0.5)
+        'beta_dpo': 0.1,  # 降低β使模型可以更大幅度偏离ref (0.3→0.1)，加速偏好学习
+        'dpo_ramp_up_epochs': 3,  # 更快进入全力DPO训练 (10→3)
+        'dpo_max_weight': 0.8,  # 提高DPO权重，让偏好信号主导 (0.5→0.8)
         
         # 采样策略（针对小数据集调整）
         'dpo_sampling_ratio': 1.0,  # 每个epoch对所有3个分子采样（100%）
         'dpo_batch_ratio': 1,  # DPO batch占总batch的50%
         
         # 偏好对构建
-        'dpo_min_score_gap': 0.05,  # 降低阈值接受更多偏好对 (原0.1→0.05)
-        'dpo_keep_old_ratio': 0.5,  # 保留更多旧偏好对
+        'dpo_min_score_gap': 0.1,  # 提高阈值，只保留区分度大的偏好对 (0.05→0.1)，减少噪声对
+        'dpo_keep_old_ratio': 0.3,  # 减少旧对比例，优先用新鲜偏好对 (0.5→0.3)
         
         # checkpoint和采样控制
         'dpo_skip_first_epoch': False,  # 从epoch 0就开始采样
         'dpo_load_weights_only': True,  # 从旧checkpoint只加载权重
-        'dpo_sampling_every_n_epochs': 5,  # 每5个epoch重新采样偏好对（防止小数据集过拟合）
+        'dpo_sampling_every_n_epochs': 3,  # 更频繁采样新偏好对 (5→3)，让模型用更新的偏好对训练
         
         # 预训练模型路径（从MOSES_aq模型开始微调）
         'pretrained_checkpoint_path': '/home1/zhh/workspace/SPD/evaluation/ckpt/last_33epoch.ckpt',
@@ -92,20 +92,20 @@ params = {
         # ==================== Iterative DPO: Best-past-policy Anchor ====================
         'iterative_dpo_enabled': True,           # 启用 Best-past-policy Anchor（动态更新 ref_model）
         'iterative_dpo_score_threshold': 0.0,    # 最低分数提升阈值（避免微小噪声触发更新，0.0 = 只要超过就更新）
-        'iterative_dpo_force_update_every_n_rounds': 10,  # 最多10轮必须强制更新参考模型，防止过时
+        'iterative_dpo_force_update_every_n_rounds': 5,  # 更频繁强制更新 (10→5)，防止ref_model过时导致信号失效
     },
     
     # ==================== DPO采样配置 ====================
     'sampling': {
         'timesteps': 400,  # 采样步数（与训练T一致）
-        'num_samples_per_molecule': 8,  # 增加采样数以获得更好的偏好对对比
+        'num_samples_per_molecule': 16,  # 增加采样数 (8→16)，产生更多偏好对，提升信号稳定性
         'fixed_n_atoms': 70,  # 固定生成的原子数（与预训练模型一致）
     },
     
     # ==================== DPO评分权重 ====================
     'dpo': {
         'sampling_ratio': 1.0,
-        'min_score_gap': 0.05,  # 降低阈值接受更多偏好对 (原0.1→0.05)
+        'min_score_gap': 0.1,  # 与training.dpo_min_score_gap保持一致
     },
     
     
