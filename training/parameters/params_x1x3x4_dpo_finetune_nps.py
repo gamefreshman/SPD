@@ -48,7 +48,7 @@ params = {
         'accumulate_grad_batches': 4,  # 累积4步梯度再更新，平滑DPO噪声
         'num_gpus': 2,  # 单GPU
         
-        'lr': 0.000005,  # 降低学习率防止遗忘（5e-6）
+        'lr': 0.000002,  # 更小学习率防止灾难性遗忘（2e-6）
         'min_lr': 0.000001,  # 最低 1e-6
         'lr_steps': 10000,  # 缓慢衰减，原值为1会导致学习率瞬间降到min_lr
         
@@ -66,16 +66,16 @@ params = {
         'enable_dpo': True,  # 启用DPO微调
         
         # DPO核心参数
-        'beta_dpo': 0.1,  # 降低β使模型可以更大幅度偏离ref (0.3→0.1)，加速偏好学习
-        'dpo_ramp_up_epochs': 3,  # 更快进入全力DPO训练 (10→3)
-        'dpo_max_weight': 0.8,  # 提高DPO权重，让偏好信号主导 (0.5→0.8)
+        'beta_dpo': 0.3,  # 提高KL约束，防止过度偏离ref (0.1→0.3)，保护生成多样性
+        'dpo_ramp_up_epochs': 10,  # 慢速提升DPO权重，先稳定基础去噪 (3→10)
+        'dpo_max_weight': 0.3,  # 降低DPO权重，70%给标准去噪保护生成质量 (0.8→0.3)
         
         # 采样策略（针对小数据集调整）
         'dpo_sampling_ratio': 1.0,  # 每个epoch对所有3个分子采样（100%）
         'dpo_batch_ratio': 1,  # DPO batch占总batch的50%
         
         # 偏好对构建
-        'dpo_min_score_gap': 0.1,  # 提高阈值，只保留区分度大的偏好对 (0.05→0.1)，减少噪声对
+        'dpo_min_score_gap': 0.15,  # 提高阈值，只保留区分度更大的偏好对 (0.1→0.15)，减少噪声对
         'dpo_keep_old_ratio': 0.3,  # 减少旧对比例，优先用新鲜偏好对 (0.5→0.3)
         
         # checkpoint和采样控制
@@ -105,7 +105,7 @@ params = {
     # ==================== DPO评分权重 ====================
     'dpo': {
         'sampling_ratio': 1.0,
-        'min_score_gap': 0.1,  # 与training.dpo_min_score_gap保持一致
+        'min_score_gap': 0.15,  # 与training.dpo_min_score_gap保持一致
     },
     
     

@@ -661,6 +661,87 @@ class LightningModule(pl.LightningModule):
             # 记录离散特征的准确率
             acc_results.append((model_diff_disc < 0).float())
 
+        # ========== 计算 x4 药效团的 DPO 损失（类型 + 位置 + 方向） ==========
+        if self.train_x4_denoising and 'x4' in input_winner:
+            mask_w_x4 = ~input_winner['x4']['decoder']['virtual_node_mask']
+            mask_l_x4 = ~input_loser['x4']['decoder']['virtual_node_mask']
+
+            n_x4_w = mask_w_x4.sum().clamp(min=1).float()
+            n_x4_l = mask_l_x4.sum().clamp(min=1).float()
+
+            # --- x4 离散特征（药效团类型）DPO loss ---
+            logits_w_x4 = output_model_winner['x4']['decoder']['denoiser']['x_out']
+            logits_l_x4 = output_model_loser['x4']['decoder']['denoiser']['x_out']
+            true_labels_w_x4 = torch.argmax(input_winner['x4']['decoder']['true_pharm_types_t0'], dim=1)
+            true_labels_l_x4 = torch.argmax(input_loser['x4']['decoder']['true_pharm_types_t0'], dim=1)
+
+            model_loss_w_x4_disc = F.cross_entropy(logits_w_x4[mask_w_x4], true_labels_w_x4[mask_w_x4], reduction='sum') / n_x4_w
+            model_loss_l_x4_disc = F.cross_entropy(logits_l_x4[mask_l_x4], true_labels_l_x4[mask_l_x4], reduction='sum') / n_x4_l
+
+            logits_ref_w_x4 = output_ref_winner['x4']['decoder']['denoiser']['x_out'].detach()
+            logits_ref_l_x4 = output_ref_loser['x4']['decoder']['denoiser']['x_out'].detach()
+            ref_loss_w_x4_disc = F.cross_entropy(logits_ref_w_x4[mask_w_x4], true_labels_w_x4[mask_w_x4], reduction='sum') / n_x4_w
+            ref_loss_l_x4_disc = F.cross_entropy(logits_ref_l_x4[mask_l_x4], true_labels_l_x4[mask_l_x4], reduction='sum') / n_x4_l
+
+            model_diff_x4_disc = model_loss_w_x4_disc - model_loss_l_x4_disc
+            ref_diff_x4_disc = ref_loss_w_x4_disc - ref_loss_l_x4_disc
+            inside_term_x4_disc = -self.beta_dpo * (model_diff_x4_disc - ref_diff_x4_disc)
+            loss_dpo_x4_disc = -torch.log(torch.sigmoid(inside_term_x4_disc) + 1e-8)
+
+            acc_results.append((model_diff_x4_disc < 0).float())
+
+            # --- x4 连续特征（药效团位置）DPO loss ---
+            pos_pred_w_x4 = output_model_winner['x4']['decoder']['denoiser']['pos_out']
+            pos_pred_l_x4 = output_model_loser['x4']['decoder']['denoiser']['pos_out']
+            pos_true_w_x4 = input_winner['x4']['decoder']['pos_noise']
+            pos_true_l_x4 = input_loser['x4']['decoder']['pos_noise']
+
+            model_loss_w_x4_pos = torch.sum((pos_pred_w_x4[mask_w_x4] - pos_true_w_x4[mask_w_x4]) ** 2) / n_x4_w
+            model_loss_l_x4_pos = torch.sum((pos_pred_l_x4[mask_l_x4] - pos_true_l_x4[mask_l_x4]) ** 2) / n_x4_l
+
+            pos_ref_w_x4 = output_ref_winner['x4']['decoder']['denoiser']['pos_out'].detach()
+            pos_ref_l_x4 = output_ref_loser['x4']['decoder']['denoiser']['pos_out'].detach()
+            ref_loss_w_x4_pos = torch.sum((pos_ref_w_x4[mask_w_x4] - pos_true_w_x4[mask_w_x4]) ** 2) / n_x4_w
+            ref_loss_l_x4_pos = torch.sum((pos_ref_l_x4[mask_l_x4] - pos_true_l_x4[mask_l_x4]) ** 2) / n_x4_l
+
+            model_diff_x4_pos = model_loss_w_x4_pos - model_loss_l_x4_pos
+            ref_diff_x4_pos = ref_loss_w_x4_pos - ref_loss_l_x4_pos
+            inside_term_x4_pos = -self.beta_dpo * (model_diff_x4_pos - ref_diff_x4_pos)
+            loss_dpo_x4_pos = -torch.log(torch.sigmoid(inside_term_x4_pos) + 1e-8)
+
+            acc_results.append((model_diff_x4_pos < 0).float())
+
+            # --- x4 连续特征（药效团方向）DPO loss ---
+            dir_pred_w_x4 = output_model_winner['x4']['decoder']['denoiser']['direction_out']
+            dir_pred_l_x4 = output_model_loser['x4']['decoder']['denoiser']['direction_out']
+            dir_true_w_x4 = input_winner['x4']['decoder']['direction_noise']
+            dir_true_l_x4 = input_loser['x4']['decoder']['direction_noise']
+
+            model_loss_w_x4_dir = torch.sum((dir_pred_w_x4[mask_w_x4] - dir_true_w_x4[mask_w_x4]) ** 2) / n_x4_w
+            model_loss_l_x4_dir = torch.sum((dir_pred_l_x4[mask_l_x4] - dir_true_l_x4[mask_l_x4]) ** 2) / n_x4_l
+
+            dir_ref_w_x4 = output_ref_winner['x4']['decoder']['denoiser']['direction_out'].detach()
+            dir_ref_l_x4 = output_ref_loser['x4']['decoder']['denoiser']['direction_out'].detach()
+            ref_loss_w_x4_dir = torch.sum((dir_ref_w_x4[mask_w_x4] - dir_true_w_x4[mask_w_x4]) ** 2) / n_x4_w
+            ref_loss_l_x4_dir = torch.sum((dir_ref_l_x4[mask_l_x4] - dir_true_l_x4[mask_l_x4]) ** 2) / n_x4_l
+
+            model_diff_x4_dir = model_loss_w_x4_dir - model_loss_l_x4_dir
+            ref_diff_x4_dir = ref_loss_w_x4_dir - ref_loss_l_x4_dir
+            inside_term_x4_dir = -self.beta_dpo * (model_diff_x4_dir - ref_diff_x4_dir)
+            loss_dpo_x4_dir = -torch.log(torch.sigmoid(inside_term_x4_dir) + 1e-8)
+
+            acc_results.append((model_diff_x4_dir < 0).float())
+
+            # 汇总 x4 DPO loss 到总量
+            loss_dpo_discrete = loss_dpo_discrete + loss_dpo_x4_disc
+            loss_dpo_continuous = loss_dpo_continuous + loss_dpo_x4_pos + loss_dpo_x4_dir
+
+            # 汇总 x4 diff 到总量
+            model_diff_disc = model_diff_disc + model_diff_x4_disc
+            ref_diff_disc = ref_diff_disc + ref_diff_x4_disc
+            model_diff_cont = model_diff_cont + model_diff_x4_pos + model_diff_x4_dir
+            ref_diff_cont = ref_diff_cont + ref_diff_x4_pos + ref_diff_x4_dir
+
         # 隐式准确率：综合连续和离散特征的结果
         # 对所有分项取平均，反映模型整体偏好识别能力
         if len(acc_results) > 0:

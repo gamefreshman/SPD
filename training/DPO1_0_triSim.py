@@ -1146,7 +1146,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                     # SA Score - 合成可及性 (1最易，10最难)。越容易合成得分越高
                     sa_score = conf.get('sa_score', 10.0)
                     sa_normalized = (sa_score - 1.0) / 9.0
-                    total_score -= sa_normalized * 0.5  # 降低SA惩罚权重，避免主导评分
+                    total_score -= sa_normalized * 1.5  # 增强SA惩罚权重，引导偏好更易合成的分子
                     
                     # 分子有效性加成
                     total_score += 2.0  # 有效分子自带2.0的基础得分奖励
