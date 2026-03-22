@@ -817,7 +817,7 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     print("="*80)
     
     # 使用ConfEval和ConditionalEvalPipeline评估
-    preference_pairs, avg_score = evaluate_and_build_pairs(
+    preference_pairs, avg_score, validity_stats = evaluate_and_build_pairs(
         all_generated_samples,
         all_reference_mols,
         molblocks_and_charges,
@@ -826,7 +826,7 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     
     model_pl.train()
     
-    return preference_pairs, avg_score
+    return preference_pairs, avg_score, validity_stats
 
 
 def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_charges, params):
@@ -849,6 +849,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
     
     all_preference_pairs = []
     all_valid_molecules_across_groups = []  # 收集所有组的有效分子，用于跨组匹配
+    total_invalid_count = 0  # 跨组累计无效分子数
     groups_with_pairs = set()  # 记录已成功构建偏好对的组
     
     # 为每组分子评估
@@ -1164,6 +1165,7 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         valid_molecules = [item for item in all_evaluated if item['conf_scores'].get('is_valid', True)]
         
         print(f"  📊 组 {source_idx} 三维相似度排名 (有效:{len(valid_molecules)}, 无效:{len(invalid_samples)})")
+        total_invalid_count += len(invalid_samples)
         for rank, item in enumerate(valid_molecules[:5]):
             marker = "🥇" if rank == 0 else ("🥈" if rank == 1 else "  ")
             cond = item['cond_scores']
@@ -1259,11 +1261,23 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
     else:
         avg_score = -float('inf')
     
+    # 统计有效率
+    num_valid = len(all_valid_molecules_across_groups)
+    num_total = num_valid + total_invalid_count
+    validity_rate = num_valid / num_total if num_total > 0 else 0.0
+
     print(f"\n{'='*50}")
     print(f"✅ 偏好对构建汇总: {len(all_preference_pairs)} 对 (来自 {len(grouped_samples)} 组)")
     print(f"   📊 有效分子综合平均分: {avg_score:.4f}")
+    print(f"   📊 有效率: {num_valid}/{num_total} = {validity_rate:.1%}")
     print(f"{'='*50}")
-    return all_preference_pairs, avg_score
+    
+    validity_stats = {
+        'num_valid': num_valid,
+        'num_total': num_total,
+        'validity_rate': validity_rate,
+    }
+    return all_preference_pairs, avg_score, validity_stats
 
 
 def main():
@@ -1390,7 +1404,7 @@ def main():
                 print(f"\n🔄 第 {sample_attempt} 次尝试采样...")
             
             with torch.no_grad():
-                initial_pairs, initial_avg_score = sample_and_evaluate_molecules(
+                initial_pairs, initial_avg_score, initial_validity_stats = sample_and_evaluate_molecules(
                     temp_model_pl,
                     params,
                     molblocks_and_charges,
@@ -1400,8 +1414,10 @@ def main():
                 )
             
             if len(initial_pairs) > 0:
+                self._last_validity_stats = initial_validity_stats
                 print(f"   ✅ 成功生成 {len(initial_pairs)} 个偏好对")
                 print(f"   📊 首次采样综合平均分: {initial_avg_score:.4f}")
+                print(f"   📊 有效率: {initial_validity_stats['num_valid']}/{initial_validity_stats['num_total']} = {initial_validity_stats['validity_rate']:.1%}")
                 break
             
             print("   ⚠️  本次采样未生成任何有效偏好对，继续尝试...")
@@ -1499,7 +1515,7 @@ def main():
                 sampling_error: 采样过程中的异常信息（如果有）
             """
             # 收集所有 winner 和 loser 的指标
-            metric_keys = ['sims_surf_target', 'sims_esp_target', 'sims_pharm_target', 'total_score']
+            metric_keys = ['sims_surf_target', 'sims_esp_target', 'sims_pharm_target', 'total_score', 'sa_score', 'logp']
             
             winner_metrics = {k: [] for k in metric_keys}
             loser_metrics = {k: [] for k in metric_keys}
@@ -1536,6 +1552,7 @@ def main():
                 'epoch': epoch,
                 'status': status,
                 'num_pairs': len(pairs),
+                'validity_stats': getattr(self, '_last_validity_stats', None),
                 'winner': winner_avg,
                 'loser': loser_avg,
                 'score_gap': winner_avg['total_score'] - loser_avg['total_score'],
@@ -1616,7 +1633,7 @@ def main():
                     num_samples = params.get('sampling', {}).get('num_samples_per_molecule', 4)
                     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
                     
-                    new_pairs, avg_score = sample_and_evaluate_molecules(
+                    new_pairs, avg_score, new_validity_stats = sample_and_evaluate_molecules(
                         pl_module,
                         self.params,
                         self.molblocks_and_charges,
@@ -1624,7 +1641,8 @@ def main():
                         num_samples_per_mol=num_samples,
                         device=device
                     )
-                    print(f"✅ 采样完成: {len(new_pairs)} 个偏好对, 平均分: {avg_score:.4f}")
+                    self._last_validity_stats = new_validity_stats
+                    print(f"✅ 采样完成: {len(new_pairs)} 个偏好对, 平均分: {avg_score:.4f}, 有效率: {new_validity_stats['validity_rate']:.1%}")
                     
                 except Exception as e:
                     sampling_error = f"{type(e).__name__}: {str(e)}"

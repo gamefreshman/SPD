@@ -125,7 +125,7 @@ def plot_metrics(metrics: list, output_path: str):
 
     has_training_metrics = any(m.get('training_metrics', {}) for m in metrics)
 
-    rows = 5 if has_training_metrics else 4
+    rows = 6 if has_training_metrics else 5
     fig, axes = plt.subplots(rows, 2, figsize=(17, 5.5 * rows))
     fig.suptitle('DPO Training Metrics per Round', fontsize=18, fontweight='bold', y=0.98)
 
@@ -288,16 +288,87 @@ def plot_metrics(metrics: list, output_path: str):
         ax.set_xticks(x)
         ax.set_xticklabels(x_labels, fontsize=7)
 
+    # ==================== 11. 分子有效率 ====================
+    validity_row = 5 if has_training_metrics else 4
+    ax = axes[validity_row, 0]
+    validity_rates = []
+    for m in metrics:
+        vs = m.get('validity_stats')
+        if vs and vs.get('validity_rate') is not None:
+            validity_rates.append(vs['validity_rate'] * 100)
+        else:
+            validity_rates.append(None)
+
+    idx_valid = [i for i, v in enumerate(validity_rates) if v is not None]
+    if len(idx_valid) > 0:
+        ys = [validity_rates[i] for i in idx_valid]
+        xs = [x[i] for i in idx_valid]
+        ax.bar(xs, ys, color='#26A69A', alpha=0.6, edgecolor='white', linewidth=0.5)
+        ax.plot(xs, ys, 'o-', color='#00796B', linewidth=2, markersize=6, label='Validity Rate')
+        if len(ys) >= 3:
+            ax.plot(xs, ema(ys), '-', color='#00796B', alpha=0.35, linewidth=3, label='EMA')
+        for i, (xi, yi) in enumerate(zip(xs, ys)):
+            vs_data = metrics[idx_valid[i]].get('validity_stats', {})
+            n_valid = vs_data.get('num_valid', '?')
+            n_total = vs_data.get('num_total', '?')
+            ax.annotate(f'{yi:.0f}%\n({n_valid}/{n_total})', (xi, yi),
+                        textcoords="offset points", xytext=(0, 10),
+                        ha='center', fontsize=7, fontweight='bold')
+    else:
+        ax.text(0.5, 0.5, 'No validity data\n(需要 v1.6+ 的 metrics)',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=14, color='gray')
+    ax.set_title('Molecule Validity Rate', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Validity (%)')
+    ax.set_xlabel('Round (Epoch)')
+    ax.set_ylim(0, 105)
+    ax.axhline(y=50, color='gray', linestyle=':', alpha=0.4, label='50% baseline')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, fontsize=7)
+
+    # ==================== 12. SA Score 归一化趋势（越低越好） ====================
+    ax = axes[validity_row, 1]
+    w_sa = [m['winner'].get('sa_score', None) for m in metrics]
+    l_sa = [m['loser'].get('sa_score', None) for m in metrics]
+
+    idx_sa = [i for i, v in enumerate(w_sa) if v is not None and v != 0]
+    if len(idx_sa) > 0:
+        w_ys = [w_sa[i] for i in idx_sa]
+        l_ys = [l_sa[i] for i in idx_sa]
+        xs = [x[i] for i in idx_sa]
+        ax.plot(xs, w_ys, 'o-', color=W, label='Winner SA', linewidth=2, markersize=5)
+        ax.plot(xs, l_ys, 's--', color=L, label='Loser SA', linewidth=2, markersize=5)
+        if len(w_ys) >= 3:
+            ax.plot(xs, ema(w_ys), '-', color=W, alpha=0.35, linewidth=3)
+            ax.plot(xs, ema(l_ys), '-', color=L, alpha=0.35, linewidth=3)
+        ax.fill_between(xs, w_ys, l_ys, alpha=0.1, color='#4CAF50')
+        # SA score 理想范围 1-4
+        ax.axhspan(1, 4, alpha=0.06, color='green', label='Easy to synthesize (1-4)')
+    else:
+        ax.text(0.5, 0.5, 'No SA score data\n(需要 v1.6+ 的 metrics)',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=14, color='gray')
+    ax.set_title('SA Score (lower = easier to synthesize)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('SA Score')
+    ax.set_xlabel('Round (Epoch)')
+    ax.legend(fontsize=7, loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, fontsize=7)
+
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"✅ 图表已保存到: {output_path}")
 
     # ==================== 数据摘要表格 ====================
-    print("\n" + "=" * 150)
-    print(f"{'Round':>6} {'Epoch':>6} {'Status':>7} {'Pairs':>6} {'W_Surf':>8} {'L_Surf':>8} "
+    print("\n" + "=" * 170)
+    print(f"{'Round':>6} {'Epoch':>6} {'Status':>7} {'Pairs':>6} {'Valid%':>7} {'W_Surf':>8} {'L_Surf':>8} "
+          f"{'W_SA':>7} {'L_SA':>7} "
           f"{'W_Total':>8} {'L_Total':>8} {'Gap':>8} {'Loss':>10} {'DPO_Loss':>10} {'Acc':>6} "
           f"{'AvgScore':>9} {'BestScore':>10} {'RefUpd':>7}")
-    print("-" * 150)
+    print("-" * 170)
     for m in metrics:
         loss_str = f"{m['train_loss']:.4f}" if m.get('train_loss') is not None else "N/A"
         tm = m.get('training_metrics', {})
@@ -313,13 +384,24 @@ def plot_metrics(metrics: list, output_path: str):
         ref_upd = m.get('ref_model_updated')
         ref_str = "✓" if ref_upd else ("✗" if ref_upd is not None else "N/A")
         
+        # 有效率
+        vs = m.get('validity_stats')
+        valid_str = f"{vs['validity_rate']*100:.0f}%" if vs and vs.get('validity_rate') is not None else "N/A"
+        
+        # SA Score
+        w_sa = m['winner'].get('sa_score', None)
+        l_sa = m['loser'].get('sa_score', None)
+        w_sa_str = f"{w_sa:.2f}" if w_sa is not None and w_sa != 0 else "N/A"
+        l_sa_str = f"{l_sa:.2f}" if l_sa is not None and l_sa != 0 else "N/A"
+        
         # 状态标记
         status_str = status.upper() if status != 'ok' else 'OK'
         error_info = m.get('sampling_error', '')
         
-        print(f"{m['round']:>6} {m['epoch']:>6} {status_str:>7} {m['num_pairs']:>6} "
+        print(f"{m['round']:>6} {m['epoch']:>6} {status_str:>7} {m['num_pairs']:>6} {valid_str:>7} "
               f"{m['winner'].get('sims_surf_target', 0):>8.4f} "
               f"{m['loser'].get('sims_surf_target', 0):>8.4f} "
+              f"{w_sa_str:>7} {l_sa_str:>7} "
               f"{m['winner'].get('total_score', 0):>8.3f} "
               f"{m['loser'].get('total_score', 0):>8.3f} "
               f"{m.get('score_gap', 0):>8.3f} "
@@ -331,7 +413,7 @@ def plot_metrics(metrics: list, output_path: str):
               f"{ref_str:>7}")
         if error_info:
             print(f"       ⚠️  ERROR: {error_info}")
-    print("=" * 150)
+    print("=" * 170)
     
     # Iterative DPO 汇总
     ref_updates = [m for m in metrics if m.get('ref_model_updated') == True]
