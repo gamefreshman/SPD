@@ -1357,6 +1357,7 @@ def main():
     # 进行首次采样以生成初始偏好对
     # 【修改】如果是DDP子进程，跳过此步骤，防止超时
     initial_pairs = []
+    initial_validity_stats = None
     if not is_ddp_subprocess:
         print("\n🔬 进行首次采样以生成初始偏好对...")
         device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -1414,7 +1415,6 @@ def main():
                 )
             
             if len(initial_pairs) > 0:
-                self._last_validity_stats = initial_validity_stats
                 print(f"   ✅ 成功生成 {len(initial_pairs)} 个偏好对")
                 print(f"   📊 首次采样综合平均分: {initial_avg_score:.4f}")
                 print(f"   📊 有效率: {initial_validity_stats['num_valid']}/{initial_validity_stats['num_total']} = {initial_validity_stats['validity_rate']:.1%}")
@@ -1736,7 +1736,11 @@ def main():
         molblocks_and_charges=molblocks_and_charges,
         initial_best_score=_initial_best_score,
     )
-    
+
+    # 将初始采样的 validity_stats 传递给 callback 实例
+    if initial_validity_stats is not None:
+        sampling_callback._last_validity_stats = initial_validity_stats
+
     # 记录初始偏好对的指标（round 0，训练前的采样）
     if len(initial_pairs) > 0 and not is_ddp_subprocess:
         sampling_callback._collect_and_save_metrics(

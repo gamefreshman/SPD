@@ -336,6 +336,7 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 
 | 版本 | 日期 | 标签 | 状态 | 简要描述 |
 |------|------|------|------|----------|
+| v1.6.1 | 2026-03-24 | `[Bug修复]` | 已完成 | 修复 main() 中误用 self 导致的 NameError |
 | v1.6 | 2026-03-22 | `[架构]` `[超参数]` `[评分公式]` | 待验证 | 为 x4 添加 DPO Loss + 超参数调优 |
 | v1.5 | 2026-03-XX | `[超参数]` | 待验证 | 增强偏好信号，加速学习，调整 8 个超参数 |
 
@@ -344,6 +345,48 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 ## 8. 修改记录
 
 > 按时间倒序排列，最新记录在最前面。新增记录请复制 [6.3 日志条目模板](#63-日志条目模板) 并填写。
+
+### [v1.6.1] 2026-03-24 修复 main() 中误用 self 导致的 NameError `[Bug修复]`
+
+- **状态**: 已完成
+- **涉及文件**: `DPO1_0_triSim.py`
+- **关联 commit**: （待填）
+- **基于版本**: v1.6
+
+#### 问题 (Problem)
+
+v1.6 新增 `initial_validity_stats` 收集逻辑时，在 `main()` 函数（非类方法）第 1417 行写了 `self._last_validity_stats = initial_validity_stats`，启动即报：
+
+```
+NameError: name 'self' is not defined
+```
+
+#### 目的 (Purpose)
+
+消除 NameError，使 `initial_validity_stats` 正确传递给 `DPOSamplingCallback` 实例。
+
+#### 内容 (Changes)
+
+1. **删除** `main()` 中的 `self._last_validity_stats = initial_validity_stats`（原第 1417 行）
+2. **新增** `initial_validity_stats = None` 在 `initial_pairs = []` 之后（为 DDP 子进程分支提供默认值）
+3. **新增** 在 `sampling_callback` 创建后、`_collect_and_save_metrics()` 调用前：
+   ```python
+   if initial_validity_stats is not None:
+       sampling_callback._last_validity_stats = initial_validity_stats
+   ```
+
+#### 思路 (Reasoning)
+
+`_last_validity_stats` 属于 `DPOSamplingCallback` 实例属性，不能在 `main()` 中通过 `self` 访问。正确做法是在 callback 实例创建后再赋值。DDP 子进程不执行初始采样，因此需要默认值 `None`，与 `getattr(self, '_last_validity_stats', None)` 的 fallback 一致。
+
+#### 待验证结论 (Hypotheses to Verify)
+
+- [x] `python DPO1_0_triSim.py` 不再报 NameError
+- [ ] 初始 round 0 的 `dpo_round_metrics.json` 中包含 `validity_stats` 字段
+
+#### 运行结果 (Results) — 待填
+
+---
 
 ### [v1.6] 2026-03-22 为 x4 药效团添加 DPO Loss + 超参数调优 `[架构]` `[超参数]` `[评分公式]`
 
@@ -479,6 +522,26 @@ flowchart TD
 # 旧: total_score -= sa_normalized * 0.5
 # 新: total_score -= sa_normalized * 1.5
 ```
+
+##### 修改 4：指标收集扩展（`DPO1_0_triSim.py`）
+
+- `metric_keys` 新增 `sa_score`、`logp`（使 winner/loser 的 SA 和 LogP 数据被收集到 JSON）
+- `evaluate_and_build_pairs` 新增返回 `validity_stats`（`num_valid`, `num_total`, `validity_rate`）
+- 通过 `sample_and_evaluate_molecules` → callback → `round_data` 完整传播
+- 新增 `total_invalid_count` 跨组累计无效分子数
+
+##### 修改 5：可视化脚本扩展（`visualize_dpo_metrics.py`）
+
+布局从 5×2 扩展到 6×2（12 面板），新增：
+
+| 面板 | 名称 | 说明 |
+|------|------|------|
+| 11 | Molecule Validity Rate | 柱状+折线图，标注 `52% (8/15)` 格式，50% 基线 |
+| 12 | SA Score (detailed) | Winner/Loser 对比，fill_between 填充，理想范围 (1-4) 绿色条带 |
+
+控制台摘要表格新增 `Valid%`、`W_SA`、`L_SA` 三列。
+
+> 旧的 metrics JSON 不含 `validity_stats` 和 `sa_score` 数据，对应面板显示 "No data" 提示，不会报错。
 
 #### 思路 (Reasoning)
 
