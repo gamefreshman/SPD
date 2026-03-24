@@ -617,8 +617,22 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
             }
             
             # 执行采样（子批次分批，避免 OOM）
-            sub_batch_size = params.get('sampling', {}).get('inference_sub_batch_size', 4)
+            # 根据 GPU 显存自动选择子批次大小
+            default_sub_batch = params.get('sampling', {}).get('inference_sub_batch_size', 4)
+            if torch.cuda.is_available():
+                gpu_mem_gb = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+                if gpu_mem_gb > 40:
+                    sub_batch_size = samples_per_group  # 4090 级别：一次全部处理
+                elif gpu_mem_gb > 20:
+                    sub_batch_size = min(8, samples_per_group)
+                else:
+                    sub_batch_size = default_sub_batch
+            else:
+                sub_batch_size = default_sub_batch
+
             generated_samples = []
+            num_sub_batches = (samples_per_group + sub_batch_size - 1) // sub_batch_size
+            print(f"  [GPU {gpu_id}] 显存 {gpu_mem_gb:.0f}GB, 子批次大小: {sub_batch_size}, 共 {num_sub_batches} 批")
 
             with torch.cuda.device(device):
                 for sub_start in range(0, samples_per_group, sub_batch_size):
@@ -706,6 +720,9 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     # 当分子数量少于GPU数量时，将每个分子复制为多组以充分利用GPU
     original_num_mols = len(prepared_conditions)
     if original_num_mols < num_gpus and original_num_mols > 0:
+        # 自动对齐：组数取 num_gpus 的倍数，确保每批所有 GPU 都满载
+        if num_parallel_groups % num_gpus != 0:
+            num_parallel_groups = max(num_gpus, ((num_parallel_groups + num_gpus - 1) // num_gpus) * num_gpus)
         # 对每个分子复制多组，最多 num_parallel_groups 组
         expanded_conditions = []
         for cond in prepared_conditions:
@@ -714,7 +731,7 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
                 cond_copy['group_idx'] = group_idx  # 标记组索引
                 expanded_conditions.append(cond_copy)
         prepared_conditions = expanded_conditions
-        print(f"\n🔄 单分子多组并行模式: 将 {original_num_mols} 个分子扩展为 {len(prepared_conditions)} 组")
+        print(f"\n🔄 单分子多组并行模式: 将 {original_num_mols} 个分子扩展为 {len(prepared_conditions)} 组 (对齐 {num_gpus} GPU)")
     
     num_groups = len(prepared_conditions)
     print(f"\n🚀 阶段2: 多GPU并行采样")

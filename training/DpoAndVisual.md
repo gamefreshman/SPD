@@ -336,7 +336,7 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 
 | 版本 | 日期 | 标签 | 状态 | 简要描述 |
 |------|------|------|------|----------|
-| v1.6.2 | 2026-03-24 | `[采样策略]` `[Bug修复]` | 待验证 | 子批次采样修复 radius_graph CUDA OOM |
+| v1.6.2 | 2026-03-24 | `[采样策略]` `[Bug修复]` | 待验证 | 自适应子批次 + GPU 对齐修复 OOM 并提升并行效率 |
 | v1.6.1 | 2026-03-24 | `[Bug修复]` | 已完成 | 修复 main() 中误用 self 导致的 NameError |
 | v1.6 | 2026-03-22 | `[架构]` `[超参数]` `[评分公式]` | 待验证 | 为 x4 添加 DPO Loss + 超参数调优 |
 | v1.5 | 2026-03-XX | `[超参数]` | 待验证 | 增强偏好信号，加速学习，调整 8 个超参数 |
@@ -347,7 +347,7 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 
 > 按时间倒序排列，最新记录在最前面。新增记录请复制 [6.3 日志条目模板](#63-日志条目模板) 并填写。
 
-### [v1.6.2] 2026-03-24 子批次采样修复 radius_graph CUDA OOM `[采样策略]` `[Bug修复]`
+### [v1.6.2] 2026-03-24 子批次采样 + 多 GPU 并行效率优化 `[采样策略]` `[Bug修复]`
 
 - **状态**: 待验证
 - **涉及文件**: `DPO1_0_triSim.py`, `parameters/params_x1x3x4_dpo_finetune_nps.py`
@@ -356,51 +356,55 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 
 #### 问题 (Problem)
 
-v1.6 配置下（`num_samples_per_molecule=16`, `n_atoms=78`, `cutoff=5.0`, `max_neighbors=1000000`），`inference_sample()` 将 16 个样本作为单个 batch 送入前向传播。在 `forward_decoder_joint_heterogeneous_graph_encoder()` 的 `radius_graph()` 中，~1330 个拼接节点构建邻接图时尝试分配 11.80 GiB（GPU 仅剩 10.20 GiB / 总 23.57 GiB），触发 CUDA OOM：
+**OOM 问题**：`inference_sample()` 将 16 个样本作为单个 batch 送入前向传播，`radius_graph()` 对 ~1330 个拼接节点构建邻接图尝试分配 11.80 GiB，超出 RTX 3090 的剩余显存（10.20 GiB），触发 CUDA OOM。
 
-```
-torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 11.80 GiB.
-```
+**并行效率问题**：3 个 GPU（RTX 4090 49GB + 2× RTX 3090 24GB），但：
+1. `num_parallel_groups=4` 不能被 3 整除 → 最后一批仅 1 个 GPU 工作，另外 2 个空闲
+2. 所有 GPU 统一 `sub_batch_size=4` → RTX 4090 (49GB) 每组需 4 次子批次迭代，实际可以一次完成
+3. 4090 算力和显存远强于 3090，却分配相同工作量
 
 #### 目的 (Purpose)
 
-在不修改模型和 inference 代码的前提下，通过调用层分批解决 OOM，保持总采样数量不变。
+1. 解决 OOM：子批次采样，不修改模型和 inference 代码
+2. 提升并行效率：自动适配异构 GPU，消除空闲等待
 
 #### 内容 (Changes)
 
-**修改 1：`_sample_single_group()` 子批次循环**（`DPO1_0_triSim.py`）
+**修改 1：自适应子批次大小**（`_sample_single_group()`）
 
-将原来的单次 `inference_sample(batch_size=16)` 改为循环调用，每次最多处理 `sub_batch_size` 个样本：
+根据 GPU 显存自动选择 sub_batch_size，不再统一使用固定值：
 
-```python
-sub_batch_size = params.get('sampling', {}).get('inference_sub_batch_size', 4)
-for sub_start in range(0, samples_per_group, sub_batch_size):
-    sub_batch = min(sub_batch_size, samples_per_group - sub_start)
-    inference_kwargs["batch_size"] = sub_batch
-    sub_samples = inference_sample(model_pl, **inference_kwargs)
-    generated_samples.extend(sub_samples)
-    torch.cuda.empty_cache()
-```
+| GPU 显存 | sub_batch_size | 效果 |
+|----------|---------------|------|
+| >40 GB (4090) | `samples_per_group` (全量) | 1 次完成，零开销 |
+| >20 GB (3090) | 8 | 2 次完成 |
+| 其他 | 4 (默认) | 4 次完成 |
 
-**修改 2：新增参数**（`params_x1x3x4_dpo_finetune_nps.py`）
+**修改 2：num_parallel_groups 自动对齐 GPU 数量**（`sample_and_evaluate_molecules()`）
+
+当 `num_parallel_groups % num_gpus != 0` 时，自动向上对齐为 `num_gpus` 的倍数：
+- 原来：4 组 / 3 GPU → 批次1（3组满载）+ 批次2（1组，2 GPU 空闲）
+- 优化后：6 组 / 3 GPU → 批次1（3组满载）+ 批次2（3组满载）
+
+**修改 3：新增参数**（`params_x1x3x4_dpo_finetune_nps.py`）
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| `inference_sub_batch_size` | 4 | 采样子批次大小，16 个样本分 4 批 × 4 个 |
+| `inference_sub_batch_size` | 4 | 采样子批次 fallback 大小（小显存 GPU 兜底值） |
 
 #### 思路 (Reasoning)
 
-- `radius_graph` 显存与节点数平方成正比。batch=16 时 ~1330 节点，batch=4 时 ~330 节点，显存需求降低约 16 倍
-- 不修改 `inference_sample()` 或 `model.py`，影响范围最小
-- 通过可配置参数 `inference_sub_batch_size` 允许按 GPU 显存灵活调整，无需硬编码
-- 替代方案（降低 `cutoff` 或 `max_neighbors`）会改变模型行为，不适合作为 bug 修复
+- **自适应 vs 固定**：异构 GPU 环境（4090+3090）下，固定 sub_batch_size 要么让大卡浪费、要么让小卡 OOM。自适应方案通过 `torch.cuda.get_device_properties()` 查询显存，自动匹配最优批次
+- **对齐组数**：`num_parallel_groups=4` 是历史遗留默认值，对齐为 GPU 倍数是零成本优化
+- **保留 params 参数**：`inference_sub_batch_size` 作为小显存 GPU 的兜底值保留，必要时可手动覆盖
 
 #### 待验证结论 (Hypotheses to Verify)
 
-- [ ] 采样阶段不再 OOM（GPU 23.57 GiB 足够 batch=4）
-- [ ] 生成样本总数仍为 `num_samples_per_molecule`（16）个
-- [ ] 偏好对构建和评分逻辑不受影响
-- [ ] 采样耗时增加在可接受范围内（预期 ~4 倍，因 4 个子批次串行）
+- [ ] RTX 3090 (24GB) 不再 OOM
+- [ ] RTX 4090 (49GB) 一次处理全部样本，无额外开销
+- [ ] 所有 GPU 在每个批次中都被充分利用（无空闲 GPU）
+- [ ] 总样本数不变（6 组 × 16 样本 = 96，vs 原 4 组 × 16 = 64，样本更多）
+- [ ] 总采样耗时应减少（4090 从 4 次迭代降为 1 次，且无空闲批次）
 
 #### 运行结果 (Results) — 待填
 
