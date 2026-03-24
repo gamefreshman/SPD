@@ -336,6 +336,7 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 
 | 版本 | 日期 | 标签 | 状态 | 简要描述 |
 |------|------|------|------|----------|
+| v1.6.2 | 2026-03-24 | `[采样策略]` `[Bug修复]` | 待验证 | 子批次采样修复 radius_graph CUDA OOM |
 | v1.6.1 | 2026-03-24 | `[Bug修复]` | 已完成 | 修复 main() 中误用 self 导致的 NameError |
 | v1.6 | 2026-03-22 | `[架构]` `[超参数]` `[评分公式]` | 待验证 | 为 x4 添加 DPO Loss + 超参数调优 |
 | v1.5 | 2026-03-XX | `[超参数]` | 待验证 | 增强偏好信号，加速学习，调整 8 个超参数 |
@@ -345,6 +346,65 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 ## 8. 修改记录
 
 > 按时间倒序排列，最新记录在最前面。新增记录请复制 [6.3 日志条目模板](#63-日志条目模板) 并填写。
+
+### [v1.6.2] 2026-03-24 子批次采样修复 radius_graph CUDA OOM `[采样策略]` `[Bug修复]`
+
+- **状态**: 待验证
+- **涉及文件**: `DPO1_0_triSim.py`, `parameters/params_x1x3x4_dpo_finetune_nps.py`
+- **关联 commit**: （待填）
+- **基于版本**: v1.6.1
+
+#### 问题 (Problem)
+
+v1.6 配置下（`num_samples_per_molecule=16`, `n_atoms=78`, `cutoff=5.0`, `max_neighbors=1000000`），`inference_sample()` 将 16 个样本作为单个 batch 送入前向传播。在 `forward_decoder_joint_heterogeneous_graph_encoder()` 的 `radius_graph()` 中，~1330 个拼接节点构建邻接图时尝试分配 11.80 GiB（GPU 仅剩 10.20 GiB / 总 23.57 GiB），触发 CUDA OOM：
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 11.80 GiB.
+```
+
+#### 目的 (Purpose)
+
+在不修改模型和 inference 代码的前提下，通过调用层分批解决 OOM，保持总采样数量不变。
+
+#### 内容 (Changes)
+
+**修改 1：`_sample_single_group()` 子批次循环**（`DPO1_0_triSim.py`）
+
+将原来的单次 `inference_sample(batch_size=16)` 改为循环调用，每次最多处理 `sub_batch_size` 个样本：
+
+```python
+sub_batch_size = params.get('sampling', {}).get('inference_sub_batch_size', 4)
+for sub_start in range(0, samples_per_group, sub_batch_size):
+    sub_batch = min(sub_batch_size, samples_per_group - sub_start)
+    inference_kwargs["batch_size"] = sub_batch
+    sub_samples = inference_sample(model_pl, **inference_kwargs)
+    generated_samples.extend(sub_samples)
+    torch.cuda.empty_cache()
+```
+
+**修改 2：新增参数**（`params_x1x3x4_dpo_finetune_nps.py`）
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `inference_sub_batch_size` | 4 | 采样子批次大小，16 个样本分 4 批 × 4 个 |
+
+#### 思路 (Reasoning)
+
+- `radius_graph` 显存与节点数平方成正比。batch=16 时 ~1330 节点，batch=4 时 ~330 节点，显存需求降低约 16 倍
+- 不修改 `inference_sample()` 或 `model.py`，影响范围最小
+- 通过可配置参数 `inference_sub_batch_size` 允许按 GPU 显存灵活调整，无需硬编码
+- 替代方案（降低 `cutoff` 或 `max_neighbors`）会改变模型行为，不适合作为 bug 修复
+
+#### 待验证结论 (Hypotheses to Verify)
+
+- [ ] 采样阶段不再 OOM（GPU 23.57 GiB 足够 batch=4）
+- [ ] 生成样本总数仍为 `num_samples_per_molecule`（16）个
+- [ ] 偏好对构建和评分逻辑不受影响
+- [ ] 采样耗时增加在可接受范围内（预期 ~4 倍，因 4 个子批次串行）
+
+#### 运行结果 (Results) — 待填
+
+---
 
 ### [v1.6.1] 2026-03-24 修复 main() 中误用 self 导致的 NameError `[Bug修复]`
 

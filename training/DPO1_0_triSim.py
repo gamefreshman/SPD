@@ -616,15 +616,24 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
                 "bond_marginals": bond_marginals,
             }
             
-            # 执行采样
+            # 执行采样（子批次分批，避免 OOM）
+            sub_batch_size = params.get('sampling', {}).get('inference_sub_batch_size', 4)
+            generated_samples = []
+
             with torch.cuda.device(device):
-                generated_samples = inference_sample(model_pl, **inference_kwargs)
-            
+                for sub_start in range(0, samples_per_group, sub_batch_size):
+                    sub_batch = min(sub_batch_size, samples_per_group - sub_start)
+                    inference_kwargs["batch_size"] = sub_batch
+                    sub_samples = inference_sample(model_pl, **inference_kwargs)
+                    generated_samples.extend(sub_samples)
+                    if sub_start + sub_batch < samples_per_group:
+                        torch.cuda.empty_cache()
+
             # 为每个样本标记组ID和分子索引
             for sample in generated_samples:
                 sample['source_mol_index'] = condition['mol_index']
                 sample['group_id'] = group_id
-            
+
             # 清理中间张量
             del atom_marginals, bond_marginals
         

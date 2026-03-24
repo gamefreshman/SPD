@@ -100,6 +100,7 @@ params = {
         'timesteps': 400,  # 采样步数（与训练T一致）
         'num_samples_per_molecule': 16,  # 增加采样数 (8→16)，产生更多偏好对，提升信号稳定性
         'fixed_n_atoms': 70,  # 固定生成的原子数（与预训练模型一致）
+        'inference_sub_batch_size': 4,  # 采样子批次大小，避免 radius_graph OOM（16个样本分4批×4个）
     },
     
     # ==================== DPO评分权重 ====================
