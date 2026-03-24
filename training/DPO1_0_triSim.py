@@ -620,7 +620,7 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
             # 根据 GPU 显存自动选择子批次大小
             default_sub_batch = params.get('sampling', {}).get('inference_sub_batch_size', 4)
             if torch.cuda.is_available():
-                gpu_mem_gb = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+                gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
                 if gpu_mem_gb > 40:
                     sub_batch_size = samples_per_group  # 4090 级别：一次全部处理
                 elif gpu_mem_gb > 20:
