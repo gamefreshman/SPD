@@ -93,7 +93,7 @@ params = {
         'save_preference_pairs': True,  # 保存偏好对用于分析
         
         # ==================== Iterative DPO: Best-past-policy Anchor ====================
-        'iterative_dpo_enabled': True,           # 启用 Best-past-policy Anchor（动态更新 ref_model）
+        'iterative_dpo_enabled': False,          # 禁用动态更新 ref_model，参考模型始终为初始预训练权重
         'iterative_dpo_score_threshold': 0.0,    # 最低分数提升阈值（避免微小噪声触发更新，0.0 = 只要超过就更新）
         'iterative_dpo_force_update_every_n_rounds': 5,  # 更频繁强制更新 (10→5)，防止ref_model过时导致信号失效
     },

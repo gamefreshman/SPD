@@ -171,7 +171,7 @@ python visualize_dpo_metrics.py <json_path> [--output <output_png>]
 
 | 参数 | 当前值 | 路径 | 说明 |
 |------|--------|------|------|
-| `iterative_dpo_enabled` | True | `training` | 启用动态 ref_model 更新 |
+| `iterative_dpo_enabled` | False | `training` | 禁用动态 ref_model 更新（v1.8），参考模型固定为预训练权重 |
 | `iterative_dpo_score_threshold` | 0.0 | `training` | 触发 ref_model 更新的最低分数提升 |
 | `iterative_dpo_force_update_every_n_rounds` | 5 | `training` | 强制更新 ref_model 的轮次间隔 |
 
@@ -336,6 +336,7 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 
 | 版本 | 日期 | 标签 | 状态 | 简要描述 |
 |------|------|------|------|----------|
+| v1.8 | 2026-03-25 | `[超参数]` | 待验证 | 禁用参考模型动态更新，ref_model 固定为初始预训练权重 |
 | v1.7 | 2026-03-25 | `[架构]` `[超参数]` | 待验证 | 混合真实数据训练防止灾难性遗忘 + 降低 beta_dpo |
 | v1.6.2 | 2026-03-24 | `[采样策略]` `[Bug修复]` | 已完成 | 自适应子批次 + GPU 对齐修复 OOM 并提升并行效率 |
 | v1.6.1 | 2026-03-24 | `[Bug修复]` | 已完成 | 修复 main() 中误用 self 导致的 NameError |
@@ -347,6 +348,50 @@ DPO 训练偏好信号偏弱，模型学习速度慢。winner/loser 的分数差
 ## 8. 修改记录
 
 > 按时间倒序排列，最新记录在最前面。新增记录请复制 [6.3 日志条目模板](#63-日志条目模板) 并填写。
+
+### [v1.8] 2026-03-25 禁用参考模型动态更新 `[超参数]`
+
+- **状态**: 待验证
+- **涉及文件**: `parameters/params_x1x3x4_dpo_finetune_nps.py`
+- **关联 commit**: （待填）
+- **基于版本**: v1.7
+
+#### 问题 (Problem)
+
+v1.6/v1.7 启用了 Iterative DPO（`iterative_dpo_enabled=True`），参考模型会在训练过程中根据分数提升或强制轮次间隔动态更新为当前模型的权重。这导致 KL 约束的锚点不断漂移，可能引入以下问题：
+
+1. **约束松弛**：每次 ref_model 更新后，模型与 ref_model 的 KL 散度被重置为 0，相当于"重新出发"，累积偏离预训练模型的幅度可能远大于预期
+2. **信号混乱**：ref_model 更新后，同一个 winner/loser 对的 DPO loss 方向可能发生变化，导致训练信号不稳定
+3. **难以归因**：v1.6 中 ref_model 更新了 5 次，后期有效率崩塌，难以区分是 DPO 过度优化还是 ref_model 更新导致的
+
+#### 目的 (Purpose)
+
+通过禁用 ref_model 动态更新，使 KL 约束始终以初始预训练模型为锚点，观察在固定参考模型下 DPO 训练的稳定性和指标变化，作为对比实验明确 Iterative DPO 的实际效果。
+
+#### 内容 (Changes)
+
+| 参数 | 修改前 | 修改后 | 理由 |
+|------|--------|--------|------|
+| `iterative_dpo_enabled` | `True` | `False` | 禁用 ref_model 动态更新，保持固定 KL 锚点 |
+
+代码层面：`DPOSamplingCallback.on_train_epoch_end()` 中的 Iterative DPO 分支（第 1693-1739 行）已有 `if self.iterative_dpo_enabled` 守卫，设为 `False` 后该分支不执行，ref_model 将在整个训练过程中保持为初始加载的预训练权重。
+
+#### 思路 (Reasoning)
+
+- **为什么不修改代码逻辑？** 代码中已有完善的 `iterative_dpo_enabled` 开关控制，只需修改参数即可。保留代码逻辑便于后续对比实验重新启用。
+- **为什么选择完全禁用而不是降低更新频率？** 需要一个干净的对比基线。如果仅降低更新频率，仍然存在锚点漂移，无法彻底排除 Iterative DPO 的影响。
+- **与 v1.7 的关系**：v1.7 已通过混合真实数据缓解灾难性遗忘，本次在此基础上进一步稳定 DPO 训练信号。
+
+#### 待验证结论 (Hypotheses to Verify)
+
+- [ ] 训练过程中不应出现"参考模型已更新"或"参考模型强制更新"日志
+- [ ] DPO loss 趋势应更平稳（无 ref_model 更新后的跳变）
+- [ ] 与 v1.7（启用 Iterative DPO）对比，winner total_score 是否仍有上升趋势
+- [ ] 有效率是否因固定 KL 约束而更稳定（不低于 v1.7 的水平）
+
+#### 运行结果 (Results) — 待填
+
+---
 
 ### [v1.7] 2026-03-25 混合真实数据训练防止灾难性遗忘 `[架构]` `[超参数]`
 
