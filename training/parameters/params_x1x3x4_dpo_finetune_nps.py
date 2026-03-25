@@ -66,10 +66,13 @@ params = {
         'enable_dpo': True,  # 启用DPO微调
         
         # DPO核心参数
-        'beta_dpo': 0.3,  # 提高KL约束，防止过度偏离ref (0.1→0.3)，保护生成多样性
+        'beta_dpo': 0.1,  # 降低KL约束，给模型更大优化空间 (0.3→0.1)，v1.6中0.3过于保守
         'dpo_ramp_up_epochs': 10,  # 慢速提升DPO权重，先稳定基础去噪 (3→10)
         'dpo_max_weight': 0.3,  # 降低DPO权重，70%给标准去噪保护生成质量 (0.8→0.3)
         
+        # 数据混合策略（防止灾难性遗忘）
+        'real_data_ratio': 0.5,  # 50%真实分子数据 + 50%DPO偏好对，维持基础去噪能力
+
         # 采样策略（针对小数据集调整）
         'dpo_sampling_ratio': 1.0,  # 每个epoch对所有3个分子采样（100%）
         'dpo_batch_ratio': 1,  # DPO batch占总batch的50%

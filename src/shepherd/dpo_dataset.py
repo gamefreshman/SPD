@@ -4,6 +4,8 @@ DPO数据集：管理偏好对数据
 真实实现：完全复用HeteroDataset的数据生成逻辑
 """
 
+import random
+
 import torch
 import numpy as np
 import rdkit.Chem as Chem
@@ -501,3 +503,60 @@ def collate_dpo_batch(batch_list):
     else:
         from torch_geometric.data import Batch
         return Batch.from_data_list(batch_list)
+
+
+class MixedDPODataset(torch.utils.data.Dataset):
+    """
+    混合数据集：以可配置比例交替返回真实训练样本和 DPO 偏好对。
+
+    解决纯 DPO 训练导致的灾难性遗忘问题——模型在 DPO 微调过程中
+    需要持续接触真实分子数据以维持基础去噪能力。
+    """
+
+    def __init__(self, standard_dataset, dpo_dataset, real_data_ratio=0.5):
+        """
+        Args:
+            standard_dataset: HeteroDataset（真实分子数据）
+            dpo_dataset: DPODataset（偏好对）
+            real_data_ratio: 真实数据占比（0-1），默认 0.5 即 50% 真实 + 50% DPO
+        """
+        self.standard_dataset = standard_dataset
+        self.dpo_dataset = dpo_dataset
+        self.real_data_ratio = real_data_ratio
+
+    def __len__(self):
+        return max(len(self.standard_dataset), len(self.dpo_dataset) * 2)
+
+    def __getitem__(self, idx):
+        if random.random() < self.real_data_ratio:
+            real_idx = idx % len(self.standard_dataset)
+            return self.standard_dataset[real_idx]
+        else:
+            dpo_idx = idx % len(self.dpo_dataset)
+            return self.dpo_dataset[dpo_idx]
+
+
+def collate_mixed_batch(batch_list):
+    """
+    自适应 collation：根据 batch 内样本类型自动选择合适的整理方式。
+
+    - 全部为 DPO 样本 → collate_dpo_batch
+    - 全部为标准样本 → Batch.from_data_list
+    - 混合 → 按多数类型整理（丢弃少数类型，避免格式冲突）
+    """
+    from torch_geometric.data import Batch
+
+    dpo_items = [b for b in batch_list if isinstance(b, dict) and b.get('batch_type') == 'dpo']
+    std_items = [b for b in batch_list if not isinstance(b, dict)]
+
+    if len(dpo_items) == len(batch_list):
+        return collate_dpo_batch(batch_list)
+
+    if len(std_items) == len(batch_list):
+        return Batch.from_data_list(batch_list)
+
+    # 混合 batch：取多数类型
+    if len(dpo_items) >= len(std_items):
+        return collate_dpo_batch(dpo_items)
+    else:
+        return Batch.from_data_list(std_items)

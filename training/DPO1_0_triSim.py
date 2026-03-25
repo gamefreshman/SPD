@@ -50,7 +50,7 @@ from lightning_fabric.utilities.seed import seed_everything
 from shepherd.model.model import Model
 from shepherd.lightning_module import LightningModule
 from shepherd.new_datasets import HeteroDataset
-from shepherd.dpo_dataset import DPODataset, collate_dpo_batch
+from shepherd.dpo_dataset import DPODataset, collate_dpo_batch, MixedDPODataset, collate_mixed_batch
 from shepherd.inference import inference_sample
 from shepherd.extract import create_rdkit_molecule
 from shepherd.shepherd_score_utils.pharm_utils.pharmacophore import get_pharmacophores
@@ -473,21 +473,34 @@ def create_dataset(params, molblocks_and_charges, marginals):
 
 
 def create_dpo_dataloader(params, dataset, dpo_dataset):
-    """创建DPO DataLoader（使用标准 torch DataLoader + 自定义 collate_fn）
-    
+    """创建混合 DataLoader：真实分子数据 + DPO 偏好对交替训练
+
+    通过 real_data_ratio 控制真实数据占比，防止纯 DPO 训练导致的
+    灾难性遗忘（有效率从 59% 崩塌到 20%）。
+
     注意：必须使用 torch.utils.data.DataLoader 而非 PyG DataLoader，
     因为 PyG DataLoader 会覆盖 collate_fn 为其内部的 Collater。
     """
-    print("🎯 创建 DPO DataLoader (使用 torch DataLoader + collate_dpo_batch)...")
-    
-    train_loader = torch.utils.data.DataLoader(
-        dataset=dpo_dataset,
-        num_workers=0,
-        batch_size=params['training']['batch_size'],
-        shuffle=True,
-        collate_fn=collate_dpo_batch,  # 【关键】确保 DPO dict 被正确 batch 化
+    real_data_ratio = params['training'].get('real_data_ratio', 0.5)
+    batch_size = params['training']['batch_size']
+
+    mixed_dataset = MixedDPODataset(
+        standard_dataset=dataset,
+        dpo_dataset=dpo_dataset,
+        real_data_ratio=real_data_ratio,
     )
-    
+
+    print(f"🎯 创建混合 DataLoader (真实数据 {real_data_ratio:.0%} + DPO {1-real_data_ratio:.0%})...")
+    print(f"   标准数据集: {len(dataset)} 样本, DPO 数据集: {len(dpo_dataset)} 偏好对")
+
+    train_loader = torch.utils.data.DataLoader(
+        dataset=mixed_dataset,
+        num_workers=0,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_mixed_batch,
+    )
+
     return train_loader
 
 
