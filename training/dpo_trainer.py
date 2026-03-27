@@ -338,6 +338,7 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
     # 获取边际分布（从dataset）
     atom_marginals = dataset.x1_atom_diffuser.transition_model.marginals.to(device)
     bond_marginals = dataset.x1_bond_diffuser.transition_model.marginals.to(device)
+    pharm_marginals = dataset.x4_pharm_diffuser.transition_model.marginals.to(device) if hasattr(dataset, 'x4_pharm_diffuser') else None
     
     # ========================================================================
     # 【修正】强制将虚拟节点（Index 0）的边际概率设为0，以避免生成无效原子
@@ -458,6 +459,7 @@ def sample_and_evaluate_molecules(model_pl, params, molblocks_and_charges, datas
                     # 边际分布
                     "atom_marginals": atom_marginals,
                     "bond_marginals": bond_marginals,
+                    "pharm_marginals": pharm_marginals,
                 }
 
                 # 记录参数到JSON文件

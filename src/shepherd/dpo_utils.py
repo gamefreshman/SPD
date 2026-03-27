@@ -398,6 +398,7 @@ class OnlineSampler:
                 # 边际分布（从dataset获取）
                 atom_marginals=self.atom_marginals,
                 bond_marginals=self.bond_marginals,
+                pharm_marginals=self.pharm_marginals,
             )
             
             # 5. 提取生成的分子

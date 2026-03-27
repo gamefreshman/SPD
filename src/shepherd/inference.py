@@ -430,6 +430,7 @@ def inference_sample(
 
     atom_marginals = None,
     bond_marginals = None,
+    pharm_marginals = None,
     
 ):
     """
@@ -540,6 +541,8 @@ def inference_sample(
     x1_atom_diffuser = DiscreteFeatureDiffusion(timesteps=T, marginals=atom_marginals)
     # 初始化键特征的离散扩散处理器
     x1_bond_diffuser = DiscreteFeatureDiffusion(timesteps=T, marginals=bond_marginals)
+    # 初始化药效团特征的离散扩散处理器（Bug 3 修复）
+    x4_pharm_diffuser = DiscreteFeatureDiffusion(timesteps=T, marginals=pharm_marginals) if pharm_marginals is not None else None
 
     # ============================================================================
     # 定义修复（Inpainting）目标
@@ -858,8 +861,14 @@ def inference_sample(
         # 生成药效团方向的连续高斯噪声
         x4_direction_T = torch.randn(N_x4, 3, device=device) * prior_noise_scale  # t = T 时的方向
         
-        # 生成药效团特征的连续高斯噪声
-        x4_x_T = torch.randn(N_x4, num_pharm_types).to(device)
+        # 生成药效团特征的初始噪声（Bug 4 修复：使用离散边际分布采样 one-hot）
+        if pharm_marginals is not None:
+            pharm_limit = pharm_marginals[None, :].expand(N_x4, -1)
+            x4_x_T_indices = pharm_limit.multinomial(1).squeeze(-1)
+            x4_x_T = F.one_hot(x4_x_T_indices, num_classes=num_pharm_types).float().to(device)
+        else:
+            # 降级：未提供 pharm_marginals 时使用原始高斯噪声
+            x4_x_T = torch.randn(N_x4, num_pharm_types).to(device)
         
         # 创建虚拟节点掩码
         x4_virtual_node_mask_ = torch.zeros(N_x4 + int(include_virtual_node), dtype = torch.long).to(device)
@@ -1440,11 +1449,11 @@ def inference_sample(
 
         # 5. 计算原子特征的后验分布
         if s_int >= 0:
-            x1_x_out_batch = x1_x_out.unsqueeze(0)
+            x1_x_t_batch = x1_x_t.unsqueeze(0)  # ✅ 使用当前 one-hot 噪声状态，而非模型 logits
             Qt_batch = Qt_x.unsqueeze(0)
             # 非最后一步，使用后验分布采样
             atom_posterior_prob = compute_batched_over0_posterior_distribution(
-                x1_x_out_batch , 
+                x1_x_t_batch , 
                 Qt_batch ,
                 Qtb_atom, Qsb_atom
             )
@@ -1537,9 +1546,47 @@ def inference_sample(
         
         # ==================== 反向去噪步骤 - X4模态 ====================
         # X4模态（药效团）的去噪计算
-        x4_pos_t_1 = ((1. / float(x4_alpha_t)) * x4_pos_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_pos_out)  +  (x4_c_t_injected * x4_pos_epsilon)  # 药效团位置去噪
-        x4_direction_t_1 = ((1. / float(x4_alpha_t)) * x4_direction_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_direction_out)  +  (x4_c_t * x4_direction_epsilon)  # 药效团方向去噪
-        x4_x_t_1 = ((1. / x4_alpha_t) * x4_x_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_x_out)  +  (x4_c_t * x4_x_epsilon)  # 药效团类型去噪
+        x4_pos_t_1 = ((1. / float(x4_alpha_t)) * x4_pos_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_pos_out)  +  (x4_c_t_injected * x4_pos_epsilon)  # 药效团位置去噪（连续，保持不变）
+        x4_direction_t_1 = ((1. / float(x4_alpha_t)) * x4_direction_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_direction_out)  +  (x4_c_t * x4_direction_epsilon)  # 药效团方向去噪（连续，保持不变）
+        
+        # Bug 2 修复：药效团类型使用离散后验采样（与 x1 原子类型一致）
+        if x4_pharm_diffuser is not None and s_int >= 0:
+            # 对模型预测结果进行 softmax 归一化
+            pred_x4_x = F.softmax(x4_x_out, dim=-1)
+            
+            # 计算 x4 的转移矩阵
+            Qtb_pharm = x4_pharm_diffuser.transition_model.get_Qt_bar(alpha_t_bar, device, True)
+            Qsb_pharm = x4_pharm_diffuser.transition_model.get_Qt_bar(alpha_s_bar, device, True)
+            
+            beta_t_pharm = x4_pharm_diffuser.noise_schedule(t_normalized)
+            beta_t_pharm = beta_t_pharm.to(device)
+            Qt_pharm = x4_pharm_diffuser.transition_model.get_Qt(beta_t_pharm, device, is_atom=True)
+            
+            # 计算后验分布
+            x4_x_t_batch = x4_x_t.unsqueeze(0)
+            Qt_pharm_batch = Qt_pharm.unsqueeze(0)
+            pharm_posterior_prob = compute_batched_over0_posterior_distribution(
+                x4_x_t_batch, Qt_pharm_batch, Qtb_pharm, Qsb_pharm
+            )
+            pharm_posterior_prob = pharm_posterior_prob.squeeze(0)
+            
+            # 加权并采样
+            weighted_X4 = pred_x4_x.unsqueeze(-1) * pharm_posterior_prob
+            unnormalized_prob_X4 = weighted_X4.sum(dim=2)
+            unnormalized_prob_X4 = torch.clamp(unnormalized_prob_X4, min=0.0)
+            unnormalized_prob_X4[torch.sum(unnormalized_prob_X4, dim=-1) == 0] = 1e-6
+            prob_X4 = unnormalized_prob_X4 / (torch.sum(unnormalized_prob_X4, dim=-1, keepdim=True) + 1e-8)
+            
+            _, num_classes_x4 = prob_X4.shape
+            X4_t = prob_X4.multinomial(1)
+            X4_t_indices = X4_t.squeeze(-1)
+            x4_x_t_1 = F.one_hot(X4_t_indices, num_classes=num_classes_x4).float()
+        elif x4_pharm_diffuser is not None and s_int < 0:
+            # 最后一步，直接使用预测结果
+            x4_x_t_1 = x4_x_out
+        else:
+            # 降级：未提供 pharm_diffuser 时使用原始连续 DDPM 公式
+            x4_x_t_1 = ((1. / x4_alpha_t) * x4_x_t)  - ((x4_var_dash_t/(x4_alpha_t * x4_sigma_dash_t)) * x4_x_out)  +  (x4_c_t * x4_x_epsilon)
         
         # 检查去噪后的X4结果，防止数值不稳定
         if torch.any(torch.isnan(x4_pos_t_1)):
@@ -1587,9 +1634,14 @@ def inference_sample(
     pbar.close()  # 关闭进度条
     
     # ==================== X4模态最终结果处理 ====================
-    # 通过最小距离匹配将连续值转换为离散的药效团类型索引
-    x4_x_final = np.argmin(np.abs(x4_x_t[~virtual_node_mask_x4].cpu().numpy() - params['dataset']['x4']['scale_node_features']), axis = -1)
-    x4_x_final = x4_x_final - 1  # 调整索引，补偿之前添加虚拟节点药效团类型时的偏移
+    # Bug 5 修复：修复后 x4_x_t 是 one-hot 编码，使用 argmax 取类型索引
+    if x4_pharm_diffuser is not None:
+        x4_x_final = torch.argmax(x4_x_t[~virtual_node_mask_x4], dim=-1).cpu().numpy()
+        x4_x_final = x4_x_final - 1  # 调整索引，补偿虚拟节点药效团类型编码偏移
+    else:
+        # 降级：未使用离散扩散时保持原始 argmin 逻辑
+        x4_x_final = np.argmin(np.abs(x4_x_t[~virtual_node_mask_x4].cpu().numpy() - params['dataset']['x4']['scale_node_features']), axis = -1)
+        x4_x_final = x4_x_final - 1  # 调整索引
     x4_pos_final = x4_pos_t[~virtual_node_mask_x4].cpu().numpy()  # 提取药效团最终位置
     
     # 处理药效团方向向量

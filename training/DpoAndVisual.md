@@ -474,6 +474,7 @@ Round 10-15:              收尾期 — 如果 5 轮无提升，停止当前实�
 
 | 版本 | 日期 | 标签 | 状态 | 简要描述 |
 |------|------|------|------|----------|
+| v1.9 | 2026-03-27 | `[Bug修复]` | 待验证 | 修复离散扩散推理 6 个 Bug：x4 后验采样、初始噪声、pharm_diffuser 基础设施 |
 | v1.8 | 2026-03-25 | `[超参数]` | 待验证 | 禁用参考模型动态更新，ref_model 固定为初始预训练权重 |
 | v1.7 | 2026-03-25 | `[架构]` `[超参数]` | **已失败** | 混合训练（1分子）正则化不足，Valid% 跌至 12% |
 | v1.6.2 | 2026-03-24 | `[采样策略]` `[Bug修复]` | 已完成 | 自适应子批次 + GPU 对齐修复 OOM 并提升并行效率 |
@@ -486,6 +487,93 @@ Round 10-15:              收尾期 — 如果 5 轮无提升，停止当前实�
 ## 10. 修改记录
 
 > 按时间倒序排列，最新记录在最前面。新增记录请复制 [6.3 日志条目模板](#63-日志条目模板) 并填写。
+
+### [v1.9] 2026-03-27 修复离散扩散推理 6 个关键 Bug `[Bug修复]`
+
+- **状态**: 待验证
+- **涉及文件**: `src/shepherd/inference.py`, `src/shepherd/dpo_utils.py`, `training/dpo_trainer.py`, `evaluation/experiment_SamEval/sample_discrete.py`
+- **关联 commit**: （待填）
+- **基于版本**: v1.8
+
+#### 问题 (Problem)
+
+`inference.py` 中的 `inference_sample()` 函数在处理离散特征（原子类型 x1、药效团类型 x4）时存在 6 个 Bug，导致采样质量严重低于预期。这些 Bug 可分为两类：
+
+**1. 训练-推理不一致**（训练代码正确，推理代码错误）：
+- 训练时 x1 原子类型和 x4 药效团类型均使用 `DiscreteFeatureDiffusion` 进行离散扩散（one-hot 状态 + 转移矩阵 + 后验采样）
+- 推理时 x1 原子类型的后验采样传入了错误的输入（logits 而非 one-hot），x4 药效团类型完全使用了连续 DDPM 公式而非离散后验采样
+
+**2. 基础设施缺失**：
+- 推理函数缺少 `pharm_marginals` 参数，未初始化 `x4_pharm_diffuser`，无法进行 x4 的离散操作
+
+#### 目的 (Purpose)
+
+修复所有 6 个 Bug，使推理管线的离散扩散行为与训练管线完全一致，恢复分子生成质量。
+
+#### 内容 (Changes)
+
+##### Bug 1（致命）：x1 原子类型后验分布输入错误 — `inference.py:1449`
+
+| 项目 | 修改前 | 修改后 |
+|------|--------|--------|
+| `compute_batched_over0_posterior_distribution` 第一个参数 | `x1_x_out`（模型 logits） | `x1_x_t`（当前 one-hot 噪声状态） |
+
+贝叶斯后验公式 `p(x_{t-1}|x_t, x_0) ∝ q(x_t|x_{t-1}) * q(x_{t-1}|x_0)` 要求输入当前状态 `x_t`，而非预测结果 `x_0`。预测结果应通过 `pred_x1_x` 参与加权，之前的代码等于把 logits 当作了 one-hot 状态。
+
+##### Bug 3（致命）：缺少 `pharm_marginals` 参数和 `x4_pharm_diffuser` 初始化 — `inference.py:432, 544`
+
+- 函数签名新增 `pharm_marginals=None`
+- 新增 `x4_pharm_diffuser = DiscreteFeatureDiffusion(timesteps=T, marginals=pharm_marginals)`
+
+##### Bug 6（低）：调用侧未传入 `pharm_marginals` — 3 个文件
+
+| 文件 | 修改内容 |
+|------|----------|
+| `dpo_utils.py:400` | 新增 `pharm_marginals=self.pharm_marginals` |
+| `dpo_trainer.py:341, 461` | 新增获取和传入 `pharm_marginals` |
+| `sample_discrete.py:361, 494` | `marginals` 元组从二元组扩展为三元组 |
+
+##### Bug 4（致命）：x4 初始噪声使用高斯分布而非边际分布 — `inference.py:864`
+
+| 项目 | 修改前 | 修改后 |
+|------|--------|--------|
+| x4 初始噪声 | `torch.randn(N_x4, num_pharm_types)` | `F.one_hot(pharm_marginals.multinomial(1), num_classes)` |
+
+离散扩散的极限分布（t=T）应为训练集的边际分布（每个类别的先验概率），而非连续高斯噪声。修复后从 `pharm_marginals` 采样并转为 one-hot 编码。
+
+##### Bug 2（致命）：x4 去噪使用连续 DDPM 公式而非离散后验采样 — `inference.py:1547-1592`
+
+| 项目 | 修改前 | 修改后 |
+|------|--------|--------|
+| x4 类型去噪 | `(1/α_t)*x_t - (σ²/(α_t*σ̃))*x_out + c_t*ε` | 离散后验采样：`compute_batched_over0_posterior_distribution` + `multinomial` + `F.one_hot` |
+
+与 x1 原子类型的处理方式完全一致：计算转移矩阵 → 后验分布 → softmax 加权 → multinomial 采样 → one-hot 编码。
+
+##### Bug 5（中等）：x4 最终输出使用 `argmin` 而非 `argmax` — `inference.py:1598`
+
+| 项目 | 修改前 | 修改后 |
+|------|--------|--------|
+| 最终类型解码 | `np.argmin(np.abs(x4_x_t - scale_features))` | `torch.argmax(x4_x_t, dim=-1)` |
+
+修复后 `x4_x_t` 是 one-hot 编码，直接 argmax 取索引即可，不需要距离匹配。
+
+#### 思路 (Reasoning)
+
+- **修复依赖顺序**：Bug 3+6（基础设施）→ Bug 4（初始噪声）→ Bug 2+5（去噪+输出），因为后者依赖 `x4_pharm_diffuser` 的存在
+- **向后兼容**：所有修改都包含降级逻辑（`if x4_pharm_diffuser is not None ... else 原始行为`），当 `pharm_marginals` 未提供时回退到原始连续行为
+- **参考实现**：x1 原子类型和 x1 键类型的离散后验采样代码已在推理管线中正确实现（line 1449-1490），x4 的修复完全仿照该实现
+
+#### 待验证结论 (Hypotheses to Verify)
+
+- [ ] x4 药效团类型应在去噪过程中保持为有效的 one-hot 编码（每步采样后只有一个维度为 1）
+- [ ] 生成分子的药效团类型分布应与训练集的边际分布接近（不再是随机噪声般的分布）
+- [ ] 药效团类型相关指标（`sims_pharm_target`）应有显著提升
+- [ ] 分子有效率不应因此修复而下降（x4 修复独立于 x1 分支，且 x1 的 Bug 1 修复应改善有效率）
+- [ ] inference pipeline 在 `pharm_marginals=None` 时仍能正常运行（向后兼容）
+
+#### 运行结果 (Results) — 待填
+
+---
 
 ### [v1.8] 2026-03-25 禁用参考模型动态更新 `[超参数]`
 

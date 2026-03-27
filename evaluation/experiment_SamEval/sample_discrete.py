@@ -358,6 +358,7 @@ def generate_samples_batch(mol_index, mol_features, model_pl, device, marginals,
                     # 边际分布
                     atom_marginals=marginals[0].to(device),
                     bond_marginals=marginals[1].to(device),
+                    pharm_marginals=marginals[2].to(device) if len(marginals) > 2 and marginals[2] is not None else None,
                 )
             
             for sample in generated_samples:
@@ -491,7 +492,7 @@ print("🔬 Step 2: 使用多GPU并行推理生成样本...")
 print(f"  使用 {num_gpus} 张GPU进行并行推理")
 
 # 准备边际分布
-marginals = (atom_marginals_x1, bond_marginals_x1)
+marginals = (atom_marginals_x1, bond_marginals_x1, pharm_marginals_x4)
 
 if num_gpus > 1:
     import queue
