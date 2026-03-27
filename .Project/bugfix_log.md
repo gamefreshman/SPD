@@ -29,36 +29,39 @@ AssertionError
 
 ### 根因分析
 
-后验概率归一化链中存在**累积浮点误差**：
+后验概率归一化链中，`unnormalized_prob_X` 的某些行概率总和**趋近于零**而非精确为零：
 
-1. `compute_batched_over0_posterior_distribution()` 内部计算分母时使用 `+ 1e-8` 防止除零（line 132）
-2. 外部归一化 `prob_X = unnormalized / (sum + 1e-8)` 又引入一次 epsilon（line 1469）
-3. 两次 epsilon 叠加导致概率和偏离 1.0 的误差在某些边界情况下超过 `1e-3`
+1. `weighted_X = pred_x1_x * posterior_prob`——当模型预测和后验分布高度不重叠时，乘积结果趋近零
+2. 原有检测 `== 0` 只能捕获**精确零**，无法检测近零值（如 `1e-10`）
+3. 归一化时 `S / (S + 1e-8)` 中 epsilon 占主导，导致归一化后概率和远小于 1.0
 
-**触发条件**：v1.9 修复 Bug 1 后，`compute_batched_over0_posterior_distribution` 的输入从 logits 变为 one-hot 编码。one-hot 输入使得转移矩阵乘法结果更加稀疏，放大了 epsilon 导致的归一化偏差。
+**实际运行数据证实**：偏差从 timestep 108 的 0.01 快速增长到 timestep 73 的 0.91，因为低时间步时模型预测更确定（softmax 输出更尖锐），与后验分布的不重叠度增加。
 
 ### 修复方法
 
-**文件**: `src/shepherd/inference.py:1469-1475`
+**文件**: `src/shepherd/inference.py`（三处统一修复：x1 原子、x1 键、x4 药效团）
 
-将硬断言替换为带警告的条件重归一化：
+将精确零检测 `== 0` 替换为阈值检测 `< 1e-5`，近零行使用均匀分布作为 fallback，归一化除法不再加 epsilon（因为零值已被正确处理）：
 
 ```diff
--            prob_X = unnormalized_prob_X / (torch.sum(unnormalized_prob_X, dim=-1, keepdim=True) + 1e-8)
--            assert ((prob_X.sum(dim=-1) - 1).abs() < 1e-3).all()
-+            # 数值保护：归一化并检查质量，若偏差过大则警告并强制重归一化
-+            prob_X = unnormalized_prob_X / (torch.sum(unnormalized_prob_X, dim=-1, keepdim=True) + 1e-8)
-+            prob_sum = prob_X.sum(dim=-1)
-+            max_deviation = (prob_sum - 1).abs().max().item()
-+            if max_deviation > 1e-2:
-+                print(f"Warning: prob_X normalization deviation {max_deviation:.6f} at timestep {t}, forcing re-normalization")
-+                prob_X = prob_X / prob_X.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+ # x1 原子类型、x1 键类型、x4 药效团类型——统一模式：
+ unnormalized_prob = weighted.sum(dim=2)
+ unnormalized_prob = torch.clamp(unnormalized_prob, min=0.0)
+-unnormalized_prob[torch.sum(unnormalized_prob, dim=-1) == 0] = 1e-6
+-prob = unnormalized_prob / (torch.sum(unnormalized_prob, dim=-1, keepdim=True) + 1e-8)
+-assert ((prob.sum(dim=-1) - 1).abs() < 1e-3).all()
++row_sums = torch.sum(unnormalized_prob, dim=-1)
++near_zero_mask = row_sums < 1e-5
++if near_zero_mask.any():
++    num_classes = unnormalized_prob.shape[-1]
++    unnormalized_prob[near_zero_mask] = 1.0 / num_classes  # 均匀分布 fallback
++prob = unnormalized_prob / torch.sum(unnormalized_prob, dim=-1, keepdim=True)
 ```
 
 **设计决策**：
-- 阈值 `1e-2` 而非 `1e-3`：允许正常浮点误差，仅在真正异常时警告
-- `1e-2` 以下偏差不影响 `multinomial` 采样的统计性质
-- 仅在偏差超限时才触发重归一化，避免不必要的计算开销
+- **阈值 `1e-5`**：比 `compute_batched_over0_posterior_distribution` 内部的 `1e-6` 和 `1e-8` 大，确保能捕获所有近零情况
+- **均匀分布 fallback**：比 `1e-6` 常数更有意义——当模型无法确定类别时，应用均匀采样而非低概率采样
+- **无 epsilon 归一化**：零值已正确处理，不需要额外的防除零保护，结果数学上精确归一化
 
 ### 验证
 

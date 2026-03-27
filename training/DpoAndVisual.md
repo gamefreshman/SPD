@@ -500,11 +500,13 @@ Round 10-15:              收尾期 — 如果 5 轮无提升，停止当前实�
 
 #### 问题 (Problem)
 
-v1.9 修复 Bug 1 后，`compute_batched_over0_posterior_distribution` 的输入从 logits 变为 one-hot，离散后验计算链中累积的浮点 epsilon（内部 1e-8 + 外部 1e-8）导致概率和偏差超过 1e-3 断言阈值，触发 AssertionError。
+v1.9 修复 Bug 1 后，`compute_batched_over0_posterior_distribution` 的输入从 logits 变为 one-hot。在反向去噪过程中，当模型预测（softmax 输出）和后验分布高度不重叠时，加权概率 `weighted_X = pred * posterior` 的行和趋近于零（但非精确零）。原有 `== 0` 检测无法捕获此情况，导致 `S / (S + 1e-8)` 中 epsilon 占主导，归一化后概率和远小于 1.0。
+
+**运行数据**：偏差从 timestep 108 的 0.01 迅速增长到 timestep 73 的 0.91（越接近 t=0，模型预测越确定，与后验不重叠度越大）。
 
 #### 修复内容
 
-将硬断言替换为带警告的条件重归一化，阈值放宽至 1e-2。
+统一修复三处（x1 原子、x1 键、x4 药效团）：将 `== 0` 精确零检测替换为 `< 1e-5` 阈值检测，近零行使用**均匀分布**作为 fallback，归一化除法不再加 epsilon（零值已被正确处理）。
 
 ---
 

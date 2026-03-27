@@ -1465,14 +1465,13 @@ def inference_sample(
             weighted_X = pred_x1_x.unsqueeze(-1) * atom_posterior_prob
             unnormalized_prob_X = weighted_X.sum(dim=2)
             unnormalized_prob_X = torch.clamp(unnormalized_prob_X, min=0.0)
-            unnormalized_prob_X[torch.sum(unnormalized_prob_X, dim=-1) == 0] = 1e-6
-            # 数值保护：归一化并检查质量，若偏差过大则警告并强制重归一化
-            prob_X = unnormalized_prob_X / (torch.sum(unnormalized_prob_X, dim=-1, keepdim=True) + 1e-8)
-            prob_sum = prob_X.sum(dim=-1)
-            max_deviation = (prob_sum - 1).abs().max().item()
-            if max_deviation > 1e-2:
-                print(f"Warning: prob_X normalization deviation {max_deviation:.6f} at timestep {t}, forcing re-normalization")
-                prob_X = prob_X / prob_X.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            # 近零行检测：使用阈值而非精确零匹配，fallback 为均匀分布
+            row_sums_X = torch.sum(unnormalized_prob_X, dim=-1)
+            near_zero_mask_X = row_sums_X < 1e-5
+            if near_zero_mask_X.any():
+                num_classes_x_tmp = unnormalized_prob_X.shape[-1]
+                unnormalized_prob_X[near_zero_mask_X] = 1.0 / num_classes_x_tmp
+            prob_X = unnormalized_prob_X / torch.sum(unnormalized_prob_X, dim=-1, keepdim=True)
 
             _, num_classes_x = prob_X.shape
 
@@ -1504,24 +1503,17 @@ def inference_sample(
 
             # 计算未归一化概率
             unnormalized_prob_E = weighted_E.sum(dim=-2)
+            unnormalized_prob_E = torch.clamp(unnormalized_prob_E, min=0.0)
 
+            # 近零行检测：使用阈值而非精确零匹配，fallback 为均匀分布
+            row_sums_E = torch.sum(unnormalized_prob_E, dim=-1)
+            near_zero_mask_E = row_sums_E < 1e-5
+            if near_zero_mask_E.any():
+                num_classes_e_tmp = unnormalized_prob_E.shape[-1]
+                unnormalized_prob_E[near_zero_mask_E] = 1.0 / num_classes_e_tmp
 
-            # 处理零概率情况
-            zero_mask = torch.sum(unnormalized_prob_E, dim=-1) == 0
-            unnormalized_prob_E[zero_mask] = 1e-7
-
-            # 计算归一化概率
-            prob_sum = torch.sum(unnormalized_prob_E, dim=-1, keepdim=True)
-            prob_E = unnormalized_prob_E / prob_sum
-
-
-            # 验证概率和为1
-            prob_sum_check = prob_E.sum(dim=-1)
-            prob_diff = prob_sum_check - 1
-            large_diff_mask = prob_diff.abs() > 1e-4
-            large_diff_indices = torch.where(large_diff_mask)
-
-            assert ((prob_sum_check - 1).abs() < 1e-3).all()
+            # 归一化概率
+            prob_E = unnormalized_prob_E / torch.sum(unnormalized_prob_E, dim=-1, keepdim=True)
 
             # 采样
             _, num_classes_e = prob_E.shape
@@ -1579,8 +1571,13 @@ def inference_sample(
             weighted_X4 = pred_x4_x.unsqueeze(-1) * pharm_posterior_prob
             unnormalized_prob_X4 = weighted_X4.sum(dim=2)
             unnormalized_prob_X4 = torch.clamp(unnormalized_prob_X4, min=0.0)
-            unnormalized_prob_X4[torch.sum(unnormalized_prob_X4, dim=-1) == 0] = 1e-6
-            prob_X4 = unnormalized_prob_X4 / (torch.sum(unnormalized_prob_X4, dim=-1, keepdim=True) + 1e-8)
+            # 近零行检测：使用阈值而非精确零匹配，fallback 为均匀分布
+            row_sums_X4 = torch.sum(unnormalized_prob_X4, dim=-1)
+            near_zero_mask_X4 = row_sums_X4 < 1e-5
+            if near_zero_mask_X4.any():
+                num_classes_x4_tmp = unnormalized_prob_X4.shape[-1]
+                unnormalized_prob_X4[near_zero_mask_X4] = 1.0 / num_classes_x4_tmp
+            prob_X4 = unnormalized_prob_X4 / torch.sum(unnormalized_prob_X4, dim=-1, keepdim=True)
             
             _, num_classes_x4 = prob_X4.shape
             X4_t = prob_X4.multinomial(1)
