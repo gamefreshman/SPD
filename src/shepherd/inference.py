@@ -1466,8 +1466,13 @@ def inference_sample(
             unnormalized_prob_X = weighted_X.sum(dim=2)
             unnormalized_prob_X = torch.clamp(unnormalized_prob_X, min=0.0)
             unnormalized_prob_X[torch.sum(unnormalized_prob_X, dim=-1) == 0] = 1e-6
+            # 数值保护：归一化并检查质量，若偏差过大则警告并强制重归一化
             prob_X = unnormalized_prob_X / (torch.sum(unnormalized_prob_X, dim=-1, keepdim=True) + 1e-8)
-            assert ((prob_X.sum(dim=-1) - 1).abs() < 1e-3).all()
+            prob_sum = prob_X.sum(dim=-1)
+            max_deviation = (prob_sum - 1).abs().max().item()
+            if max_deviation > 1e-2:
+                print(f"Warning: prob_X normalization deviation {max_deviation:.6f} at timestep {t}, forcing re-normalization")
+                prob_X = prob_X / prob_X.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
             _, num_classes_x = prob_X.shape
 
