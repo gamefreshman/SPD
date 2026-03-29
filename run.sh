@@ -1,40 +1,31 @@
-#!/bin/bashs
+#!/bin/bash
 source .venv/bin/activate
-
-# 切换到 training 目录
 cd training
 
-# 运行 Python 训练脚本
 export CUDA_VISIBLE_DEVICES="1,2"
 
-nohup python DPO1_0_partlyFrozen.py params_x1x3x4_dpo_finetune_nps 0 > logs/dpo_nps_0_partlyFrozen.log 2>&1 &
+# ============================================================
+# SPD 基模型重训（从头训练，使用 v1.9 修复后的推理代码）
+# ============================================================
+# nohup python new_train.py params_x1x3x4_diffusion_mosesaq_retrain > logs/retrain.log 2>&1 &
 
-nohup python DPO1_0.py params_x1x3x4_dpo_finetune_nps 0 > logs/dpo_nps_0.log 2>&1 &
+# ============================================================
+# DPO v2.0 — Partial Denoising DPO（从 GT 加噪 t=0.5 出发）
+# ============================================================
+# nohup python DPO1_0_triSim.py params_x1x3x4_dpo_partial_denoise_nps 0 > logs/dpo_partial_denoise.log 2>&1 &
 
-nohup python DPO1.py params_x1x3x4_dpo_finetune_nps 0 > logs/dpo_nps.log 2>&1 &
+# ============================================================
+# DPO 标准训练（三指标：Surf + ESP + Pharm）
+# ============================================================
+# nohup python DPO1_0_triSim.py params_x1x3x4_dpo_finetune_nps 0 > logs/dpo_triSim.log 2>&1 &
 
-nohup python DPO2.py params_x1x3x4_dpo_finetune_pdb 0 > logs/dpo_pdb.log 2>&1 &
+# ============================================================
+# 可视化 DPO 训练指标
+# ============================================================
+# python visualize_dpo_metrics.py <json_path> --output dpo_metrics.png
 
-nohup python DPO3.py params_x1x3x4_dpo_fragment_merging 0 > logs/dpo_fragment_merging.log 2>&1 & 
-
-nohup python DPO2_0_surfOnly.py params_x1x3x4_dpo_finetune_nps 0 > logs/dpo_surfOnly.log 2>&1 &
----
-
-cd /home1/zhh/workspace/SPD/evaluation/experiment
-
-nohup python sample200.py > sample200.log 2>&1 &
-
----
-
-# 杀掉所有你的 DPO 相关进程
-pkill -9 -u zhh -f "DPO1_0_partlyFrozen.py"
-# 检查是否清理干净
-nvidia-smi
-
-nohup python sample_fragment.py > fragDPO.log 2>&1 &
-
-git fetch origin new-clean-branch
-
-python visualize_dpo_metrics.py /home1/zhh/workspace/SPD/training/jobs/33/x1x3x4_dpo_finetune_nps/dpo_round_metrics.json --output dpo_metrics.png
-
-pkill -f nohup
+# ============================================================
+# 评估采样
+# ============================================================
+# cd /home1/zhh/workspace/SPD/evaluation/experiment_SamEval
+# nohup python sample_NP.py > sample_NP.log 2>&1 &

@@ -504,28 +504,80 @@ def create_dpo_dataloader(params, dataset, dpo_dataset):
     return train_loader
 
 
+def _extract_gt_atom_data(mol, params):
+    """
+    从 RDKit 分子中提取原子级别数据，用于 Partial Denoising (v2.0)。
+
+    Returns:
+        dict: 包含 GT 分子的原子位置、类型和键信息
+            - 'positions': np.ndarray [N_atoms, 3] 居中后的原子坐标
+            - 'atom_type_indices': np.ndarray [N_atoms] 原子类型索引
+            - 'bond_type_indices': np.ndarray [N_atoms, N_atoms] 键类型索引矩阵（上三角）
+            - 'num_atoms': int 原子数量
+    """
+    atom_types_list = params['dataset']['x1']['atom_types']  # [None, 'H', 'C', 'N', ...]
+    bond_types_list = params['dataset']['x1']['bond_types']  # [None, 'SINGLE', 'DOUBLE', ...]
+
+    # 原子位置（已居中）
+    positions = np.array(mol.GetConformer().GetPositions())
+    positions = positions - np.mean(positions, axis=0)
+
+    # 原子类型索引
+    num_atoms = mol.GetNumAtoms()
+    atom_type_indices = np.zeros(num_atoms, dtype=int)
+    for i, atom in enumerate(mol.GetAtoms()):
+        symbol = atom.GetSymbol()
+        if symbol in atom_types_list:
+            atom_type_indices[i] = atom_types_list.index(symbol)
+        else:
+            atom_type_indices[i] = 0  # 未知类型映射到 None
+
+    # 键类型索引矩阵
+    bond_type_map = {
+        rdkit.Chem.BondType.SINGLE: 'SINGLE',
+        rdkit.Chem.BondType.DOUBLE: 'DOUBLE',
+        rdkit.Chem.BondType.TRIPLE: 'TRIPLE',
+        rdkit.Chem.BondType.AROMATIC: 'AROMATIC',
+    }
+    bond_type_indices = np.zeros((num_atoms, num_atoms), dtype=int)  # 0 = None (无键)
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bt = bond_type_map.get(bond.GetBondType(), None)
+        if bt and bt in bond_types_list:
+            idx = bond_types_list.index(bt)
+            bond_type_indices[i, j] = idx
+            bond_type_indices[j, i] = idx
+
+    return {
+        'positions': positions,
+        'atom_type_indices': atom_type_indices,
+        'bond_type_indices': bond_type_indices,
+        'num_atoms': num_atoms,
+    }
+
+
 def _prepare_molecule_condition(mol_index, mol_block, charges, params):
     """
     并行预处理单个分子的条件特征（CPU密集型操作）
-    
+
     Returns:
         dict: 包含分子索引、参考分子和条件特征的字典
     """
     mol = rdkit.Chem.MolFromMolBlock(mol_block, removeHs=False)
     if mol is None:
         return None
-    
+
     charges = np.array(charges)
-    
+
     # 预处理分子坐标
     mol_coordinates = np.array(mol.GetConformer().GetPositions())
     mol_coordinates = mol_coordinates - np.mean(mol_coordinates, axis=0)
     mol = update_mol_coordinates(mol, mol_coordinates)
-    
+
     # 提取条件特征
     centers = mol.GetConformer().GetPositions()
     radii = get_atomic_vdw_radii(mol)
-    
+
     # 生成分子表面点云
     surface = get_molecular_surface(
         centers,
@@ -534,20 +586,20 @@ def _prepare_molecule_condition(mol_index, mol_block, charges, params):
         probe_radius=params['dataset']['probe_radius'],
         num_samples_per_atom=20,
     )
-    
+
     # 提取药效团特征
     pharm_types, pharm_pos, pharm_direction = get_pharmacophores(
         mol,
         multi_vector=params['dataset']['x4']['multivectors'],
         check_access=params['dataset']['x4']['check_accessibility'],
     )
-    
+
     # 计算表面静电势
     electrostatics = get_electrostatics_given_point_charges(
         charges, centers, surface,
     )
-    
-    return {
+
+    result = {
         'mol_index': mol_index,
         'mol': mol,
         'surface': surface,
@@ -557,6 +609,12 @@ def _prepare_molecule_condition(mol_index, mol_block, charges, params):
         'pharm_direction': pharm_direction,
         'num_pharmacophores': len(pharm_types),
     }
+
+    # Partial Denoising (v2.0): 额外提取 GT 原子级别数据
+    if params.get('sampling', {}).get('partial_denoise_t_start', None) is not None:
+        result['gt_atom_data'] = _extract_gt_atom_data(mol, params)
+
+    return result
 
 
 def _sample_single_group(model_pl, params, condition, dataset, group_id, 
@@ -588,9 +646,120 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
                 atom_marginals[0] = 0.0
                 atom_marginals = atom_marginals / atom_marginals.sum()
             
+            # 获取药效团边际分布（v1.9 修复后需要）
+            pharm_marginals = None
+            if hasattr(dataset, 'x4_pharm_diffuser') and dataset.x4_pharm_diffuser is not None:
+                pharm_marginals = dataset.x4_pharm_diffuser.transition_model.marginals.to(device)
+
             # n_atoms = params.get('sampling', {}).get('fixed_n_atoms', 78)
             n_atoms = 78 # 直接硬编码为当前优化的原子的原子序数
-            
+
+            # ============ Partial Denoising (v2.0): 构建预加噪 GT 数据 ============
+            partial_denoise_t_start = params.get('sampling', {}).get('partial_denoise_t_start', None)
+            partial_denoise_data = None
+            start_timestep = None
+
+            if partial_denoise_t_start is not None and 'gt_atom_data' in condition:
+                T = params['noise_schedules']['x1']['T']
+                start_timestep = int(T * partial_denoise_t_start)
+                gt = condition['gt_atom_data']
+                num_atom_types = len(params['dataset']['x1']['atom_types'])
+                num_bond_types = len(params['dataset']['x1']['bond_types'])
+                include_virtual_node = True
+
+                # 获取 t_start 时刻的累积噪声参数
+                t_idx = start_timestep - 1  # 时间步从 1 开始，索引从 0 开始
+                alpha_dash_t = params['noise_schedules']['x1']['alpha_dash_ts'][t_idx]
+                sigma_dash_t = params['noise_schedules']['x1']['sigma_dash_ts'][t_idx]
+
+                print(f"  [Partial Denoising] t_start={partial_denoise_t_start}, "
+                      f"timestep={start_timestep}/{T}, "
+                      f"alpha_dash={alpha_dash_t:.4f}, sigma_dash={sigma_dash_t:.4f}, "
+                      f"GT atoms={gt['num_atoms']}, padded to {n_atoms}")
+
+                # 为每个子批次构建预加噪数据的函数
+                def _build_partial_denoise_data(sub_batch_size):
+                    """对 GT 分子前向加噪到 t_start，构建 inference_sample 所需的初始状态"""
+                    all_x1_pos = []
+                    all_x1_x = []
+                    all_x1_bond_edge_x = []
+                    all_x1_bond_edge_index = []
+                    all_x1_vmask = []
+                    num_nodes_counter = 0
+
+                    for b in range(sub_batch_size):
+                        # --- x1 位置：前向加噪 ---
+                        gt_pos = torch.tensor(gt['positions'], dtype=torch.float, device=device)
+                        # padding 到 n_atoms（多余原子放在原点附近加大噪声）
+                        if gt['num_atoms'] < n_atoms:
+                            pad_pos = torch.zeros(n_atoms - gt['num_atoms'], 3, device=device)
+                            gt_pos_padded = torch.cat([gt_pos, pad_pos], dim=0)
+                        else:
+                            gt_pos_padded = gt_pos[:n_atoms]
+
+                        noise_pos = torch.randn_like(gt_pos_padded)
+                        noise_pos = noise_pos - noise_pos.mean(dim=0)  # 移除质心
+                        x1_pos_t = alpha_dash_t * gt_pos_padded + sigma_dash_t * noise_pos
+
+                        # --- x1 原子类型：离散前向加噪 ---
+                        gt_atom_oh = torch.zeros(n_atoms, num_atom_types, dtype=torch.float, device=device)
+                        for i in range(min(gt['num_atoms'], n_atoms)):
+                            gt_atom_oh[i, gt['atom_type_indices'][i]] = 1.0
+                        # padding 原子设为 None 类型 (index 0)
+                        for i in range(gt['num_atoms'], n_atoms):
+                            gt_atom_oh[i, 0] = 1.0
+
+                        x1_x_t = dataset.x1_atom_diffuser.apply_noise(gt_atom_oh, start_timestep, device)
+
+                        # --- x1 键类型：离散前向加噪 ---
+                        bond_adj = np.triu(np.ones((n_atoms, n_atoms), dtype=int), k=1)
+                        bond_edge_idx = np.stack(bond_adj.nonzero(), axis=0)
+
+                        # 构建 GT 键 one-hot
+                        num_edges = bond_edge_idx.shape[1]
+                        gt_bond_oh = torch.zeros(num_edges, num_bond_types, dtype=torch.float, device=device)
+                        for e_idx in range(num_edges):
+                            i, j = bond_edge_idx[0, e_idx], bond_edge_idx[1, e_idx]
+                            if i < gt['num_atoms'] and j < gt['num_atoms']:
+                                bt_idx = gt['bond_type_indices'][i, j]
+                                gt_bond_oh[e_idx, bt_idx] = 1.0
+                            else:
+                                gt_bond_oh[e_idx, 0] = 1.0  # None 键
+
+                        x1_bond_t = dataset.x1_bond_diffuser.apply_noise(gt_bond_oh, start_timestep, device)
+
+                        # --- 添加虚拟节点 ---
+                        virtual_node_pos = torch.tensor([[0., 0., 0.]], device=device)
+                        virtual_node_x = torch.zeros(1, num_atom_types, dtype=torch.float, device=device)
+                        virtual_node_x[0, 0] = 1.0  # None 类型
+
+                        x1_pos_t_full = torch.cat([virtual_node_pos, x1_pos_t], dim=0)
+                        x1_x_t_full = torch.cat([virtual_node_x, x1_x_t], dim=0)
+
+                        # 虚拟节点掩码
+                        vmask = torch.zeros(n_atoms + 1, dtype=torch.bool, device=device)
+                        vmask[0] = True
+
+                        # 键索引偏移（虚拟节点 +1，批次偏移）
+                        be_idx = torch.tensor(bond_edge_idx, dtype=torch.long, device=device)
+                        be_idx = be_idx + 1  # 虚拟节点偏移
+                        be_idx = be_idx + num_nodes_counter  # 批次偏移
+
+                        all_x1_pos.append(x1_pos_t_full)
+                        all_x1_x.append(x1_x_t_full)
+                        all_x1_bond_edge_x.append(x1_bond_t)
+                        all_x1_bond_edge_index.append(be_idx)
+                        all_x1_vmask.append(vmask)
+                        num_nodes_counter += n_atoms + 1
+
+                    return {
+                        'x1_pos': torch.cat(all_x1_pos, dim=0),
+                        'x1_x': torch.cat(all_x1_x, dim=0).long(),
+                        'x1_bond_edge_x': torch.cat(all_x1_bond_edge_x, dim=0).long(),
+                        'x1_bond_edge_index': torch.cat(all_x1_bond_edge_index, dim=1),
+                        'x1_virtual_node_mask': torch.cat(all_x1_vmask, dim=0),
+                    }
+
             # 准备inference参数
             inference_kwargs = {
                 "batch_size": samples_per_group,
@@ -627,8 +796,9 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
                 "pharm_direction": condition['pharm_direction'],
                 "atom_marginals": atom_marginals,
                 "bond_marginals": bond_marginals,
+                "pharm_marginals": pharm_marginals,
             }
-            
+
             # 执行采样（子批次分批，避免 OOM）
             # 根据 GPU 显存自动选择子批次大小
             default_sub_batch = params.get('sampling', {}).get('inference_sub_batch_size', 4)
@@ -651,8 +821,19 @@ def _sample_single_group(model_pl, params, condition, dataset, group_id,
                 for sub_start in range(0, samples_per_group, sub_batch_size):
                     sub_batch = min(sub_batch_size, samples_per_group - sub_start)
                     inference_kwargs["batch_size"] = sub_batch
+
+                    # Partial Denoising: 为当前子批次构建预加噪数据
+                    if partial_denoise_t_start is not None and 'gt_atom_data' in condition:
+                        inference_kwargs["start_timestep"] = start_timestep
+                        inference_kwargs["partial_denoise_data"] = _build_partial_denoise_data(sub_batch)
+
                     sub_samples = inference_sample(model_pl, **inference_kwargs)
                     generated_samples.extend(sub_samples)
+
+                    # 清理 partial_denoise_data 引用
+                    inference_kwargs.pop("start_timestep", None)
+                    inference_kwargs.pop("partial_denoise_data", None)
+
                     if sub_start + sub_batch < samples_per_group:
                         torch.cuda.empty_cache()
 

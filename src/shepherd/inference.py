@@ -431,7 +431,16 @@ def inference_sample(
     atom_marginals = None,
     bond_marginals = None,
     pharm_marginals = None,
-    
+
+    # ==================== Partial Denoising (v2.0) ====================
+    start_timestep = None,         # int: 从此时间步开始反向去噪（默认 None = 从 T 开始）
+    partial_denoise_data = None,   # dict: 预加噪的初始状态，包含以下键：
+                                   #   'x1_pos': [batch*(N_x1+1), 3]
+                                   #   'x1_x': [batch*(N_x1+1), num_atom_types] (one-hot, long)
+                                   #   'x1_bond_edge_x': [batch*num_edges] (one-hot, long)
+                                   #   'x1_bond_edge_index': [2, batch*num_edges]
+                                   #   'x1_virtual_node_mask': [batch*(N_x1+1)]
+                                   #   x4 由 inpainting 机制处理，无需提供
 ):
     """
     运行ShEPhERD推理以采样batch_size个分子。
@@ -894,43 +903,63 @@ def inference_sample(
     virtual_node_mask_x4 = torch.cat(virtual_node_mask_x4, dim =0)  # 虚拟节点掩码
     
     # ============================================================================
-    # 变量重命名以保持一致性
+    # 变量重命名以保持一致性（或使用 partial_denoise_data 覆盖 x1）
     # ============================================================================
-    
-    # X1模态（分子）变量重命名
-    x1_pos_t = pos_forward_noised_x1  # 当前时间步的原子位置
-    x1_x_t = x_forward_noised_x1  # 当前时间步的原子特征
-    x1_bond_edge_x_t = bond_edge_x_forward_noised_x1  # 当前时间步的键特征
-    
-    # X4模态（药效团）变量重命名
+
+    if partial_denoise_data is not None:
+        # Partial Denoising (v2.0): x1 使用预加噪的 GT 数据
+        x1_pos_t = partial_denoise_data['x1_pos'].to(device)
+        x1_x_t = partial_denoise_data['x1_x'].to(device)
+        x1_bond_edge_x_t = partial_denoise_data['x1_bond_edge_x'].to(device)
+        # 覆盖 bond_edge_index（因为 GT 的 padding 原子需要特殊的边索引）
+        bond_edge_index_x1 = partial_denoise_data['x1_bond_edge_index'].to(device)
+        virtual_node_mask_x1 = partial_denoise_data['x1_virtual_node_mask'].to(device)
+        print(f"  [Partial Denoising] x1 使用预加噪 GT 数据，从 t={start_timestep} 开始")
+    else:
+        # 原始行为：x1 从纯噪声开始
+        x1_pos_t = pos_forward_noised_x1
+        x1_x_t = x_forward_noised_x1
+        x1_bond_edge_x_t = bond_edge_x_forward_noised_x1
+
+    # X4模态变量重命名（x4 始终由 inpainting 机制处理）
     x4_pos_t = pos_forward_noised_x4  # 当前时间步的药效团位置
     x4_direction_t = direction_forward_noised_x4  # 当前时间步的药效团方向
     x4_x_t = x_forward_noised_x4  # 当前时间步的药效团特征
-    
+
     # ============================================================================
     # 计算各模态的批次节点总数
     # ============================================================================
-    
+
     x1_batch_size_nodes = x1_pos_t.shape[0]  # X1模态总节点数（包含所有批次和虚拟节点）
     x4_batch_size_nodes = x4_pos_t.shape[0]  # X4模态总节点数
-    
+
     # ============================================================================
-    # 初始化各模态的当前时间步（从最大噪声时间开始）
+    # 初始化各模态的当前时间步（从最大噪声时间开始，或从 start_timestep）
     # ============================================================================
-    
-    x1_t = params['noise_schedules']['x1']['ts'][::-1][0]  # X1模态起始时间步（t=T）
-    x2_t = params['noise_schedules']['x2']['ts'][::-1][0]  # X2模态起始时间步（t=T）
-    x3_t = params['noise_schedules']['x3']['ts'][::-1][0]  # X3模态起始时间步（t=T）
-    x4_t = params['noise_schedules']['x4']['ts'][::-1][0]  # X4模态起始时间步（t=T）
-    
+
+    T_full = params['noise_schedules']['x1']['ts'][::-1][0]  # 最大时间步 T
+
+    if start_timestep is not None:
+        # Partial Denoising: 从指定时间步开始
+        x1_t = start_timestep
+        x2_t = start_timestep
+        x3_t = start_timestep
+        x4_t = start_timestep
+    else:
+        x1_t = T_full  # X1模态起始时间步（t=T）
+        x2_t = params['noise_schedules']['x2']['ts'][::-1][0]
+        x3_t = params['noise_schedules']['x3']['ts'][::-1][0]
+        x4_t = params['noise_schedules']['x4']['ts'][::-1][0]
+
     t = x1_t
     # ============================================================================
     # 时间步一致性验证
     # ============================================================================
     
-    assert x1_t == x2_t  # 确保X1和X2模态时间步一致
-    assert x1_t == x3_t  # 确保X1和X3模态时间步一致
-    assert x1_t == x4_t  # 确保X1和X4模态时间步一致
+    if start_timestep is None:
+        assert x1_t == x2_t  # 确保X1和X2模态时间步一致
+        assert x1_t == x3_t  # 确保X1和X3模态时间步一致
+        assert x1_t == x4_t  # 确保X1和X4模态时间步一致
     
     # ============================================================================
     # 初始修复（Inpainting）条件处理
@@ -978,7 +1007,7 @@ def inference_sample(
     # ============================================================================
     
     # 创建进度条（包含协调跳跃的额外步数）
-    pbar = tqdm(total= T + sum(harmonize_jumps) * int(harmonize), position=0, leave=True)
+    pbar = tqdm(total= t + sum(harmonize_jumps) * int(harmonize), position=0, leave=True)
     
     # ============================================================================
     # 主要去噪循环（从t=T到t=0）
