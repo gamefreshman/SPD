@@ -36,6 +36,8 @@ class LightningModule(pl.LightningModule):
             self.ref_model.eval()
             for param in self.ref_model.parameters():
                 param.requires_grad = False
+        # x4 在结构上仍可保持带噪条件通路，但 DPO 目标默认只优化 x1。
+        self.dpo_optimize_x4 = params['training'].get('dpo_optimize_x4', False)
 
         # beta_dpo，dpo 的 模型与参考模型的偏离度
         # dpo_max_weight，dpo 的 DPO损失与标准损失的混合比例的最高权重
@@ -365,13 +367,11 @@ class LightningModule(pl.LightningModule):
                 output_winner = self.forward_training(input_winner)
                 loss_std_x1, _, _, _ = self.x1_denoising_loss(input_winner, output_winner)
                 
-                # 标准损失：x1 + x4（防止 x4 药效团解码器在 DPO 训练中退化）
+                # DPO 微调语义：x4 作为带噪条件输入，但当前目标只优化 x1。
                 loss_std = loss_std_x1
-                loss_std_x4 = torch.tensor(0.0, device=self.device)
-                if self.train_x4_denoising and 'x4' in input_winner:
+                if self.dpo_optimize_x4 and self.train_x4_denoising and 'x4' in input_winner:
                     loss_x4, _, _, _ = self.x4_denoising_loss(input_winner, output_winner)
                     loss_std = loss_std + loss_x4
-                    loss_std_x4 = loss_x4
 
                 # 传入已计算好的 input_winner/output_winner，避免在 compute_dpo_loss 内再次前向计算 winner
                 loss_dpo, implicit_acc, model_diff, ref_diff = self.compute_dpo_loss(
@@ -391,7 +391,6 @@ class LightningModule(pl.LightningModule):
                 self.log('loss_dpo', loss_dpo)
                 self.log('loss_std_on_winner', loss_std)
                 self.log('loss_std_x1_on_winner', loss_std_x1)
-                self.log('loss_std_x4_on_winner', loss_std_x4)
                 self.log('train_loss', loss)
                 
                 # 缓存 DPO 指标到模块上，确保 callback 可以可靠读取
@@ -661,8 +660,8 @@ class LightningModule(pl.LightningModule):
             # 记录离散特征的准确率
             acc_results.append((model_diff_disc < 0).float())
 
-        # ========== 计算 x4 药效团的 DPO 损失（类型 + 位置 + 方向） ==========
-        if self.train_x4_denoising and 'x4' in input_winner:
+        # ========== 可选的 x4 DPO 损失（默认关闭） ==========
+        if self.dpo_optimize_x4 and self.train_x4_denoising and 'x4' in input_winner:
             mask_w_x4 = ~input_winner['x4']['decoder']['virtual_node_mask']
             mask_l_x4 = ~input_loser['x4']['decoder']['virtual_node_mask']
 

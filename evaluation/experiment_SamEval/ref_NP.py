@@ -27,6 +27,7 @@ import pickle
 from copy import deepcopy
 import os
 import multiprocessing
+from datetime import datetime
 from tqdm import tqdm
 
 
@@ -42,7 +43,27 @@ import importlib
 
 from shepherd.inference import *
 
-chkpt = '../data/shepherd_chkpts/x1x3x4_diffusion_mosesaq_20240824_submission.ckpt' # checkpoint used for evaluations in preprint
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+chkpt = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'data', 'shepherd_chkpts', 'x1x3x4_diffusion_mosesaq_20240824_submission.ckpt'))  # checkpoint used for evaluations in preprint
+CONDITION_SOURCE_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, '..', 'data', 'conformers', 'np', 'molblock_charges_NPs.pkl'))
+CONDITION_SEMANTICS = 'x2_x3_fixed__x4_noised_condition__optimize_x1'
+CONDITION_FLAG_SUMMARY = {
+    'inpaint_x2_pos': False,
+    'inpaint_x3_pos': False,
+    'inpaint_x3_x': False,
+    'inpaint_x4_pos': True,
+    'inpaint_x4_direction': True,
+    'inpaint_x4_type': True,
+    'stop_inpainting_at_time_x2': 0.0,
+    'add_noise_to_inpainted_x2_pos': 0.0,
+    'stop_inpainting_at_time_x3': 0.0,
+    'add_noise_to_inpainted_x3_pos': 0.0,
+    'add_noise_to_inpainted_x3_x': 0.0,
+    'stop_inpainting_at_time_x4': 0.0,
+    'add_noise_to_inpainted_x4_pos': 0.0,
+    'add_noise_to_inpainted_x4_direction': 0.0,
+    'add_noise_to_inpainted_x4_type': 0.0,
+}
 
 import json
 import gc
@@ -63,6 +84,35 @@ N_ATOMS_LIST = [36, 40, 44, 48, 49,
                 77, 78, 79, 80, 81, 
                 83, 84, 85, 86, 87]
 SAMPLES_PER_N_ATOMS = 100  # 每个原子数量生成的分子数
+
+
+def assert_condition_semantics():
+    assert CONDITION_FLAG_SUMMARY['inpaint_x2_pos'] is False
+    assert CONDITION_FLAG_SUMMARY['inpaint_x3_pos'] is False
+    assert CONDITION_FLAG_SUMMARY['inpaint_x3_x'] is False
+    assert CONDITION_FLAG_SUMMARY['inpaint_x4_pos'] is True
+    assert CONDITION_FLAG_SUMMARY['inpaint_x4_direction'] is True
+    assert CONDITION_FLAG_SUMMARY['inpaint_x4_type'] is True
+    print(
+        f"🧭 采样语义: {CONDITION_SEMANTICS} | "
+        "x2/x3 固定条件, x4 带噪条件, 目标仅生成 x1"
+    )
+
+
+def write_sidecar_metadata(sample_json_path):
+    sidecar_path = f"{sample_json_path}.meta.json"
+    payload = {
+        'sample_json_path': os.path.abspath(sample_json_path),
+        'checkpoint_path': chkpt,
+        'source_script': os.path.abspath(__file__),
+        'condition_semantics': CONDITION_SEMANTICS,
+        'sampling_flags': CONDITION_FLAG_SUMMARY,
+        'condition_source_file': CONDITION_SOURCE_FILE,
+        'written_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    with open(sidecar_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"📝 sidecar metadata 已保存到: {sidecar_path}")
 
 
 def count_existing_samples(molecule_index, n_atoms):
@@ -224,21 +274,7 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, molblock, charges_list,
                     harmonize=False,
                     harmonize_ts=[],
                     harmonize_jumps=[],
-                    inpaint_x2_pos=False,
-                    inpaint_x3_pos=True,
-                    inpaint_x3_x=True,
-                    inpaint_x4_pos=True,
-                    inpaint_x4_direction=True,
-                    inpaint_x4_type=True,
-                    stop_inpainting_at_time_x2=0.0,
-                    add_noise_to_inpainted_x2_pos=0.0,
-                    stop_inpainting_at_time_x3=0.0,
-                    add_noise_to_inpainted_x3_pos=0.0,
-                    add_noise_to_inpainted_x3_x=0.0,
-                    stop_inpainting_at_time_x4=0.0,
-                    add_noise_to_inpainted_x4_pos=0.0,
-                    add_noise_to_inpainted_x4_direction=0.0,
-                    add_noise_to_inpainted_x4_type=0.0,
+                    **CONDITION_FLAG_SUMMARY,
                     center_of_mass=np.zeros(3),
                     surface=surface,
                     electrostatics=electrostatics,
@@ -299,6 +335,7 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, molblock, charges_list,
 
 # 主函数：使用多GPU并行处理
 if __name__ == '__main__':
+    assert_condition_semantics()
     # ==================== 配置参数 ====================
     # 采样参数 - 根据GPU内存调整batch_size
     # 24GB GPU: batch_size=2-3
@@ -316,7 +353,7 @@ if __name__ == '__main__':
     print(f"{'='*100}\n")
     
     # 加载所有三种自然分子
-    with open('../data/conformers/np/molblock_charges_NPs.pkl', 'rb') as f:
+    with open(CONDITION_SOURCE_FILE, 'rb') as f:
         molblocks_and_charges = pickle.load(f)
     
     # 加载模型参数（仅用于获取配置，在主进程中）
@@ -441,6 +478,7 @@ if __name__ == '__main__':
     output_file = 'data/generated_samples_all_molecules.json'
     with open(output_file, 'w') as f:
         json.dump(all_results, f, indent=2)
+    write_sidecar_metadata(output_file)
     
     # 统计总数
     total_all = 0

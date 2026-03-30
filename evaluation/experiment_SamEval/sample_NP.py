@@ -4,6 +4,7 @@ import json
 import pickle
 import multiprocessing
 import gc
+from datetime import datetime
 from functools import partial
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -44,6 +45,54 @@ BATCH_SIZE = 2
 
 # 模型 checkpoint 路径
 chkpt = '/home1/zhh/workspace/SPD/training/jobs/33/x1x3x4_dpo_finetune_nps/last.ckpt'
+CONDITION_SOURCE_FILE = '/home1/zhh/workspace/SPD/data/conformers/np/molblock_charges_NPs.pkl'
+CONDITION_SEMANTICS = 'x2_x3_fixed__x4_noised_condition__optimize_x1'
+CONDITION_FLAG_SUMMARY = {
+    'inpaint_x2_pos': False,
+    'inpaint_x3_pos': False,
+    'inpaint_x3_x': False,
+    'inpaint_x4_pos': True,
+    'inpaint_x4_direction': True,
+    'inpaint_x4_type': True,
+    'stop_inpainting_at_time_x2': 0.0,
+    'add_noise_to_inpainted_x2_pos': 0.0,
+    'stop_inpainting_at_time_x3': 0.0,
+    'add_noise_to_inpainted_x3_pos': 0.0,
+    'add_noise_to_inpainted_x3_x': 0.0,
+    'stop_inpainting_at_time_x4': 0.0,
+    'add_noise_to_inpainted_x4_pos': 0.0,
+    'add_noise_to_inpainted_x4_direction': 0.0,
+    'add_noise_to_inpainted_x4_type': 0.0,
+}
+
+
+def assert_condition_semantics():
+    assert CONDITION_FLAG_SUMMARY['inpaint_x2_pos'] is False
+    assert CONDITION_FLAG_SUMMARY['inpaint_x3_pos'] is False
+    assert CONDITION_FLAG_SUMMARY['inpaint_x3_x'] is False
+    assert CONDITION_FLAG_SUMMARY['inpaint_x4_pos'] is True
+    assert CONDITION_FLAG_SUMMARY['inpaint_x4_direction'] is True
+    assert CONDITION_FLAG_SUMMARY['inpaint_x4_type'] is True
+    print(
+        f"🧭 采样语义: {CONDITION_SEMANTICS} | "
+        "x2/x3 固定条件, x4 带噪条件, 目标仅生成 x1"
+    )
+
+
+def write_sidecar_metadata(sample_json_path):
+    sidecar_path = f"{sample_json_path}.meta.json"
+    payload = {
+        'sample_json_path': os.path.abspath(sample_json_path),
+        'checkpoint_path': chkpt,
+        'source_script': os.path.abspath(__file__),
+        'condition_semantics': CONDITION_SEMANTICS,
+        'sampling_flags': CONDITION_FLAG_SUMMARY,
+        'condition_source_file': CONDITION_SOURCE_FILE,
+        'written_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    with open(sidecar_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"📝 sidecar metadata 已保存到: {sidecar_path}")
 
 # 仅加载配置（不加载模型到 GPU，避免 fork 问题）
 print("加载模型配置...")
@@ -52,8 +101,9 @@ params = model_pl_temp.params
 del model_pl_temp
 gc.collect()
 
+assert_condition_semantics()
 
-with open('/home1/zhh/workspace/SPD/data/conformers/np/molblock_charges_NPs.pkl', 'rb') as f:
+with open(CONDITION_SOURCE_FILE, 'rb') as f:
     # 从pkl文件中读取molblock和charges数据
     molblocks_and_charges = pickle.load(f)
     # 打印数据长度以确认实际包含的分子数量
@@ -326,21 +376,7 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable
                     harmonize=False,
                     harmonize_ts=[],
                     harmonize_jumps=[],
-                    inpaint_x2_pos=False,
-                    inpaint_x3_pos=False,
-                    inpaint_x3_x=False,
-                    inpaint_x4_pos=True,
-                    inpaint_x4_direction=True,
-                    inpaint_x4_type=True,
-                    stop_inpainting_at_time_x2=0.0,
-                    add_noise_to_inpainted_x2_pos=0.0,
-                    stop_inpainting_at_time_x3=0.0,
-                    add_noise_to_inpainted_x3_pos=0.0,
-                    add_noise_to_inpainted_x3_x=0.0,
-                    stop_inpainting_at_time_x4=0.0,
-                    add_noise_to_inpainted_x4_pos=0.0,
-                    add_noise_to_inpainted_x4_direction=0.0,
-                    add_noise_to_inpainted_x4_type=0.0,
+                    **CONDITION_FLAG_SUMMARY,
                     center_of_mass=np.zeros(3),
                     surface=mol_features['surface'],
                     electrostatics=mol_features['electrostatics'],
@@ -676,6 +712,7 @@ if __name__ == '__main__':
     output_file = f'data/generated_samples_all_molecules_{os.path.basename(chkpt)}.json'
     with open(output_file, 'w') as f:
         json.dump(all_results_json, f, indent=2)
+    write_sidecar_metadata(output_file)
     
     # 统计总数
     total_all = 0

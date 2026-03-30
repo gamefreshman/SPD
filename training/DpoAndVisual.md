@@ -16,6 +16,64 @@
 
 ---
 
+## 2026-03-30 训练语义纠偏与 NP/SPD 评估链审计
+
+### 结论
+
+- `eval_unified.py` 不是根因，它消费的是已经生成好的样本，并通过 `REF_MOL_PKL` 重建 CondEval 参考条件。
+- 当前需要收口的是两处：
+  - 训练侧 DPO 目标曾把 `x4` 当成联合优化对象，偏离了“`x4` 作为条件生成 `x1`”的任务定义。
+  - NP/SPD 评估链对样本 provenance 和缓存失效的管理过弱，容易出现“同一路径新旧样本混用”的误判。
+
+### 本次修改日志
+
+#### 1. 训练语义收口
+
+- `src/shepherd/lightning_module.py`
+  - DPO batch 的 `loss_std` 默认只包含 `x1`。
+  - `compute_dpo_loss()` 默认不再计算 `x4` 的 DPO 分量。
+  - 新增 `training.dpo_optimize_x4` 开关，默认 `False`。
+- `training/parameters/params_x1x3x4_dpo_finetune_nps.py`
+- `training/parameters/params_x1x3x4_dpo_partial_denoise_nps.py`
+  - 明确 `train_x4_denoising=True` 仅表示保留 `x4` 带噪条件通路。
+  - DPO 目标默认只优化 `x1`。
+
+#### 2. 推理入口保护
+
+- `src/shepherd/inference.py`
+  - 当调用方传入 `inpaint_x2_pos=True` 或 `inpaint_x3_* = True` 时，打印 warning。
+  - 该 warning 明确指出：在当前 SPD 语义下，`x2/x3` 始终是固定条件，这些参数只作为兼容配置保留。
+
+#### 3. NP/SPD 采样链 provenance 补强
+
+- `evaluation/experiment_SamEval/sample_NP.py`
+  - 保持正确语义：`x2/x3` 固定条件，`x4` 带噪条件。
+  - 增加语义断言与启动日志。
+  - 在输出 JSON 旁写入 `<samples>.meta.json` sidecar，记录 checkpoint、脚本来源、条件语义、关键采样 flags、条件来源文件。
+- `evaluation/experiment_SamEval/ref_NP.py`
+  - 修正旧残留配置：`inpaint_x3_pos` / `inpaint_x3_x` 改为 `False`。
+  - 同步写 sidecar metadata，保证与 `sample_NP.py` 使用同一语义。
+
+#### 4. 统一评估缓存失效逻辑
+
+- `evaluation/experiment_SamEval/eval_unified.py`
+  - 不再只按路径复用缓存，改为比较：
+    - sample JSON 的 fingerprint
+    - sidecar metadata fingerprint
+    - sidecar 关键摘要，尤其 `condition_semantics`
+  - 若模型 sidecar 语义不一致，则停止横向对比。
+  - 若 sidecar 缺失，则打印强 warning，提示当前比较无法验证采样语义。
+
+### 审计范围说明
+
+- 本轮只修 NP/SPD 链路，不扩到 `sample_fragment.py` / `ref_fragment.py`。
+- 对当前 `eval_unified.py` 的三个输入模型（`Origin_Shepherd` / `SPD` / `DPO`），重新生成 JSON 时必须同步保留对应 `.meta.json` sidecar。
+
+### 运行注意
+
+- 重采样后需要清空 `evaluation/experiment_SamEval/conf_eval_results.json` 与 `evaluation/experiment_SamEval/cond_eval_results.json` 再重跑评估。
+- 如果只替换了 JSON、没有同步替换 sidecar，`eval_unified.py` 现在会给出 provenance 警告，避免继续静默复用旧缓存。
+
 ## 1. 概述
 
 本工作流由三个文件组成，实现基于 **Direct Preference Optimization (DPO)** 的分子生成模型微调流水线。核心目标是通过三维相似度评分（Surface、ESP、Pharmacophore）构建偏好对，引导扩散模型生成与目标天然产物更相似的分子。
@@ -468,9 +526,9 @@ Round 10-15:              收尾期 — 如果 5 轮无提升，停止当前实�
 
 | 版本 | 总轮次 | 最佳 W_Total | 最终 Valid% | 最终 Pairs | 结论 |
 |------|--------|-------------|------------|------------|------|
-| v1.6 | 16 | 4.255 (R10) | 20% | 17 | Score 提升但有效率崩塌，根因：纯 DPO 训练无真实数据 |
-| v1.7 | 18 | 4.197 (R10) | **12%** | **6** | **比 v1.6 更差**。混合训练（1 分子）正则化不足，beta=0.1 过低加速偏离，18 轮 0 次 ref 更新 |
-| v1.9 | 20 | 4.213 (R11) | **11%** | **4** | 离散推理修复后 R0 基线 Valid% 从 ~60% 降至 50%，崩塌模式同前。**推理修复可能需要重训 SPD 基模型** |
+| v1.6 | 16 | 4.255 (R10) | 20% | 17 | Score 提升但有效率崩塌。曾以为是无真实数据，实际**真实根因为 BF-003 条件语义缺陷**（x3评估时被加噪，x4误入DPO优化目标），导致严重的 OOD 漂移。 |
+| v1.7 | 18 | 4.197 (R10) | **12%** | **6** | **比 v1.6 更差**。混合真实数据也无法挽救，因 BF-003 问题导致条件机制从根本上崩坏。 |
+| v1.9 | 20 | 4.213 (R11) | **11%** | **4** | 离散推理修复后崩塌同前。除了可能需要重训基模型外，此版本仍受制于致命的 BF-003 语义偏差。 |
 
 ---
 

@@ -42,7 +42,7 @@ params = {
         'train_x1_denoising': True,
         'train_x2_denoising': False,
         'train_x3_denoising': False,
-        'train_x4_denoising': True,
+        'train_x4_denoising': True,  # 保留 x4 带噪条件通路；DPO 是否优化 x4 由 dpo_optimize_x4 单独控制
         
         # 调整批次大小（因为只有3个分子）
         'batch_size': 2,  # 小批次，适合3个分子的微调
@@ -69,10 +69,11 @@ params = {
         # DPO核心参数
         'beta_dpo': 0.3,  # 增强KL约束，减缓模型偏离速度 (0.1→0.3)，v1.6-v1.9 均证明 0.1 过低
         'dpo_ramp_up_epochs': 10,  # 慢速提升DPO权重，先稳定基础去噪 (3→10)
-        'dpo_max_weight': 0.3,  # 降低DPO权重，70%给标准去噪保护生成质量 (0.8→0.3)
+        'dpo_max_weight': 0.15,  # 进一步降低DPO权重，优先保留基础去噪能力
+        'dpo_optimize_x4': False,  # x4 始终作为带噪条件，DPO 微调目标仅优化 x1
         
         # 数据混合策略（防止灾难性遗忘）
-        'real_data_ratio': 0.5,  # 50%真实分子数据 + 50%DPO偏好对，维持基础去噪能力
+        'real_data_ratio': 0.7,  # 70%真实分子数据 + 30%DPO偏好对，强化基础分布约束
 
         # 采样策略（针对小数据集调整）
         'dpo_sampling_ratio': 1.0,  # 每个epoch对所有3个分子采样（100%）
@@ -81,11 +82,23 @@ params = {
         # 偏好对构建
         'dpo_min_score_gap': 0.15,  # 提高阈值，只保留区分度更大的偏好对 (0.1→0.15)，减少噪声对
         'dpo_keep_old_ratio': 0.3,  # 减少旧对比例，优先用新鲜偏好对 (0.5→0.3)
+        'dpo_top_k_winners': 2,  # 组内只保留少量最优 winner，避免笛卡尔积放大极端样本
+        'dpo_max_losers_per_winner': 2,  # 每个 winner 只配少量 loser
+        'dpo_max_pair_repeats_per_molecule': 2,  # 限制单个分子在 pair buffer 中的复用次数
         
         # checkpoint和采样控制
         'dpo_skip_first_epoch': False,  # 从epoch 0就开始采样
         'dpo_load_weights_only': True,  # 从旧checkpoint只加载权重
         'dpo_sampling_every_n_epochs': 3,  # 更频繁采样新偏好对 (5→3)，让模型用更新的偏好对训练
+        'buffer_gate_min_validity_rate': 0.40,  # 低于该化学有效率的新 round 不进入 buffer
+        'buffer_gate_min_pairs': 50,  # 新 round 至少要产出足够多的 pair 才能覆盖旧数据
+        'buffer_gate_require_zero_score_failures': True,  # 条件评分失败样本出现时直接拒绝写入 buffer
+        'protect_stop_validity_rate': 0.40,  # 连续低于该有效率则保护性停训
+        'protect_stop_patience_rounds': 2,  # 连续 2 轮低有效率后停训
+        'protect_stop_min_pairs': 30,  # pair 数过低时立即停训
+        'protect_stop_on_zero_winner_group': True,  # 任一组无可评分 winner 时立即停训
+        'healthy_checkpoint_min_validity_rate': 0.40,  # 仅在健康轮次更新 best checkpoint
+        'healthy_checkpoint_require_zero_score_failures': True,
         
         # 预训练模型路径（从MOSES_aq模型开始微调）
         'pretrained_checkpoint_path': '/home1/zhh/workspace/SPD/evaluation/ckpt/last_33epoch.ckpt',
@@ -97,6 +110,11 @@ params = {
         'iterative_dpo_enabled': False,          # 禁用动态更新 ref_model，参考模型始终为初始预训练权重
         'iterative_dpo_score_threshold': 0.0,    # 最低分数提升阈值（避免微小噪声触发更新，0.0 = 只要超过就更新）
         'iterative_dpo_force_update_every_n_rounds': 5,  # 更频繁强制更新 (10→5)，防止ref_model过时导致信号失效
+    },
+
+    'freeze_strategy': {
+        'freeze_encoder': True,
+        'freeze_hetero_last_n_layers': 1,  # 进一步收紧可训练自由度，优先保护共享表示层
     },
     
     # ==================== DPO采样配置 ====================

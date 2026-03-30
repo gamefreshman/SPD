@@ -257,6 +257,88 @@ def convert_for_json(obj):
     return obj
 
 
+def _array_signature(values, decimals=None):
+    """将数组压平成稳定的可哈希签名，用于去重分子样本。"""
+    if values is None:
+        return ()
+
+    arr = np.asarray(values)
+    if arr.size == 0:
+        return ()
+
+    if decimals is not None and np.issubdtype(arr.dtype, np.floating):
+        arr = np.round(arr.astype(np.float64), decimals=decimals)
+
+    return tuple(arr.reshape(-1).tolist())
+
+
+def build_sample_signature(sample_item):
+    """为分子样本构建轻量级签名，避免同一分子被重复配对。"""
+    return (
+        _array_signature(sample_item.get('atoms'), decimals=None),
+        _array_signature(sample_item.get('positions'), decimals=3),
+        _array_signature(sample_item.get('bonds'), decimals=None),
+    )
+
+
+def sanitize_scoring_molecule(mol):
+    """尽量构造适合打分的 RDKit 分子，失败时返回原因。"""
+    if mol is None:
+        return None, "rdkit_mol_missing"
+
+    scoring_mol = rdkit.Chem.Mol(mol)
+    if scoring_mol is None:
+        return None, "rdkit_mol_copy_failed"
+
+    try:
+        rdkit.Chem.SanitizeMol(scoring_mol)
+    except Exception as exc:
+        return None, f"sanitize_failed:{type(exc).__name__}"
+
+    try:
+        if scoring_mol.GetNumConformers() > 0 and not any(atom.GetAtomicNum() == 1 for atom in scoring_mol.GetAtoms()):
+            scoring_mol = rdkit.Chem.AddHs(scoring_mol, addCoords=True)
+            rdkit.Chem.SanitizeMol(scoring_mol)
+    except Exception:
+        # 显式氢补全只作为增强手段，失败时保留原分子继续评分。
+        pass
+
+    return scoring_mol, None
+
+
+def compute_partial_charges_with_fallback(mol):
+    """优先使用 MMFF，失败时回退到 Gasteiger 电荷。"""
+    from rdkit.Chem import AllChem
+    from rdkit.Chem import rdPartialCharges
+
+    try:
+        if AllChem.MMFFHasAllMoleculeParams(mol):
+            molec_props = AllChem.MMFFGetMoleculeProperties(mol)
+            if molec_props is not None:
+                charges = np.array(
+                    [molec_props.GetMMFFPartialCharge(i) for i in range(mol.GetNumAtoms())],
+                    dtype=float,
+                )
+                if np.all(np.isfinite(charges)):
+                    return charges, "mmff"
+    except Exception:
+        pass
+
+    try:
+        charge_mol = rdkit.Chem.Mol(mol)
+        rdPartialCharges.ComputeGasteigerCharges(charge_mol)
+        charges = np.array(
+            [float(charge_mol.GetAtomWithIdx(i).GetProp('_GasteigerCharge')) for i in range(charge_mol.GetNumAtoms())],
+            dtype=float,
+        )
+        if np.all(np.isfinite(charges)):
+            return charges, "gasteiger"
+    except Exception:
+        pass
+
+    return None, "missing_partial_charges"
+
+
 def get_bond_type_str(bond):
     """将RDKit键类型转换为字符串"""
     return str(bond.GetBondType())
@@ -1067,110 +1149,139 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
         group_id = sample.get('group_id', sample.get('source_mol_index', 0))
         grouped_samples[group_id].append(sample)
     
+    training_cfg = params.get('training', {})
+    dpo_cfg = params.get('dpo', {})
+    min_gap = dpo_cfg.get('min_score_gap', training_cfg.get('dpo_min_score_gap', 0.05))
+    top_k_winners = max(1, int(training_cfg.get('dpo_top_k_winners', 2)))
+    max_losers_per_winner = max(1, int(training_cfg.get('dpo_max_losers_per_winner', 2)))
+    max_pair_repeats_per_molecule = max(1, int(training_cfg.get('dpo_max_pair_repeats_per_molecule', 2)))
+
     all_preference_pairs = []
-    all_valid_molecules_across_groups = []  # 收集所有组的有效分子，用于跨组匹配
-    total_invalid_count = 0  # 跨组累计无效分子数
-    groups_with_pairs = set()  # 记录已成功构建偏好对的组
-    
+    all_scoreable_molecules_for_avg = []
+    all_pairable_molecules_across_groups = []
+    groups_with_pairs = set()
+    seen_pair_signatures = set()
+    pair_repeat_counts = defaultdict(int)
+
+    chemical_valid_count = 0
+    total_invalid_count = 0
+    cond_eval_success_count = 0
+    cond_eval_failed_count = 0
+    pairable_count = 0
+    zero_winner_group_count = 0
+
+    ref_molec = None
+    ref_eval_error = None
+    num_surf_points = 400
+    alpha = None
+    lam_scaled = None
+    get_overlap_np = None
+    get_overlap_esp_np = None
+    get_overlap_pharm_np = None
+
+    # 所有组都对同一个参考分子采样，因此只初始化一次参考评分对象。
+    if reference_mols is None or len(reference_mols) == 0:
+        ref_eval_error = "missing_reference_molecule"
+        print("⚠️  无参考分子，跳过条件评分，本轮不会构建新的偏好对")
+    else:
+        try:
+            from shepherd_score.score.gaussian_overlap_np import get_overlap_np
+            from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
+            from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
+            from shepherd_score.score.constants import ALPHA, LAM_SCALING
+
+            ref_mol_idx = 0
+            ref_scoring_mol, ref_sanitize_error = sanitize_scoring_molecule(reference_mols[ref_mol_idx])
+            if ref_scoring_mol is None:
+                raise ValueError(ref_sanitize_error or "reference_sanitize_failed")
+
+            ref_partial_charges, ref_charge_method = compute_partial_charges_with_fallback(ref_scoring_mol)
+            ref_molec = Molecule(
+                ref_scoring_mol,
+                num_surf_points=num_surf_points,
+                probe_radius=1.2,
+                partial_charges=ref_partial_charges,
+                pharm_multi_vector=False,
+            )
+            alpha = ALPHA(num_surf_points)
+            lam_scaled = 0.3 * LAM_SCALING
+
+            print(
+                "📌 参考分子评分对象初始化成功: "
+                f"charges={ref_charge_method}, "
+                f"has_surf_esp={ref_molec.surf_esp is not None}, "
+                f"has_pharm_ancs={ref_molec.pharm_ancs is not None}"
+            )
+        except Exception as exc:
+            ref_eval_error = f"reference_eval_init_failed:{type(exc).__name__}"
+            print(f"⚠️  参考分子评分初始化失败: {exc}")
+            ref_molec = None
+
+    def build_score_payload(item):
+        payload = {
+            **item['conf_scores'],
+            **item['cond_scores'],
+            'total_score': item['total_score'],
+        }
+        if item.get('charge_method'):
+            payload['charge_method'] = item['charge_method']
+        return payload
+
+    def add_preference_pair(winner, loser):
+        winner_sig = winner['sample_signature']
+        loser_sig = loser['sample_signature']
+
+        if winner_sig == loser_sig:
+            return False, "duplicate_molecule"
+        if pair_repeat_counts[winner_sig] >= max_pair_repeats_per_molecule:
+            return False, f"winner_repeat_limit={max_pair_repeats_per_molecule}"
+        if pair_repeat_counts[loser_sig] >= max_pair_repeats_per_molecule:
+            return False, f"loser_repeat_limit={max_pair_repeats_per_molecule}"
+
+        pair_key = (winner_sig, loser_sig)
+        if pair_key in seen_pair_signatures:
+            return False, "duplicate_pair"
+
+        winner_score = winner['total_score']
+        loser_score = loser['total_score']
+        score_gap = winner_score - loser_score
+        if score_gap < min_gap:
+            return False, f"gap={score_gap:.3f}<min_gap={min_gap:.3f}"
+
+        winner_mol = create_rdkit_molecule(winner['sample'])
+        loser_mol = create_rdkit_molecule(loser['sample'])
+        if winner_mol is None or loser_mol is None:
+            return False, "rdkit_molecule_build_failed"
+
+        pair = (
+            winner_mol,
+            loser_mol,
+            build_score_payload(winner),
+            build_score_payload(loser),
+        )
+        all_preference_pairs.append(pair)
+        seen_pair_signatures.add(pair_key)
+        pair_repeat_counts[winner_sig] += 1
+        pair_repeat_counts[loser_sig] += 1
+        return True, f"gap={score_gap:.3f}"
+
     # 为每组分子评估
     for source_idx, samples in grouped_samples.items():
         print(f"\n📋 评估组 {source_idx}: {len(samples)} 个样本")
         
-        # 1. 使用ConfEval评估每个生成的分子（或使用RDKit备选方案）
         evaluated_samples = []
-        invalid_samples = []  # 单独收集无效样本
+        invalid_samples = []
         
         for i, sample in enumerate(samples):
-
-            # 提取原子、坐标和键信息
             atoms = sample['x1']['atoms']
             positions = sample['x1']['positions']
-            bonds = sample['x1'].get('bonds', None)  # 提取键信息
+            bonds = sample['x1'].get('bonds', None)
             
             if isinstance(atoms, np.ndarray):
                 atoms = atoms.flatten()
             
             if len(atoms) == 0:
-                print(f"  🔬 样本 {i+1}: 跳过（无原子）")
-                continue
-            
-            # 验证原子序数的有效性
-            valid_atoms = (atoms > 0) & (atoms <= 118)
-            num_valid = np.sum(valid_atoms)
-            num_invalid = len(atoms) - num_valid
-            
-            if num_invalid > 0:
-                if num_valid == 0:
-                    print(f"  🔬 样本 {i+1}: ✗ 所有 {len(atoms)} 个原子都无效")
-                    # 给无效分子赋予极低分数
-                    invalid_samples.append({
-                        'sample': sample,
-                        'conf_scores': {'is_valid': False},
-                        'atoms': atoms,
-                        'positions': positions,
-                        'bonds': bonds,
-                    })
-                    continue
-            
-            conf_scores = None
-            
-            # 尝试使用ConfEval评估（依赖xtb）
-            try:
-                conf_eval = ConfEval(atoms, positions, solvent='water', bonds=bonds)
-                
-                # 检查分子是否有效，无效则跳过
-                if not conf_eval.is_valid:
-                    print(f"  🔬 样本 {i+1}: ✗ 分子无效")
-                    # 给无效分子赋予极低分数
-                    invalid_samples.append({
-                        'sample': sample,
-                        'conf_scores': {'is_valid': False},
-                        'atoms': atoms,
-                        'positions': positions,
-                        'bonds': bonds,
-                    })
-                    continue
-                
-                # SurfOnly模式：只需确认分子有效，不提取SA/LogP详细指标
-                conf_scores = {'is_valid': True}
-                print(f"  🔬 样本 {i+1}: ✓ 分子有效")
-                
-                # 提取 SA Score 和 LogP（用于偏好对评分）
-                try:
-                    # 尝试从 ConfEval 获取
-                    if hasattr(conf_eval, 'sa_score') and conf_eval.sa_score is not None:
-                        conf_scores['sa_score'] = float(conf_eval.sa_score)
-                    if hasattr(conf_eval, 'logp') and conf_eval.logp is not None:
-                        conf_scores['logp'] = float(conf_eval.logp)
-                    
-                    # 如果 ConfEval 没有，用 RDKit 直接计算
-                    if 'sa_score' not in conf_scores or conf_scores['sa_score'] == 0:
-                        try:
-                            from rdkit.Chem import Descriptors
-                            from rdkit.Contrib.SA_Score import sascorer
-                            gen_mol = conf_eval.mol if hasattr(conf_eval, 'mol') else None
-                            if gen_mol is None:
-                                from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
-                                gen_mol, _, _ = get_mol_from_atom_pos(atoms, positions, bonds=bonds)
-                            if gen_mol is not None:
-                                conf_scores['sa_score'] = float(sascorer.calculateScore(gen_mol))
-                                conf_scores['logp'] = float(Descriptors.MolLogP(gen_mol))
-                        except Exception as sa_e:
-                            print(f"    ⚠️ SA/LogP 计算失败: {sa_e}")
-                    
-                    # 如果仍然没有值，给默认值
-                    conf_scores.setdefault('sa_score', 5.0)   # 中等难度
-                    conf_scores.setdefault('logp', 2.5)        # 中等亲脂性
-                    
-                    print(f"    📊 SA={conf_scores['sa_score']:.2f}, LogP={conf_scores['logp']:.2f}")
-                    
-                except Exception as prop_e:
-                    print(f"    ⚠️ 属性提取异常: {prop_e}")
-                    conf_scores['sa_score'] = 5.0
-                    conf_scores['logp'] = 2.5
-                
-            except Exception as e:
-                print(f"  🔬 样本 {i+1}: ✗ ConfEval失败 ({type(e).__name__}: {str(e)[:50]})")
+                print(f"  🔬 样本 {i+1}: ✗ 无原子")
                 invalid_samples.append({
                     'sample': sample,
                     'conf_scores': {'is_valid': False},
@@ -1180,322 +1291,391 @@ def evaluate_and_build_pairs(generated_samples, reference_mols, molblocks_and_ch
                 })
                 continue
             
-            if conf_scores is None:
+            valid_atoms = (atoms > 0) & (atoms <= 118)
+            num_valid_atoms = int(np.sum(valid_atoms))
+            num_invalid_atoms = len(atoms) - num_valid_atoms
+            if num_invalid_atoms > 0 and num_valid_atoms == 0:
+                print(f"  🔬 样本 {i+1}: ✗ 所有 {len(atoms)} 个原子都无效")
+                invalid_samples.append({
+                    'sample': sample,
+                    'conf_scores': {'is_valid': False},
+                    'atoms': atoms,
+                    'positions': positions,
+                    'bonds': bonds,
+                })
                 continue
-            
-            evaluated_samples.append({
-                'sample': sample,
-                'conf_scores': conf_scores,
-                'atoms': atoms,
-                'positions': positions,
-                'bonds': bonds,  # 添加键信息
-            })
-        
-        # 合并有效和无效样本，确保至少有一个有效样本作为winner
-        all_evaluated = evaluated_samples + invalid_samples
-        
-        if len(evaluated_samples) < 1:  # 至少需要一个有效样本作为winner
-            print(f"  ❌ 组 {source_idx} 偏好对构建失败: 无有效样本作为winner (有效:{len(evaluated_samples)}, 无效:{len(invalid_samples)})")
-            continue
-            
-        if len(all_evaluated) < 2:  # 总共需要至少2个样本构建偏好对
-            print(f"  ❌ 组 {source_idx} 偏好对构建失败: 总样本不足2个 ({len(all_evaluated)}/{len(samples)})")
-            continue
-        
-        # 2. 条件评估 (相似性评分) - 每个分子单独评估
-        print("  🔬 开始ConditionalEval评估...")
-        
-        # 检查是否有参考分子
-        # 注意：所有组都使用第一个参考分子（因为所有组都是对同一分子的采样）
-        ref_mol_idx = 0  # 始终使用第一个参考分子
-        if reference_mols is None or len(reference_mols) == 0:
-            print("  ⚠️  无参考分子，使用默认相似性分数")
-            for item in all_evaluated:
-                item['cond_scores'] = {
-                    'sims_surf_target': 0.0,
-                    'sims_esp_target': 0.0,
-                    'sims_pharm_target': 0.0,
-                }
-        else:
-            # 计算三个相似度：Surface、ESP、Pharmacophore
+
             try:
-                from shepherd_score.container import Molecule
-                from shepherd_score.score.gaussian_overlap_np import get_overlap_np
-                from shepherd_score.score.electrostatic_scoring_np import get_overlap_esp_np
-                from shepherd_score.score.pharmacophore_scoring_np import get_overlap_pharm_np
-                from shepherd_score.score.constants import ALPHA, LAM_SCALING
-                from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
-                from rdkit.Chem import AllChem
-                
-                ref_mol = reference_mols[ref_mol_idx]
-                
-                # 创建参考分子对象（包含 Surface、ESP 和 Pharmacophore 信息）
-                ref_molec = Molecule(
-                    ref_mol, 
-                    num_surf_points=400,
-                    probe_radius=1.2,
-                    partial_charges=None,  # 使用MMFF自动计算
-                    pharm_multi_vector=False
-                )
-                
-                print(f"    📊 参考分子属性: has_surf_esp={ref_molec.surf_esp is not None}, has_pharm_ancs={ref_molec.pharm_ancs is not None}")
-                
-                num_surf_points = 400
-                alpha = ALPHA(num_surf_points)
-                lam_scaled = 0.3 * LAM_SCALING
-                
-                for i, item in enumerate(all_evaluated):
-                    if item['conf_scores'].get('is_valid', True) == False:
-                        item['cond_scores'] = {
-                            'sims_surf_target': 0.0,
-                            'sims_esp_target': 0.0,
-                            'sims_pharm_target': 0.0,
-                        }
-                        continue
-                    
-                    try:
-                        atoms = item['atoms']
-                        positions = item['positions']
-                        bonds = item.get('bonds', None)
-                        
-                        gen_mol, charge, xyz_block = get_mol_from_atom_pos(atoms, positions, bonds=bonds)
-                        
-                        if gen_mol is None:
-                            item['cond_scores'] = {
-                                'sims_surf_target': 0.0,
-                                'sims_esp_target': 0.0,
-                                'sims_pharm_target': 0.0,
-                            }
-                            continue
-                        
-                        # 使用MMFF获取partial charges（用于ESP计算）
+                conf_eval = ConfEval(atoms, positions, solvent='water', bonds=bonds)
+                if not conf_eval.is_valid:
+                    print(f"  🔬 样本 {i+1}: ✗ 分子无效")
+                    invalid_samples.append({
+                        'sample': sample,
+                        'conf_scores': {'is_valid': False},
+                        'atoms': atoms,
+                        'positions': positions,
+                        'bonds': bonds,
+                    })
+                    continue
+
+                conf_scores = {'is_valid': True}
+                print(f"  🔬 样本 {i+1}: ✓ 分子有效")
+
+                try:
+                    if hasattr(conf_eval, 'sa_score') and conf_eval.sa_score is not None:
+                        conf_scores['sa_score'] = float(conf_eval.sa_score)
+                    if hasattr(conf_eval, 'logp') and conf_eval.logp is not None:
+                        conf_scores['logp'] = float(conf_eval.logp)
+
+                    if 'sa_score' not in conf_scores or conf_scores['sa_score'] == 0:
                         try:
-                            molec_props = AllChem.MMFFGetMoleculeProperties(gen_mol)
-                            if molec_props is not None:
-                                partial_charges = np.array([molec_props.GetMMFFPartialCharge(j) for j in range(gen_mol.GetNumAtoms())])
-                            else:
-                                partial_charges = None
-                        except:
-                            partial_charges = None
-                        
-                        gen_molec = Molecule(
-                            gen_mol,
-                            num_surf_points=num_surf_points,
-                            probe_radius=1.2,
-                            partial_charges=partial_charges,
-                            pharm_multi_vector=False
+                            from rdkit.Chem import Descriptors
+                            from rdkit.Contrib.SA_Score import sascorer
+                            from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
+
+                            rdkit_mol = conf_eval.mol if hasattr(conf_eval, 'mol') else None
+                            if rdkit_mol is None:
+                                rdkit_mol, _, _ = get_mol_from_atom_pos(atoms, positions, bonds=bonds)
+                            if rdkit_mol is not None:
+                                conf_scores['sa_score'] = float(sascorer.calculateScore(rdkit_mol))
+                                conf_scores['logp'] = float(Descriptors.MolLogP(rdkit_mol))
+                        except Exception as sa_exc:
+                            print(f"    ⚠️ SA/LogP 计算失败: {sa_exc}")
+
+                    conf_scores.setdefault('sa_score', 5.0)
+                    conf_scores.setdefault('logp', 2.5)
+                    print(f"    📊 SA={conf_scores['sa_score']:.2f}, LogP={conf_scores['logp']:.2f}")
+                except Exception as prop_exc:
+                    print(f"    ⚠️ 属性提取异常: {prop_exc}")
+                    conf_scores['sa_score'] = 5.0
+                    conf_scores['logp'] = 2.5
+
+                rdkit_mol = conf_eval.mol if hasattr(conf_eval, 'mol') else None
+                if rdkit_mol is None:
+                    try:
+                        from shepherd_score.evaluations.utils.convert_data import get_mol_from_atom_pos
+                        rdkit_mol, _, _ = get_mol_from_atom_pos(atoms, positions, bonds=bonds)
+                    except Exception:
+                        rdkit_mol = None
+                scoring_mol, sanitize_error = sanitize_scoring_molecule(rdkit_mol)
+                score_invalid = False
+                score_failure_reason = None
+                if scoring_mol is None:
+                    score_invalid = True
+                    score_failure_reason = sanitize_error or "sanitize_failed"
+                    print(f"    ⚠️ 分子可通过 ConfEval，但评分准备失败: {score_failure_reason}")
+
+                evaluated_samples.append({
+                    'sample': sample,
+                    'conf_scores': conf_scores,
+                    'atoms': atoms,
+                    'positions': positions,
+                    'bonds': bonds,
+                    'scoring_mol': scoring_mol,
+                    'cond_scores': None,
+                    'charge_method': None,
+                    'score_invalid': score_invalid,
+                    'score_failure_reason': score_failure_reason,
+                })
+                chemical_valid_count += 1
+            except Exception as exc:
+                print(f"  🔬 样本 {i+1}: ✗ ConfEval失败 ({type(exc).__name__}: {str(exc)[:80]})")
+                invalid_samples.append({
+                    'sample': sample,
+                    'conf_scores': {'is_valid': False},
+                    'atoms': atoms,
+                    'positions': positions,
+                    'bonds': bonds,
+                })
+
+        total_invalid_count += len(invalid_samples)
+
+        if len(evaluated_samples) < 1:
+            zero_winner_group_count += 1
+            print(
+                f"  ❌ 组 {source_idx} 偏好对构建失败: 无化学有效样本可作为 winner "
+                f"(有效:{len(evaluated_samples)}, 无效:{len(invalid_samples)})"
+            )
+            continue
+
+        print("  🔬 开始ConditionalEval评估...")
+        scoreable_molecules = []
+
+        if ref_molec is None:
+            for item in evaluated_samples:
+                item['score_invalid'] = True
+                item['score_failure_reason'] = item.get('score_failure_reason') or ref_eval_error
+                cond_eval_failed_count += 1
+            print(f"  ⚠️  跳过组 {source_idx} 条件评分: {ref_eval_error}")
+        else:
+            for i, item in enumerate(evaluated_samples):
+                if item.get('score_invalid'):
+                    cond_eval_failed_count += 1
+                    print(f"    ⚠️ 分子 {i+1} 评分准备失败: {item['score_failure_reason']}")
+                    continue
+
+                try:
+                    gen_mol = item.get('scoring_mol')
+                    if gen_mol is None:
+                        raise ValueError("missing_sanitized_molecule")
+
+                    partial_charges, charge_method = compute_partial_charges_with_fallback(gen_mol)
+                    if partial_charges is None:
+                        raise ValueError("partial_charge_unavailable")
+
+                    gen_molec = Molecule(
+                        gen_mol,
+                        num_surf_points=num_surf_points,
+                        probe_radius=1.2,
+                        partial_charges=partial_charges,
+                        pharm_multi_vector=False,
+                    )
+
+                    sims_surf_target = 0.0
+                    if gen_molec.surf_pos is not None and ref_molec.surf_pos is not None:
+                        sims_surf_target = float(get_overlap_np(gen_molec.surf_pos, ref_molec.surf_pos, alpha=alpha))
+
+                    sims_esp_target = 0.0
+                    if (
+                        gen_molec.surf_pos is not None
+                        and gen_molec.surf_esp is not None
+                        and ref_molec.surf_pos is not None
+                        and ref_molec.surf_esp is not None
+                    ):
+                        sims_esp_target = float(
+                            get_overlap_esp_np(
+                                gen_molec.surf_pos,
+                                ref_molec.surf_pos,
+                                gen_molec.surf_esp,
+                                ref_molec.surf_esp,
+                                alpha=alpha,
+                                lam=lam_scaled,
+                            )
                         )
-                        
-                        # 计算 Surface（shape）相似度
+
+                    sims_pharm_target = 0.0
+                    if (
+                        gen_molec.pharm_ancs is not None
+                        and ref_molec.pharm_ancs is not None
+                        and len(gen_molec.pharm_ancs) > 0
+                        and len(ref_molec.pharm_ancs) > 0
+                    ):
+                        sims_pharm_target = float(
+                            get_overlap_pharm_np(
+                                gen_molec.pharm_types,
+                                ref_molec.pharm_types,
+                                gen_molec.pharm_ancs,
+                                ref_molec.pharm_ancs,
+                                gen_molec.pharm_vecs,
+                                ref_molec.pharm_vecs,
+                                similarity='tanimoto',
+                                extended_points=False,
+                                only_extended=False,
+                            )
+                        )
+
+                    if np.isnan(sims_surf_target):
                         sims_surf_target = 0.0
-                        if (gen_molec.surf_pos is not None and ref_molec.surf_pos is not None):
-                            sims_surf_target = float(get_overlap_np(
-                                gen_molec.surf_pos, ref_molec.surf_pos, alpha=alpha
-                            ))
-                        
-                        # 计算 ESP 相似度
+                    if np.isnan(sims_esp_target):
                         sims_esp_target = 0.0
-                        if (gen_molec.surf_pos is not None and gen_molec.surf_esp is not None and
-                            ref_molec.surf_pos is not None and ref_molec.surf_esp is not None):
-                            sims_esp_target = float(get_overlap_esp_np(
-                                gen_molec.surf_pos, ref_molec.surf_pos,
-                                gen_molec.surf_esp, ref_molec.surf_esp,
-                                alpha=alpha, lam=lam_scaled
-                            ))
-                        
-                        # 计算药效团相似度
+                    if np.isnan(sims_pharm_target):
                         sims_pharm_target = 0.0
-                        if (gen_molec.pharm_ancs is not None and ref_molec.pharm_ancs is not None and
-                            len(gen_molec.pharm_ancs) > 0 and len(ref_molec.pharm_ancs) > 0):
-                            sims_pharm_target = float(get_overlap_pharm_np(
-                                gen_molec.pharm_types, ref_molec.pharm_types,
-                                gen_molec.pharm_ancs, ref_molec.pharm_ancs,
-                                gen_molec.pharm_vecs, ref_molec.pharm_vecs,
-                                similarity='tanimoto', extended_points=False, only_extended=False
-                            ))
-                        
-                        # 处理 NaN 值
-                        if np.isnan(sims_surf_target): sims_surf_target = 0.0
-                        if np.isnan(sims_esp_target): sims_esp_target = 0.0
-                        if np.isnan(sims_pharm_target): sims_pharm_target = 0.0
-                        
-                        item['cond_scores'] = {
-                            'sims_surf_target': sims_surf_target,
-                            'sims_esp_target': sims_esp_target,
-                            'sims_pharm_target': sims_pharm_target,
-                        }
-                        print(f"    ✓ 分子 {i+1}: Surf={sims_surf_target:.3f}, ESP={sims_esp_target:.3f}, Pharm={sims_pharm_target:.3f}")
-                        
-                    except Exception as e:
-                        print(f"    ⚠️ 分子 {i+1} 条件评估失败: {e}")
-                        item['cond_scores'] = {
-                            'sims_surf_target': 0.0,
-                            'sims_esp_target': 0.0,
-                            'sims_pharm_target': 0.0,
-                        }
-                
-                print(f"  ✓ 三维相似度评估完成 ({len(all_evaluated)} 个分子)")
-                
-            except Exception as e:
-                print(f"  ⚠️  评估初始化失败: {e}")
-                for item in all_evaluated:
+
                     item['cond_scores'] = {
-                        'sims_surf_target': 0.0,
-                        'sims_esp_target': 0.0,
-                        'sims_pharm_target': 0.0,
+                        'sims_surf_target': sims_surf_target,
+                        'sims_esp_target': sims_esp_target,
+                        'sims_pharm_target': sims_pharm_target,
                     }
-        
-        # 3. 计算综合分数: ESP、Pharmacophore、SA、logP 和 有效性
-        for item in all_evaluated:
+                    item['charge_method'] = charge_method
+                    item['score_invalid'] = False
+                    item['score_failure_reason'] = None
+                    cond_eval_success_count += 1
+                    scoreable_molecules.append(item)
+                    print(
+                        f"    ✓ 分子 {i+1}: Surf={sims_surf_target:.3f}, ESP={sims_esp_target:.3f}, "
+                        f"Pharm={sims_pharm_target:.3f}, charges={charge_method}"
+                    )
+                except Exception as exc:
+                    item['score_invalid'] = True
+                    item['score_failure_reason'] = f"{type(exc).__name__}:{str(exc)[:120]}"
+                    cond_eval_failed_count += 1
+                    print(f"    ⚠️ 分子 {i+1} 条件评估失败: {item['score_failure_reason']}")
+
+            print(f"  ✓ 三维相似度评估完成 ({len(scoreable_molecules)}/{len(evaluated_samples)} 个分子可评分)")
+
+        for item in scoreable_molecules:
             conf = item['conf_scores']
             cond = item['cond_scores']
-            
-            # 分子有效性作为最核心指标：无效分子得分为极低负数，而不是 -inf，给模型一点梯度（虽然排序会在最后）
-            if conf.get('is_valid', True) == False:
-                item['total_score'] = -100.0
-            else:
-                try:
-                    total_score = 0.0
 
-                    # === 3D 特征目标 ===
-                    # Surface形状（辅助）、ESP和药效团（主导）
-                    total_score += cond['sims_surf_target'] * 1.0     # Surface形状相似度
-                    total_score += cond['sims_esp_target'] * 3.0      # 静电势相似度
-                    total_score += cond['sims_pharm_target'] * 3.0    # 药效团相似度
+            try:
+                total_score = 0.0
+                total_score += cond['sims_surf_target'] * 1.0
+                total_score += cond['sims_esp_target'] * 3.0
+                total_score += cond['sims_pharm_target'] * 3.0
 
-                    # === 化学性质与成药性目标 ===
-                    # SA Score - 合成可及性 (1最易，10最难)。越容易合成得分越高
-                    sa_score = conf.get('sa_score', 10.0)
-                    sa_normalized = (sa_score - 1.0) / 9.0
-                    total_score -= sa_normalized * 1.5  # 增强SA惩罚权重，引导偏好更易合成的分子
-                    
-                    # 分子有效性加成
-                    total_score += 2.0  # 有效分子自带2.0的基础得分奖励
-                    
-                    if np.isnan(total_score) or np.isinf(total_score):
-                        total_score = -100.0
-                except Exception as e:
-                    total_score = -100.0
-                
+                sa_score = conf.get('sa_score', 10.0)
+                sa_normalized = (sa_score - 1.0) / 9.0
+                total_score -= sa_normalized * 1.5
+                total_score += 2.0
+
+                if np.isnan(total_score) or np.isinf(total_score):
+                    raise ValueError("non_finite_total_score")
                 item['total_score'] = total_score
-        
-        # 按综合分数排序
-        all_evaluated.sort(key=lambda x: x['total_score'], reverse=True)
-        
-        valid_molecules = [item for item in all_evaluated if item['conf_scores'].get('is_valid', True)]
-        
-        print(f"  📊 组 {source_idx} 三维相似度排名 (有效:{len(valid_molecules)}, 无效:{len(invalid_samples)})")
-        total_invalid_count += len(invalid_samples)
-        for rank, item in enumerate(valid_molecules[:5]):
+            except Exception as exc:
+                item['score_invalid'] = True
+                item['score_failure_reason'] = f"score_aggregation_failed:{type(exc).__name__}"
+                item['total_score'] = -100.0
+                cond_eval_success_count = max(0, cond_eval_success_count - 1)
+                cond_eval_failed_count += 1
+
+        scoreable_molecules = [item for item in scoreable_molecules if not item.get('score_invalid', False)]
+        scoreable_molecules.sort(key=lambda x: x['total_score'], reverse=True)
+        all_scoreable_molecules_for_avg.extend(scoreable_molecules)
+
+        unique_scoreable_molecules = []
+        seen_group_signatures = set()
+        for item in scoreable_molecules:
+            item['group_id'] = source_idx
+            item['sample_signature'] = build_sample_signature(item)
+            if item['sample_signature'] in seen_group_signatures:
+                continue
+            seen_group_signatures.add(item['sample_signature'])
+            unique_scoreable_molecules.append(item)
+
+        pairable_count += len(unique_scoreable_molecules)
+        print(
+            f"  📊 组 {source_idx} 排名概览: 化学有效={len(evaluated_samples)}, "
+            f"可评分={len(scoreable_molecules)}, 可配对(去重后)={len(unique_scoreable_molecules)}, 无效={len(invalid_samples)}"
+        )
+
+        if len(unique_scoreable_molecules) == 0:
+            zero_winner_group_count += 1
+            print(f"  ❌ 组 {source_idx} 无可评分 winner，跳过 pair 构建")
+            continue
+
+        for rank, item in enumerate(unique_scoreable_molecules[:5]):
             marker = "🥇" if rank == 0 else ("🥈" if rank == 1 else "  ")
             cond = item['cond_scores']
-            print(f"      {marker} #{rank+1}: Total={item['total_score']:.3f} "
-                  f"(Surf={cond['sims_surf_target']:.3f}, ESP={cond['sims_esp_target']:.3f}, Pharm={cond['sims_pharm_target']:.3f})")
-        if len(valid_molecules) > 5:
-            print(f"      ... 省略 {len(valid_molecules) - 5} 个有效样本")
-        
-        # 收集本组的有效分子用于后续跨组匹配
-        for item in valid_molecules:
-            item['group_id'] = source_idx
-        all_valid_molecules_across_groups.extend(valid_molecules)
-        
-        # 尝试在组内构建多个偏好对（top半 vs bottom半的所有满足gap的组合）
-        if len(valid_molecules) >= 2:
-            min_gap = params.get('dpo', {}).get('min_score_gap', 0.05)
-            mid = max(1, len(valid_molecules) // 2)
+            print(
+                f"      {marker} #{rank+1}: Total={item['total_score']:.3f} "
+                f"(Surf={cond['sims_surf_target']:.3f}, ESP={cond['sims_esp_target']:.3f}, Pharm={cond['sims_pharm_target']:.3f})"
+            )
+        if len(unique_scoreable_molecules) > 5:
+            print(f"      ... 省略 {len(unique_scoreable_molecules) - 5} 个可配对样本")
+
+        all_pairable_molecules_across_groups.extend(unique_scoreable_molecules)
+
+        if len(unique_scoreable_molecules) >= 2:
             group_pair_count = 0
+            max_winners = min(top_k_winners, len(unique_scoreable_molecules) - 1)
+            winners = unique_scoreable_molecules[:max_winners]
+            loser_pool = unique_scoreable_molecules[max_winners:]
+            if len(loser_pool) == 0:
+                loser_pool = unique_scoreable_molecules[1:]
+            loser_candidates = list(reversed(loser_pool))
 
-            for w_idx in range(mid):
-                for l_idx in range(mid, len(valid_molecules)):
-                    winner = valid_molecules[w_idx]
-                    loser = valid_molecules[l_idx]
-                    winner_score = winner['total_score']
-                    loser_score = loser['total_score']
-                    score_gap = winner_score - loser_score
-
-                    if score_gap >= min_gap:
-                        winner_mol = create_rdkit_molecule(winner['sample'])
-                        loser_mol = create_rdkit_molecule(loser['sample'])
-
-                        if winner_mol is not None and loser_mol is not None:
-                            pair = (
-                                winner_mol,
-                                loser_mol,
-                                {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner_score},
-                                {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser_score},
-                            )
-                            all_preference_pairs.append(pair)
-                            group_pair_count += 1
+            for winner in winners:
+                winner_pair_count = 0
+                used_loser_signatures = set()
+                for loser in loser_candidates:
+                    if loser is winner:
+                        continue
+                    loser_sig = loser['sample_signature']
+                    if loser_sig in used_loser_signatures:
+                        continue
+                    added, reason = add_preference_pair(winner, loser)
+                    if added:
+                        group_pair_count += 1
+                        winner_pair_count += 1
+                        used_loser_signatures.add(loser_sig)
+                        print(
+                            f"    ✅ 组内偏好对: winner={winner['total_score']:.3f}, "
+                            f"loser={loser['total_score']:.3f}, {reason}"
+                        )
+                    if winner_pair_count >= max_losers_per_winner:
+                        break
 
             if group_pair_count > 0:
                 groups_with_pairs.add(source_idx)
-                print(f"  ✅ 组 {source_idx} 构建了 {group_pair_count} 个偏好对 (top{mid} vs bottom{len(valid_molecules)-mid})")
+                print(
+                    f"  ✅ 组 {source_idx} 构建了 {group_pair_count} 个偏好对 "
+                    f"(top_k={max_winners}, losers_per_winner<={max_losers_per_winner})"
+                )
             else:
-                print(f"  ⚠️  组 {source_idx} 组内分差不足 (min_gap={min_gap})，等待跨组匹配")
+                print(f"  ⚠️  组 {source_idx} 未构建出组内偏好对 (min_gap={min_gap}, 去重/复用限制已生效)")
         else:
-            print(f"  ⚠️  组 {source_idx} 有效分子不足 ({len(valid_molecules)}<2)，等待跨组匹配")
+            print(f"  ⚠️  组 {source_idx} 可配对样本不足 ({len(unique_scoreable_molecules)}<2)，等待跨组匹配")
     
-    # === 跨组匹配：如果单组构建失败，从所有有效分子中构建偏好对 ===
-    if len(all_preference_pairs) < len(grouped_samples) and len(all_valid_molecules_across_groups) >= 2:
-        print(f"\n🔄 跨组匹配: 从 {len(all_valid_molecules_across_groups)} 个有效分子中补充偏好对")
-        
-        # 按分数排序所有有效分子
-        all_valid_molecules_across_groups.sort(key=lambda x: x['total_score'], reverse=True)
-        
-        min_gap = params.get('dpo', {}).get('min_score_gap', 0.3)
-        
-        # 构建跨组偏好对：最高分 vs 最低分
-        for i in range(min(3, len(all_valid_molecules_across_groups) - 1)):  # 最多补充3对
-            winner = all_valid_molecules_across_groups[i]
-            loser = all_valid_molecules_across_groups[-(i+1)]
-            
-            # 避免同一分子
-            if winner is loser:
-                continue
-            
-            winner_score = winner['total_score']
-            loser_score = loser['total_score']
-            score_gap = winner_score - loser_score
-            
-            if score_gap >= min_gap:
-                winner_mol = create_rdkit_molecule(winner['sample'])
-                loser_mol = create_rdkit_molecule(loser['sample'])
-                
-                if winner_mol is not None and loser_mol is not None:
-                    pair = (
-                        winner_mol,
-                        loser_mol,
-                        {**winner['conf_scores'], **winner['cond_scores'], 'total_score': winner_score},
-                        {**loser['conf_scores'], **loser['cond_scores'], 'total_score': loser_score},
+    if len(all_preference_pairs) < len(grouped_samples) and len(all_pairable_molecules_across_groups) >= 2:
+        print(f"\n🔄 跨组匹配: 从 {len(all_pairable_molecules_across_groups)} 个可配对分子中补充偏好对")
+
+        all_pairable_molecules_across_groups.sort(key=lambda x: x['total_score'], reverse=True)
+        cross_pair_count = 0
+        max_cross_pairs = 3
+        max_winners = min(top_k_winners, len(all_pairable_molecules_across_groups) - 1)
+        winners = all_pairable_molecules_across_groups[:max_winners]
+        loser_pool = all_pairable_molecules_across_groups[max_winners:]
+        if len(loser_pool) == 0:
+            loser_pool = all_pairable_molecules_across_groups[1:]
+        loser_candidates = list(reversed(loser_pool))
+
+        for winner in winners:
+            winner_pair_count = 0
+            for loser in loser_candidates:
+                if winner is loser:
+                    continue
+                if winner.get('group_id') == loser.get('group_id'):
+                    continue
+
+                added, reason = add_preference_pair(winner, loser)
+                if added:
+                    cross_pair_count += 1
+                    winner_pair_count += 1
+                    print(
+                        f"  ✅ 跨组偏好对: 组{winner.get('group_id', '?')}({winner['total_score']:.3f}) "
+                        f"vs 组{loser.get('group_id', '?')}({loser['total_score']:.3f}), {reason}"
                     )
-                    all_preference_pairs.append(pair)
-                    w_group = winner.get('group_id', '?')
-                    l_group = loser.get('group_id', '?')
-                    print(f"  ✅ 跨组偏好对: 组{w_group}(Winner={winner_score:.3f}) vs 组{l_group}(Loser={loser_score:.3f}), Gap={score_gap:.3f}")
+
+                if winner_pair_count >= max_losers_per_winner or cross_pair_count >= max_cross_pairs:
+                    break
+            if cross_pair_count >= max_cross_pairs:
+                break
     
-    # === 计算所有有效分子的综合平均分（用于 Best-past-policy Anchor） ===
-    if len(all_valid_molecules_across_groups) > 0:
-        valid_scores = [item['total_score'] for item in all_valid_molecules_across_groups
-                        if item['total_score'] > -100.0]  # 排除无效分子的极低惩罚分
+    if len(all_scoreable_molecules_for_avg) > 0:
+        valid_scores = [item['total_score'] for item in all_scoreable_molecules_for_avg if item['total_score'] > -100.0]
         avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else -float('inf')
     else:
         avg_score = -float('inf')
     
-    # 统计有效率
-    num_valid = len(all_valid_molecules_across_groups)
-    num_total = num_valid + total_invalid_count
+    num_valid = chemical_valid_count
+    num_total = chemical_valid_count + total_invalid_count
     validity_rate = num_valid / num_total if num_total > 0 else 0.0
+    scorable_rate = cond_eval_success_count / chemical_valid_count if chemical_valid_count > 0 else 0.0
 
     print(f"\n{'='*50}")
     print(f"✅ 偏好对构建汇总: {len(all_preference_pairs)} 对 (来自 {len(grouped_samples)} 组)")
     print(f"   📊 有效分子综合平均分: {avg_score:.4f}")
-    print(f"   📊 有效率: {num_valid}/{num_total} = {validity_rate:.1%}")
+    print(f"   📊 化学有效率: {num_valid}/{num_total} = {validity_rate:.1%}")
+    print(f"   📊 可评分率: {cond_eval_success_count}/{chemical_valid_count} = {scorable_rate:.1%}")
+    print(f"   📊 打分失败数: {cond_eval_failed_count}")
+    print(f"   📊 可配对分子数: {pairable_count}")
+    print(f"   📊 0-winner 组数: {zero_winner_group_count}")
     print(f"{'='*50}")
     
     validity_stats = {
         'num_valid': num_valid,
         'num_total': num_total,
         'validity_rate': validity_rate,
+        'chemical_valid_count': chemical_valid_count,
+        'chemical_invalid_count': total_invalid_count,
+        'chemical_valid_rate': validity_rate,
+        'cond_eval_success_count': cond_eval_success_count,
+        'cond_eval_failed_count': cond_eval_failed_count,
+        'score_failed_count': cond_eval_failed_count,
+        'scorable_rate': scorable_rate,
+        'num_scoreable': cond_eval_success_count,
+        'pairable_count': pairable_count,
+        'zero_winner_group_count': zero_winner_group_count,
     }
     return all_preference_pairs, avg_score, validity_stats
 
@@ -1697,32 +1877,155 @@ def main():
                      initial_best_score=-float('inf')):
             super().__init__()
             self.params = params
+            self.training_cfg = params.get('training', {})
             self.dataset = dataset
             self.dpo_dataset = dpo_dataset  # 直接引用DPO数据集
             self.molblocks_and_charges = molblocks_and_charges
             self.pairs_history = []  # 存储每轮的偏好对列表
-            self.max_rounds = 4  # 【修复】保留最近 4 轮（原来 2 轮太少）
+            self.max_rounds = 4  # 保留最近 4 轮健康偏好对
             self.epoch_counter = 0  # 用于追踪采样次数
             self.round_metrics = []  # 每轮指标记录
             self.metrics_file = os.path.join(output_dir, 'dpo_round_metrics.json')  # 指标保存路径
+            self.best_healthy_score = -float('inf')
+            self.best_healthy_epoch = None
+            self.best_healthy_ckpt_path = os.path.join(output_dir, 'best_healthy.ckpt')
+            self.unhealthy_round_streak = 0
+            self._last_validity_stats = None
             
             # ==================== Iterative DPO: Best-past-policy Anchor ====================
             self.best_score = initial_best_score  # 历史最高综合平均分
             self.best_score_epoch = -1             # 取得最高分的 epoch（-1 表示初始采样）
             self.ref_update_history = []           # 参考模型更新历史
-            self.iterative_dpo_enabled = params['training'].get('iterative_dpo_enabled', True)
-            self.score_threshold = params['training'].get('iterative_dpo_score_threshold', 0.0)
-            self.force_update_every_n_rounds = params['training'].get('iterative_dpo_force_update_every_n_rounds', 10)
+            self.iterative_dpo_enabled = self.training_cfg.get('iterative_dpo_enabled', True)
+            self.score_threshold = self.training_cfg.get('iterative_dpo_score_threshold', 0.0)
+            self.force_update_every_n_rounds = self.training_cfg.get('iterative_dpo_force_update_every_n_rounds', 10)
             self.rounds_since_last_update = 0  # 距离上次参考模型更新的轮数
+
+            # ==================== 稳定化控制 ====================
+            self.buffer_gate_min_validity_rate = float(self.training_cfg.get('buffer_gate_min_validity_rate', 0.40))
+            self.buffer_gate_min_pairs = int(self.training_cfg.get('buffer_gate_min_pairs', 50))
+            self.buffer_gate_require_zero_score_failures = bool(
+                self.training_cfg.get('buffer_gate_require_zero_score_failures', True)
+            )
+            self.protect_stop_validity_rate = float(self.training_cfg.get('protect_stop_validity_rate', 0.40))
+            self.protect_stop_patience_rounds = int(self.training_cfg.get('protect_stop_patience_rounds', 2))
+            self.protect_stop_min_pairs = int(self.training_cfg.get('protect_stop_min_pairs', 30))
+            self.protect_stop_on_zero_winner_group = bool(
+                self.training_cfg.get('protect_stop_on_zero_winner_group', True)
+            )
+            self.healthy_checkpoint_min_validity_rate = float(
+                self.training_cfg.get('healthy_checkpoint_min_validity_rate', 0.40)
+            )
+            self.healthy_checkpoint_require_zero_score_failures = bool(
+                self.training_cfg.get('healthy_checkpoint_require_zero_score_failures', True)
+            )
+
             print(f"\n🏗️  Iterative DPO 配置:")
             print(f"   启用: {self.iterative_dpo_enabled}")
             print(f"   初始 best_score: {self.best_score:.4f}")
             print(f"   最低提升阈值: {self.score_threshold}")
             print(f"   强制更新间隔: 每 {self.force_update_every_n_rounds} 轮")
+            print(f"\n🛡️  DPO 稳定化配置:")
+            print(
+                f"   Buffer gate: validity>={self.buffer_gate_min_validity_rate:.0%}, "
+                f"pairs>={self.buffer_gate_min_pairs}, score_failed=0->{self.buffer_gate_require_zero_score_failures}"
+            )
+            print(
+                f"   Protective stop: validity<{self.protect_stop_validity_rate:.0%} 连续 "
+                f"{self.protect_stop_patience_rounds} 轮 / pairs<{self.protect_stop_min_pairs} / "
+                f"zero_winner_group->{self.protect_stop_on_zero_winner_group}"
+            )
+            print(
+                f"   Healthy checkpoint: validity>={self.healthy_checkpoint_min_validity_rate:.0%}, "
+                f"score_failed=0->{self.healthy_checkpoint_require_zero_score_failures}"
+            )
+
+        def _is_healthy_round(self, validity_stats):
+            if validity_stats is None:
+                return False
+            if validity_stats.get('validity_rate', 0.0) < self.healthy_checkpoint_min_validity_rate:
+                return False
+            if (
+                self.healthy_checkpoint_require_zero_score_failures
+                and validity_stats.get('score_failed_count', 0) > 0
+            ):
+                return False
+            return True
+
+        def _evaluate_buffer_gate(self, pairs, validity_stats, sampling_error):
+            reasons = []
+            if sampling_error:
+                reasons.append(f"sampling_error={sampling_error}")
+            if validity_stats is None:
+                reasons.append("missing_validity_stats")
+            else:
+                if validity_stats.get('validity_rate', 0.0) < self.buffer_gate_min_validity_rate:
+                    reasons.append(
+                        f"validity_rate={validity_stats.get('validity_rate', 0.0):.1%}"
+                        f"<{self.buffer_gate_min_validity_rate:.1%}"
+                    )
+                if (
+                    self.buffer_gate_require_zero_score_failures
+                    and validity_stats.get('score_failed_count', 0) > 0
+                ):
+                    reasons.append(f"score_failed_count={validity_stats.get('score_failed_count', 0)}")
+            if len(pairs) < self.buffer_gate_min_pairs:
+                reasons.append(f"num_pairs={len(pairs)}<{self.buffer_gate_min_pairs}")
+            return len(reasons) == 0, "; ".join(reasons) if reasons else "passed"
+
+        def _maybe_save_healthy_checkpoint(self, trainer, avg_score, validity_stats, sampling_error):
+            if sampling_error is not None or avg_score is None or avg_score <= -float('inf'):
+                return False
+            if not self._is_healthy_round(validity_stats):
+                return False
+            if avg_score <= self.best_healthy_score:
+                return False
+
+            try:
+                trainer.save_checkpoint(self.best_healthy_ckpt_path)
+                self.best_healthy_score = avg_score
+                self.best_healthy_epoch = trainer.current_epoch
+                print(
+                    f"🏆 更新健康 checkpoint: epoch {trainer.current_epoch}, "
+                    f"avg_score={avg_score:.4f} -> {self.best_healthy_ckpt_path}"
+                )
+                return True
+            except Exception as exc:
+                print(f"⚠️  保存健康 checkpoint 失败: {exc}")
+                return False
+
+        def _update_unhealthy_streak(self, validity_stats, sampling_error):
+            if sampling_error is not None or validity_stats is None:
+                return
+            if validity_stats.get('validity_rate', 0.0) < self.protect_stop_validity_rate:
+                self.unhealthy_round_streak += 1
+            else:
+                self.unhealthy_round_streak = 0
+
+        def _protective_stop_reason(self, pairs, validity_stats, sampling_error):
+            if sampling_error is not None or validity_stats is None:
+                return None
+            if (
+                self.protect_stop_on_zero_winner_group
+                and validity_stats.get('zero_winner_group_count', 0) > 0
+            ):
+                return (
+                    f"zero_winner_group_count={validity_stats.get('zero_winner_group_count', 0)}"
+                )
+            if len(pairs) < self.protect_stop_min_pairs:
+                return f"num_pairs={len(pairs)}<{self.protect_stop_min_pairs}"
+            if self.unhealthy_round_streak >= self.protect_stop_patience_rounds:
+                return (
+                    f"validity_rate<{self.protect_stop_validity_rate:.1%} "
+                    f"连续 {self.unhealthy_round_streak} 轮"
+                )
+            return None
         
         def _collect_and_save_metrics(self, pairs, epoch, train_loss=None, extra_metrics=None,
                                       current_avg_score=None, ref_model_updated=None,
-                                      sampling_error=None):
+                                      sampling_error=None, buffer_gate_passed=None,
+                                      buffer_gate_reason=None, protective_stop_reason=None,
+                                      healthy_checkpoint_updated=None):
             """收集偏好对指标并保存到 JSON 文件
             
             Args:
@@ -1783,6 +2086,15 @@ def main():
                 'best_score': self.best_score if self.best_score > -float('inf') else None,
                 'ref_model_updated': ref_model_updated,
                 'best_score_epoch': self.best_score_epoch,
+                'best_healthy_score': self.best_healthy_score if self.best_healthy_score > -float('inf') else None,
+                'best_healthy_epoch': self.best_healthy_epoch,
+                'healthy_checkpoint_path': (
+                    self.best_healthy_ckpt_path if self.best_healthy_epoch is not None else None
+                ),
+                'healthy_checkpoint_updated': healthy_checkpoint_updated,
+                'buffer_gate_passed': buffer_gate_passed,
+                'buffer_gate_reason': buffer_gate_reason,
+                'protective_stop_reason': protective_stop_reason,
                 # 错误信息（如果有）
                 'sampling_error': sampling_error,
             }
@@ -1848,6 +2160,10 @@ def main():
                 avg_score = -float('inf')
                 ref_model_updated = False
                 sampling_error = None
+                buffer_gate_passed = None
+                buffer_gate_reason = None
+                protective_stop_reason = None
+                healthy_checkpoint_updated = False
                 
                 try:
                     num_samples = params.get('sampling', {}).get('num_samples_per_molecule', 4)
@@ -1862,7 +2178,12 @@ def main():
                         device=device
                     )
                     self._last_validity_stats = new_validity_stats
-                    print(f"✅ 采样完成: {len(new_pairs)} 个偏好对, 平均分: {avg_score:.4f}, 有效率: {new_validity_stats['validity_rate']:.1%}")
+                    print(
+                        f"✅ 采样完成: {len(new_pairs)} 个偏好对, 平均分: {avg_score:.4f}, "
+                        f"化学有效率: {new_validity_stats['validity_rate']:.1%}, "
+                        f"可评分率: {new_validity_stats.get('scorable_rate', 0.0):.1%}, "
+                        f"score_failed={new_validity_stats.get('score_failed_count', 0)}"
+                    )
                     
                 except Exception as e:
                     sampling_error = f"{type(e).__name__}: {str(e)}"
@@ -1870,9 +2191,21 @@ def main():
                     print(f"   错误: {sampling_error}")
                     traceback.print_exc()
                     print(f"   训练将继续，但本轮不更新偏好对和参考模型")
+
+                healthy_checkpoint_updated = self._maybe_save_healthy_checkpoint(
+                    trainer,
+                    avg_score if avg_score > -float('inf') else None,
+                    self._last_validity_stats,
+                    sampling_error,
+                )
                 
                 # ==================== Iterative DPO: Best-past-policy Anchor ====================
-                if self.iterative_dpo_enabled and len(new_pairs) > 0 and sampling_error is None:
+                if (
+                    self.iterative_dpo_enabled
+                    and len(new_pairs) > 0
+                    and sampling_error is None
+                    and self._is_healthy_round(self._last_validity_stats)
+                ):
                     self.rounds_since_last_update += 1
                     score_improvement = avg_score - self.best_score
                     force_update = (self.force_update_every_n_rounds > 0 and
@@ -1919,8 +2252,14 @@ def main():
                         if self.score_threshold > 0:
                             print(f"   最低提升阈值: {self.score_threshold}, 实际差值: {score_improvement:.4f}")
                 
-                # ========== 更新偏好对 ==========
-                if len(new_pairs) > 0:
+                # ========== 质量门控：只有健康轮次才写入 buffer ==========
+                buffer_gate_passed, buffer_gate_reason = self._evaluate_buffer_gate(
+                    new_pairs,
+                    self._last_validity_stats,
+                    sampling_error,
+                )
+
+                if buffer_gate_passed:
                     self.pairs_history.append(new_pairs)
                     
                     if len(self.pairs_history) > self.max_rounds:
@@ -1931,7 +2270,32 @@ def main():
                         all_pairs.extend(round_pairs)
                     
                     self.dpo_dataset.update_preference_pairs(all_pairs)
-                    print(f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 (保留{len(self.pairs_history)}轮, 将在下一epoch生效)")
+                    print(
+                        f"✅ 更新DPO数据集: {len(all_pairs)} 个偏好对 "
+                        f"(保留{len(self.pairs_history)}轮健康数据, 将在下一epoch生效)"
+                    )
+                else:
+                    print(f"🛑 本轮偏好对未写入 buffer: {buffer_gate_reason}")
+                    if len(self.pairs_history) > 0:
+                        current_pairs = sum(len(round_pairs) for round_pairs in self.pairs_history)
+                        print(f"   保留已有健康 buffer: {len(self.pairs_history)} 轮 / {current_pairs} 对")
+                    else:
+                        print(f"   保留现有 DPO 数据集不变: {len(self.dpo_dataset.preference_pairs)} 对")
+
+                # ========== 保护性停训 ==========
+                self._update_unhealthy_streak(self._last_validity_stats, sampling_error)
+                protective_stop_reason = self._protective_stop_reason(
+                    new_pairs,
+                    self._last_validity_stats,
+                    sampling_error,
+                )
+                if protective_stop_reason is not None:
+                    print(f"🛑 触发保护性停训: {protective_stop_reason}")
+                    if self.best_healthy_epoch is not None:
+                        print(
+                            f"   最近最佳健康 checkpoint: epoch {self.best_healthy_epoch} -> "
+                            f"{self.best_healthy_ckpt_path}"
+                        )
                 
                 # ========== 【关键修复】无论成功/失败/空结果，都保存指标 ==========
                 print(f"  📊 保存指标: train_loss={train_loss}, avg_score={avg_score:.4f}, pairs={len(new_pairs)}")
@@ -1940,7 +2304,13 @@ def main():
                     current_avg_score=avg_score if avg_score > -float('inf') else None,
                     ref_model_updated=ref_model_updated,
                     sampling_error=sampling_error,
+                    buffer_gate_passed=buffer_gate_passed,
+                    buffer_gate_reason=buffer_gate_reason,
+                    protective_stop_reason=protective_stop_reason,
+                    healthy_checkpoint_updated=healthy_checkpoint_updated,
                 )
+                if protective_stop_reason is not None:
+                    trainer.should_stop = True
 
     # 首次采样的 avg_score 作为 best_score 初始值
     _initial_best_score = getattr(main, '_initial_avg_score', None)  # 占位，下面立刻赋值
@@ -2128,4 +2498,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

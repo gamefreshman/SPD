@@ -955,6 +955,19 @@ def inference_sample(
     # ============================================================================
     # 时间步一致性验证
     # ============================================================================
+
+    if inpaint_x2_pos or inpaint_x3_pos or inpaint_x3_x:
+        requested_flags = []
+        if inpaint_x2_pos:
+            requested_flags.append('inpaint_x2_pos')
+        if inpaint_x3_pos:
+            requested_flags.append('inpaint_x3_pos')
+        if inpaint_x3_x:
+            requested_flags.append('inpaint_x3_x')
+        print(
+            "⚠️ [inference_sample] 当前 SPD 语义下 x2/x3 始终是固定条件，"
+            f"{', '.join(requested_flags)} 只会保留为兼容参数，不会改变 x2/x3 的固定条件角色。"
+        )
     
     if start_timestep is None:
         assert x1_t == x2_t  # 确保X1和X2模态时间步一致

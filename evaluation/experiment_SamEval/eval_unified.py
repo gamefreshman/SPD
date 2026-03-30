@@ -17,6 +17,7 @@
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = "0,1,2"
 
+import hashlib
 import json
 import glob
 import pickle
@@ -161,6 +162,97 @@ def _get_script_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def get_sidecar_path(sample_json_path):
+    return f"{sample_json_path}.meta.json"
+
+
+def compute_file_fingerprint(file_path):
+    stat = os.stat(file_path)
+    hasher = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            hasher.update(chunk)
+    return {
+        'size': stat.st_size,
+        'mtime': int(stat.st_mtime),
+        'sha256': hasher.hexdigest(),
+    }
+
+
+def load_sidecar_metadata(sample_json_path):
+    sidecar_path = get_sidecar_path(sample_json_path)
+    if not os.path.exists(sidecar_path):
+        return None
+    try:
+        with open(sidecar_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ 无法加载 sidecar metadata {sidecar_path}: {e}")
+        return None
+
+
+def summarize_sidecar_metadata(sidecar_data):
+    if not sidecar_data:
+        return None
+    return {
+        'condition_semantics': sidecar_data.get('condition_semantics'),
+        'checkpoint_path': sidecar_data.get('checkpoint_path'),
+        'source_script': sidecar_data.get('source_script'),
+        'sampling_flags': sidecar_data.get('sampling_flags'),
+        'condition_source_file': sidecar_data.get('condition_source_file'),
+    }
+
+
+def collect_model_source_infos(model_files):
+    model_source_infos = {}
+    for model_name, file_path in model_files.items():
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"{model_name} 样本文件不存在: {file_path}")
+
+        sidecar_path = get_sidecar_path(file_path)
+        model_source_infos[model_name] = {
+            'path': file_path,
+            'sample_fingerprint': compute_file_fingerprint(file_path),
+            'sidecar_path': sidecar_path if os.path.exists(sidecar_path) else None,
+            'sidecar_fingerprint': compute_file_fingerprint(sidecar_path) if os.path.exists(sidecar_path) else None,
+            'sidecar_summary': summarize_sidecar_metadata(load_sidecar_metadata(file_path)),
+        }
+    return model_source_infos
+
+
+def validate_condition_semantics(model_source_infos):
+    semantics = {}
+    missing_sidecars = []
+
+    for model_name, info in model_source_infos.items():
+        sidecar_summary = info.get('sidecar_summary')
+        if not sidecar_summary:
+            missing_sidecars.append(model_name)
+            continue
+        semantics[model_name] = sidecar_summary.get('condition_semantics')
+
+    if missing_sidecars:
+        print(
+            "⚠️ 以下模型缺少 sidecar metadata，eval_unified 无法验证它们的采样语义: "
+            + ", ".join(missing_sidecars)
+        )
+
+    non_empty_semantics = {
+        model_name: value for model_name, value in semantics.items() if value
+    }
+    unique_semantics = set(non_empty_semantics.values())
+
+    if len(unique_semantics) > 1:
+        details = ", ".join(
+            f"{model_name}={value}" for model_name, value in sorted(non_empty_semantics.items())
+        )
+        raise RuntimeError(f"模型采样语义不一致，停止横向对比: {details}")
+
+    if len(unique_semantics) == 1:
+        current_semantics = next(iter(unique_semantics))
+        print(f"✅ 模型 sidecar 条件语义一致: {current_semantics}")
+
+
 def load_cache(cache_filename):
     """加载缓存文件，返回数据字典或 None"""
     cache_path = os.path.join(_get_script_dir(), cache_filename)
@@ -205,27 +297,33 @@ def save_cache(cache_filename, data):
     print(f"💾 缓存已保存: {cache_path}")
 
 
-def detect_models_needing_eval(model_files, cached_data):
+def detect_models_needing_eval(model_source_infos, cached_data):
     """
-    对比当前 MODEL_FILES 与缓存中的文件路径，
+    对比当前样本文件的 fingerprint / sidecar metadata 与缓存记录，
     返回需要重新评估的模型集合。
     """
     if cached_data is None:
-        return set(model_files.keys())
+        return set(model_source_infos.keys())
 
-    cached_model_files = cached_data.get('metadata', {}).get('model_files', {})
+    cached_model_sources = cached_data.get('metadata', {}).get('model_sources', {})
 
     models_to_eval = set()
-    for model_name, file_path in model_files.items():
-        cached_path = cached_model_files.get(model_name)
-        if cached_path != file_path:
+    for model_name, source_info in model_source_infos.items():
+        current_signature = {
+            'path': source_info['path'],
+            'sample_fingerprint': source_info['sample_fingerprint'],
+            'sidecar_fingerprint': source_info['sidecar_fingerprint'],
+            'sidecar_summary': source_info['sidecar_summary'],
+        }
+        cached_signature = cached_model_sources.get(model_name)
+        if cached_signature != current_signature:
             models_to_eval.add(model_name)
-            if cached_path is not None:
-                print(f"  🔄 {model_name}: 路径已变化，需要重新评估")
+            if cached_signature is not None:
+                print(f"  🔄 {model_name}: 样本内容或语义元数据已变化，需要重新评估")
             else:
                 print(f"  🆕 {model_name}: 新增模型，需要评估")
         else:
-            print(f"  ✅ {model_name}: 路径未变化，将复用缓存")
+            print(f"  ✅ {model_name}: fingerprint 与 sidecar 元数据未变化，将复用缓存")
 
     return models_to_eval
 
@@ -559,6 +657,10 @@ def main():
 
     print("\n🔍 检测缓存...")
 
+    print("\n📂 收集模型样本来源...")
+    model_source_infos = collect_model_source_infos(MODEL_FILES)
+    validate_condition_semantics(model_source_infos)
+
     # 分别加载 conf 和 cond 缓存
     conf_cache = load_cache(CONF_CACHE_FILE)
     cond_cache = load_cache(COND_CACHE_FILE)
@@ -575,11 +677,11 @@ def main():
 
     # 确定哪些模型的 ConfEval 需要重新评估
     print("\n📋 检查 ConfEval 缓存...")
-    models_needing_conf = detect_models_needing_eval(MODEL_FILES, conf_cache)
+    models_needing_conf = detect_models_needing_eval(model_source_infos, conf_cache)
 
     # 确定哪些模型的 CondEval 需要重新评估
     print("\n📋 检查 CondEval 缓存...")
-    models_needing_cond = detect_models_needing_eval(MODEL_FILES, cond_cache)
+    models_needing_cond = detect_models_needing_eval(model_source_infos, cond_cache)
 
     # 如果 conf 需要重跑，cond 也必须重跑（conf 是前置依赖）
     for model_name in models_needing_conf:
@@ -704,6 +806,7 @@ def main():
             'metadata': {
                 'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
                 'model_files': MODEL_FILES,
+                'model_sources': model_source_infos,
             },
             'per_sample_results': all_conf_results,
         }
@@ -829,6 +932,7 @@ def main():
             'metadata': {
                 'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
                 'model_files': MODEL_FILES,
+                'model_sources': model_source_infos,
             },
             'cond_group_results': {
                 model_name: {
