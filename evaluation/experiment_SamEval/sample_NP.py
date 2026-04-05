@@ -282,8 +282,7 @@ def load_samples_from_incremental(molecule_index, n_atoms):
 
 # ==================== GPU Worker 函数（多进程模式） ====================
 def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable, 
-                        params_dict, batch_size, atom_marginals_list, bond_marginals_list,
-                        pharm_marginals_list=None):
+                        params_dict, batch_size, atom_marginals_list, bond_marginals_list):
     """
     在指定GPU上运行采样任务（多进程 worker）
     
@@ -296,7 +295,6 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable
         batch_size: 批次大小
         atom_marginals_list: 原子边际分布 (list)
         bond_marginals_list: 键边际分布 (list)
-        pharm_marginals_list: 药效团边际分布 (list, optional)
     
     Returns:
         dict: {n_atoms: [samples]}
@@ -325,7 +323,6 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable
     # 转换边际分布为 tensor
     atom_marginals = torch.tensor(atom_marginals_list, dtype=torch.float).to(device)
     bond_marginals = torch.tensor(bond_marginals_list, dtype=torch.float).to(device)
-    pharm_marginals = torch.tensor(pharm_marginals_list, dtype=torch.float).to(device) if pharm_marginals_list is not None else None
     
     # 恢复分子特征
     mol_features = {
@@ -389,7 +386,6 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable
                     pharm_direction=mol_features['pharm_direction'],
                     atom_marginals=atom_marginals,
                     bond_marginals=bond_marginals,
-                    pharm_marginals=pharm_marginals,
                 )
             
             # 转换样本为可序列化格式
@@ -579,7 +575,6 @@ if __name__ == '__main__':
     # 转换边际分布为 list（用于跨进程传输）
     atom_marginals_list = atom_marginals_x1.tolist()
     bond_marginals_list = bond_marginals_x1.tolist()
-    pharm_marginals_list = pharm_marginals_x4.tolist()
     
     print(f"  📋 采样配置:")
     print(f"    - 原子数量列表: {N_ATOMS_LIST} (共{len(N_ATOMS_LIST)}种)")
@@ -648,8 +643,7 @@ if __name__ == '__main__':
                         future = executor.submit(
                             run_sampling_on_gpu,
                             gpu_id, task_list, mol_index, mol_features_serializable,
-                            params, BATCH_SIZE, atom_marginals_list, bond_marginals_list,
-                            pharm_marginals_list
+                            params, BATCH_SIZE, atom_marginals_list, bond_marginals_list
                         )
                         futures.append(future)
                 

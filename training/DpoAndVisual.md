@@ -636,6 +636,36 @@ Round 10-15:              收尾期 — 如果 5 轮无提升，停止当前实�
 
 > 按时间倒序排列，最新记录在最前面。新增记录请复制 [6.3 日志条目模板](#63-日志条目模板) 并填写。
 
+### ⚠️ [踩坑记录] 2026-04-05 sample_NP.py 传入 pharm_marginals 导致采样崩溃 `[Bug]` `[采样]`
+
+- **状态**: **已回滚**
+- **涉及文件**: `evaluation/experiment_SamEval/sample_NP.py`, `src/shepherd/inference.py`
+- **影响**: DPO epoch-089 有效样本从 **1519 → 44**（-97%），3D 相似度全面下降
+
+#### 问题描述
+
+`sample_NP.py` 计算了 `pharm_marginals_x4` 但未传入 `inference_sample`，看起来像是遗漏 bug。尝试修复后发现导致采样严重崩溃。
+
+#### 根因分析
+
+**x4 作为条件（`inpaint_x4_type=True`）时，不能传入 `pharm_marginals`。** 原因如下：
+
+1. x4 的 **inpainting 前向轨迹**（`inference.py:658 x4_x_inpainting_trajectory`）使用 `forward_trajectory()` 产生**连续高斯噪声值**
+2. 传入 `pharm_marginals` 后，**初始化**（`inference.py:874`）从连续高斯变为离散 one-hot 采样
+3. **去噪步骤**（`inference.py:1592-1627`）从连续 DDPM 变为离散后验采样（转移矩阵 + multinomial），输出 one-hot 向量
+4. 每步 inpainting 又用连续前向轨迹值覆盖 → x4 type 在 **连续值 ↔ 离散 one-hot** 之间反复切换
+5. 模型接收到不一致的条件输入，生成质量严重下降
+
+#### 结论与规则
+
+> **规则：x4 作为条件模态时，`pharm_marginals` 必须为 `None`。**
+> 
+> 离散后验采样（`DiscreteFeatureDiffusion`）仅适用于**被生成的模态**（如 x1 的原子类型、键类型），不适用于通过 inpainting 前向轨迹提供的**条件模态**（x4）。因为 inpainting 轨迹基于连续高斯 `forward_trajectory()`，与离散转移矩阵不兼容。
+>
+> `DPO1_0_triSim.py` 中虽然传了 `pharm_marginals`，需确认实际运行时 `dataset.x4_pharm_diffuser` 是否为 `None`。若不为 `None`，DPO 训练中的在线采样也可能受此影响。
+
+---
+
 ### [v2.0] 2026-03-28 Partial Denoising DPO `[架构]` `[采样策略]`
 
 - **状态**: **已实现，待运行**
