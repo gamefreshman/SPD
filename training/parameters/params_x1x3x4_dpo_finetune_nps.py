@@ -67,19 +67,19 @@ params = {
         
         # DPO核心参数
         'beta_dpo': 0.3,  # 提高KL约束，减缓模型偏离速度，优先保住生成分布
-        'dpo_ramp_up_epochs': 10,  # 慢速提升DPO权重，先稳定基础去噪 (3→10)
-        'dpo_max_weight': 0.15,  # 进一步降低DPO权重，优先保留基础去噪能力
+        'dpo_ramp_up_epochs': 30,  # 更缓慢引入DPO信号，前30epoch专注去噪能力维护 (10→30)
+        'dpo_max_weight': 0.05,  # 大幅降低DPO权重，95%给标准去噪保护有效率 (0.15→0.05)
         'dpo_optimize_x4': False,  # x4 始终作为带噪条件，DPO 微调目标仅优化 x1
         
         # 数据混合策略（防止灾难性遗忘）
-        'real_data_ratio': 0.7,  # 70%真实分子数据 + 30%DPO偏好对，强化基础分布约束
+        'real_data_ratio': 0.85,  # 85%真实分子数据 + 15%DPO偏好对，极大强化去噪能力保护 (0.7→0.85)
 
         # 采样策略（针对小数据集调整）
         'dpo_sampling_ratio': 1.0,  # 每个epoch对所有3个分子采样（100%）
         'dpo_batch_ratio': 1,  # DPO batch占总batch的50%
         
         # 偏好对构建
-        'dpo_min_score_gap': 0.15,  # 提高阈值，只保留区分度更大的偏好对 (0.1→0.15)，减少噪声对
+        'dpo_min_score_gap': 0.10,  # 降低阈值以保证低有效率时仍能构建偏好对 (0.15→0.10)
         'dpo_keep_old_ratio': 0.3,  # 减少旧对比例，优先用新鲜偏好对 (0.5→0.3)
         'dpo_top_k_winners': 2,  # 组内只保留少量最优 winner，避免笛卡尔积放大极端样本
         'dpo_max_losers_per_winner': 2,  # 每个 winner 只配少量 loser
@@ -119,7 +119,7 @@ params = {
     # ==================== DPO采样配置 ====================
     'sampling': {
         'timesteps': 400,  # 采样步数（与训练T一致）
-        'num_samples_per_molecule': 16,  # 增加采样数 (8→16)，产生更多偏好对，提升信号稳定性
+        'num_samples_per_molecule': 32,  # 翻倍采样数以获取更多有效偏好对 (16→32)
         'fixed_n_atoms': 70,  # 固定生成的原子数（与预训练模型一致）
         'inference_sub_batch_size': 4,  # 采样子批次大小，避免 radius_graph OOM（16个样本分4批×4个）
     },
@@ -127,7 +127,7 @@ params = {
     # ==================== DPO评分权重 ====================
     'dpo': {
         'sampling_ratio': 1.0,
-        'min_score_gap': 0.15,  # 与training.dpo_min_score_gap保持一致
+        'min_score_gap': 0.10,  # 与training.dpo_min_score_gap保持一致 (0.15→0.10)
     },
     
     

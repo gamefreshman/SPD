@@ -137,7 +137,7 @@ def load_and_group_nested_format(data):
 
 # ========== 定义文件路径 ==========
 MODEL_FILES = {
-    'DPO': '/home1/zhh/workspace/SPD/evaluation/core_data/data/1/dpo/generated_samples_all_molecules_epoch-epoch=009.ckpt.json',
+    'DPO': '/home1/zhh/workspace/SPD/evaluation/core_data/data/1/dpo/dpo600_epoch089_20260404_1324_sync2/generated_samples_all_molecules_epoch-epoch=089.ckpt.json',
     'Origin_Shepherd': '/home1/zhh/workspace/SPD/evaluation/core_data/data/1/origin/generated_samples_all_molecules.json',
     'SPD': '/home1/zhh/workspace/SPD/evaluation/core_data/data/1/DIS/33/generated_samples_all_molecules_last_33epoch.ckpt.json',
 }
@@ -297,6 +297,18 @@ def save_cache(cache_filename, data):
     print(f"💾 缓存已保存: {cache_path}")
 
 
+def normalize_source_signature(signature):
+    """只比较缓存判定真正依赖的字段，避免字典结构差异导致误判。"""
+    signature = signature or {}
+    return {
+        'path': signature.get('path'),
+        'sample_fingerprint': signature.get('sample_fingerprint'),
+        'sidecar_path': signature.get('sidecar_path'),
+        'sidecar_fingerprint': signature.get('sidecar_fingerprint'),
+        'sidecar_summary': signature.get('sidecar_summary'),
+    }
+
+
 def detect_models_needing_eval(model_source_infos, cached_data):
     """
     对比当前样本文件的 fingerprint / sidecar metadata 与缓存记录，
@@ -309,16 +321,17 @@ def detect_models_needing_eval(model_source_infos, cached_data):
 
     models_to_eval = set()
     for model_name, source_info in model_source_infos.items():
-        current_signature = {
+        current_signature = normalize_source_signature({
             'path': source_info['path'],
             'sample_fingerprint': source_info['sample_fingerprint'],
+            'sidecar_path': source_info.get('sidecar_path'),
             'sidecar_fingerprint': source_info['sidecar_fingerprint'],
             'sidecar_summary': source_info['sidecar_summary'],
-        }
-        cached_signature = cached_model_sources.get(model_name)
+        })
+        cached_signature = normalize_source_signature(cached_model_sources.get(model_name))
         if cached_signature != current_signature:
             models_to_eval.add(model_name)
-            if cached_signature is not None:
+            if cached_model_sources.get(model_name) is not None:
                 print(f"  🔄 {model_name}: 样本内容或语义元数据已变化，需要重新评估")
             else:
                 print(f"  🆕 {model_name}: 新增模型，需要评估")

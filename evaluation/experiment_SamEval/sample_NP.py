@@ -44,7 +44,8 @@ else:
 BATCH_SIZE = 2
 
 # 模型 checkpoint 路径
-chkpt = '/home1/zhh/workspace/SPD/training/jobs/33/x1x3x4_dpo_finetune_nps/last.ckpt'
+# chkpt = '/home1/zhh/workspace/SPD/training/jobs/33/x1x3x4_dpo_finetune_nps/last.ckpt'
+chkpt = '/home1/zhh/workspace/SPD/training/jobs/33/x1x3x4_dpo_finetune_nps/epoch-epoch=009.ckpt'
 CONDITION_SOURCE_FILE = '/home1/zhh/workspace/SPD/data/conformers/np/molblock_charges_NPs.pkl'
 CONDITION_SEMANTICS = 'x2_x3_fixed__x4_noised_condition__optimize_x1'
 CONDITION_FLAG_SUMMARY = {
@@ -239,7 +240,7 @@ def preprocess_molecule(args):
 N_ATOMS_LIST = [36, 40, 44, 48, 49, 50, 51, 52, 56, 60, 
                 64, 68, 70, 72, 76, 77, 78, 79, 80, 81, 
                 83, 84, 85, 86, 87]
-SAMPLES_PER_N_ATOMS = 10  # 每个原子数量生成的分子数
+SAMPLES_PER_N_ATOMS = 60  # 每个原子数量生成的分子数 (25×60=1500/mol, 3mol×1500=4500 total)
 
 
 # ==================== 断点续传函数 ====================
@@ -281,7 +282,8 @@ def load_samples_from_incremental(molecule_index, n_atoms):
 
 # ==================== GPU Worker 函数（多进程模式） ====================
 def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable, 
-                        params_dict, batch_size, atom_marginals_list, bond_marginals_list):
+                        params_dict, batch_size, atom_marginals_list, bond_marginals_list,
+                        pharm_marginals_list=None):
     """
     在指定GPU上运行采样任务（多进程 worker）
     
@@ -294,6 +296,7 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable
         batch_size: 批次大小
         atom_marginals_list: 原子边际分布 (list)
         bond_marginals_list: 键边际分布 (list)
+        pharm_marginals_list: 药效团边际分布 (list, optional)
     
     Returns:
         dict: {n_atoms: [samples]}
@@ -322,6 +325,7 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable
     # 转换边际分布为 tensor
     atom_marginals = torch.tensor(atom_marginals_list, dtype=torch.float).to(device)
     bond_marginals = torch.tensor(bond_marginals_list, dtype=torch.float).to(device)
+    pharm_marginals = torch.tensor(pharm_marginals_list, dtype=torch.float).to(device) if pharm_marginals_list is not None else None
     
     # 恢复分子特征
     mol_features = {
@@ -385,6 +389,7 @@ def run_sampling_on_gpu(gpu_id, tasks, molecule_index, mol_features_serializable
                     pharm_direction=mol_features['pharm_direction'],
                     atom_marginals=atom_marginals,
                     bond_marginals=bond_marginals,
+                    pharm_marginals=pharm_marginals,
                 )
             
             # 转换样本为可序列化格式
@@ -574,6 +579,7 @@ if __name__ == '__main__':
     # 转换边际分布为 list（用于跨进程传输）
     atom_marginals_list = atom_marginals_x1.tolist()
     bond_marginals_list = bond_marginals_x1.tolist()
+    pharm_marginals_list = pharm_marginals_x4.tolist()
     
     print(f"  📋 采样配置:")
     print(f"    - 原子数量列表: {N_ATOMS_LIST} (共{len(N_ATOMS_LIST)}种)")
@@ -642,7 +648,8 @@ if __name__ == '__main__':
                         future = executor.submit(
                             run_sampling_on_gpu,
                             gpu_id, task_list, mol_index, mol_features_serializable,
-                            params, BATCH_SIZE, atom_marginals_list, bond_marginals_list
+                            params, BATCH_SIZE, atom_marginals_list, bond_marginals_list,
+                            pharm_marginals_list
                         )
                         futures.append(future)
                 
