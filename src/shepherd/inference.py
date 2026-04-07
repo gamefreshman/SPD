@@ -295,6 +295,52 @@ def forward_jump(x, t_start, jump, sigma_ts, remove_COM_from_noise = False, batc
     
     return x_jump, t_end
 
+def discrete_forward_jump(x_t, t_start, jump, marginals, max_T=400, mask=None):
+    """
+    执行离散特征的前向跳跃操作。使用离散扩散的转移矩阵累积计算跳跃后的类别状态。
+    """
+    from shepherd.new_datasets import PredefinedNoiseScheduleDiscrete
+    
+    t_end = t_start + jump
+    if t_end > max_T:
+        t_end = max_T
+        
+    noise_schedule = PredefinedNoiseScheduleDiscrete(timesteps=max_T)
+    # 计算起点和终点的累积转移系数
+    alpha_bar_start = noise_schedule.get_alpha_bar(torch.tensor(t_start / max_T))
+    alpha_bar_end = noise_schedule.get_alpha_bar(torch.tensor(t_end / max_T))
+    
+    # 两个阶段的差异表示中间这一段跳跃所保留的原始真实信息比例
+    alpha_jump = alpha_bar_end / alpha_bar_start
+    
+    marginals = marginals.float().to(x_t.device)
+    K = marginals.size(0)
+    
+    U = marginals.unsqueeze(0).expand(K, -1)
+    I = torch.eye(K, device=x_t.device)
+    
+    # 构建这段跳跃时间内的转移矩阵
+    Q_jump = alpha_jump * I + (1.0 - alpha_jump) * U
+    
+    # 计算跳跃后的概率分布并使用防御性处理防止 NaN
+    prob_t_end = torch.matmul(x_t, Q_jump)
+    prob_t_end = torch.clamp(prob_t_end, min=0)
+    row_sums = prob_t_end.sum(dim=-1, keepdim=True)
+    uniform_fallback = torch.ones_like(prob_t_end) / K
+    prob_t_end = torch.where(row_sums > 1e-6, prob_t_end / row_sums, uniform_fallback)
+    
+    # 对展平的分布进行采样
+    prob_t_end_flat = prob_t_end.view(-1, K)
+    sampled_indices = torch.multinomial(prob_t_end_flat, num_samples=1).squeeze(-1)
+    
+    x_t_end = F.one_hot(sampled_indices, num_classes=K).float()
+    x_jump = x_t_end.view(x_t.shape)
+    
+    if mask is not None:
+        x_jump[~mask] = x_t[~mask]
+        
+    return x_jump, t_end
+
 def forward_trajectory(x, ts, alpha_ts, sigma_ts, remove_COM_from_noise = False, mask = None, deterministic = False):
     """
     模拟前向噪声轨迹，生成扩散过程中每个时间步的状态。
@@ -1052,13 +1098,16 @@ def inference_sample(
             
             # X1模态协调跳跃（分子）
             x1_pos_t, x1_t_jump = forward_jump(x1_pos_t, x1_t, harmonize_jump, x1_sigma_ts, remove_COM_from_noise = True, batch = x1_batch, mask = ~virtual_node_mask_x1)
-            x1_x_t, x1_t_jump = forward_jump(x1_x_t, x1_t, harmonize_jump, x1_sigma_ts, remove_COM_from_noise = False, batch = x1_batch, mask = ~virtual_node_mask_x1)
-            x1_bond_edge_x_t, x1_t_jump = forward_jump(x1_bond_edge_x_t, x1_t, harmonize_jump, x1_sigma_ts, remove_COM_from_noise = False, batch = None, mask = None)
+            x1_x_t, x1_t_jump = discrete_forward_jump(x1_x_t, x1_t, harmonize_jump, atom_marginals, max_T=T_full, mask=~virtual_node_mask_x1)
+            x1_bond_edge_x_t, x1_t_jump = discrete_forward_jump(x1_bond_edge_x_t, x1_t, harmonize_jump, bond_marginals, max_T=T_full, mask=None)
             
             # X4模态协调跳跃（药效团）
             x4_pos_t, x4_t_jump = forward_jump(x4_pos_t, x4_t, harmonize_jump, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
             x4_direction_t, x4_t_jump = forward_jump(x4_direction_t, x4_t, harmonize_jump, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
-            x4_x_t, x4_t_jump = forward_jump(x4_x_t, x4_t, harmonize_jump, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
+            if pharm_marginals is not None:
+                x4_x_t, x4_t_jump = discrete_forward_jump(x4_x_t, x4_t, harmonize_jump, pharm_marginals, max_T=T_full, mask=~virtual_node_mask_x4)
+            else:
+                x4_x_t, x4_t_jump = forward_jump(x4_x_t, x4_t, harmonize_jump, x4_sigma_ts, remove_COM_from_noise = False, batch = x4_batch, mask = ~virtual_node_mask_x4)
     
             # 更新所有模态的时间步
             x1_t = x1_t_jump
