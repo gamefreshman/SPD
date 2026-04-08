@@ -8,11 +8,18 @@
 | 损失函数 | `lightning_module.py` | ✅ 正确 |
 | 推理去噪 | `inference.py` | ⚠️ 发现2个BUG |
 | scale_atom_features 一致性 | 全链路 | ✅ 一致 |
-| 噪声调度映射 | 全链路 | ⚠️ 设计风险 |
+| 噪声调度映射 | 全链路 | ✅ 设计合理 |
 | 边际分布处理 | `sample_NP.py` / `inference.py` | ✅ 正确 |
 | Origin vs SPD 差异 | `datasets.py` vs `new_datasets.py` | 📝 预期差异 |
 | 模型输入值域 | 全链路 | ✅ 训练≡推理 |
 | DPO 损失函数 | `lightning_module.py` | ✅ 正确 |
+| **DPO 数据集噪声注入** | **`dpo_dataset.py`** | **🔴 发现3个严重BUG** |
+| **DPO 在线采样** | **`dpo_utils.py`** | **🔴 发现1个严重BUG** |
+| **参考模型更新** | **`lightning_module.py` / `callbacks.py`** | **⚠️ 未实现 EMA** |
+| 后验采样公式 | `inference.py` | ✅ 正确 |
+| 边际分布计算缓存 | `new_train.py` | ✅ 正确 |
+| 混合 DataLoader | `mixed_dataloader.py` | ✅ 逻辑正确 |
+| 推理虚拟节点重置 | `inference.py` | ⚠️ x1特征未重置 |
 
 ---
 
@@ -216,13 +223,224 @@ x1_x_t → input_dict['x1']['decoder']['x'] → model.x1_decoder_encoder_embeddi
 
 ---
 
-## 九、汇总与优先级建议
+## 九、DPO 数据集 (`dpo_dataset.py`) — 🔴 发现3个严重 BUG
+
+### BUG 3：时间步类型不匹配导致离散扩散完全失效（致命）
+
+**位置**：`dpo_dataset.py` line 177, 248 → `new_datasets.py` line 758, 292-308
+
+**问题链条**：
+
+```
+DPODataset._mol_to_hetero_data:
+  shared_timestep = np.random.uniform(0, 1)        # → float, 如 0.75
+  ↓
+get_x1_data(mol, t=0.75, alpha_dash_t, sigma_dash_t)
+  ↓
+  t_tensor = torch.tensor([0.75])                   # float tensor
+  ↓
+DiscreteFeatureDiffusion.apply_noise(features_0, t_int=tensor([0.75]), device)
+  t_int_tensor = torch.tensor([tensor([0.75])])     # → tensor([[0.75]])
+  ↓
+get_params_for_t(tensor([[0.75]]), device):
+  t_int = torch.clamp(0.75, 1, 400)                # → 1.0 (被强制 clamp 到最小值!)
+  t_float = 1.0 / 400 = 0.0025                     # → 几乎是 t=0 的噪声水平!
+```
+
+**标准训练路径对比**：
+```
+HeteroDataset.__getitem__:
+  ts = np.arange(1, 401)                            # → [1, 2, ..., 400]
+  t = np.random.choice(ts)                          # → 整数, 如 300
+  ↓
+get_x1_data(mol, t=300, alpha_dash_t, sigma_dash_t)
+  t_tensor = torch.tensor([300])                    # int tensor
+  ↓
+get_params_for_t(tensor([[300]]), device):
+  t_int = clamp(300, 1, 400) = 300                  # → 正确!
+  t_float = 300 / 400 = 0.75                        # → 正确的噪声水平
+```
+
+**影响**：DPO 训练中**所有偏好对的离散特征**（原子类型、键类型）**几乎没有噪声**（始终 t_float≈0.0025），离散扩散通道在 DPO 训练中**完全失效**。模型在 DPO 批次中看到的离散输入几乎是干净的，而标准批次中看到的是正常噪声水平，导致严重的训练不一致。
+
+---
+
+### BUG 4：timestep 存储截断导致模型时间嵌入错误（致命）
+
+**位置**：`new_datasets.py` line 616
+
+```python
+data['timestep'] = torch.tensor([t], dtype=torch.long)
+# 当 t=0.75 (DPO float) → torch.tensor([0.75], dtype=torch.long) = tensor([0])
+# 当 t=300  (标准 int)  → torch.tensor([300],  dtype=torch.long) = tensor([300])
+```
+
+**影响**：DPO 批次中模型的时间嵌入（Time Embedding）**始终为 t=0**，模型误以为处于最干净状态。结合 BUG 3（离散噪声也接近 t=0），DPO 训练的离散通道在时间嵌入和实际噪声两方面都完全错位。
+
+---
+
+### BUG 5：连续噪声调度回退为错误的线性插值（严重）
+
+**位置**：`dpo_dataset.py` line 222-231
+
+```python
+# 意图：从 HeteroDataset 获取正确的噪声调度参数
+if hasattr(self.data_generator, 'x1_pos_diffuser'):   # ← 始终 False!
+    noise_schedule = self.data_generator.x1_pos_diffuser.noise_schedule
+    alpha_t = noise_schedule.get_alpha_bar(t_normalized).item()
+    ...
+else:
+    # 回退到简单线性插值（错误！）
+    alpha_dash_t = 1.0 - timestep       # t=0.75 → α̅=0.25
+    sigma_dash_t = timestep              # t=0.75 → σ̅=0.75
+```
+
+**为什么始终 False**：`HeteroDataset` 没有 `x1_pos_diffuser` 属性。它只有 `x1_atom_diffuser`（离散）和 `x1_bond_diffuser`（离散）。连续噪声参数存储在 `noise_schedule_dict` 字典中，不是对象属性。
+
+**实际 vs 回退对比**（以 t=0.75 为例）：
+
+| 参数 | 回退值（错误） | 实际值（正确） | 偏差 |
+|------|---------------|---------------|------|
+| α̅ (alpha_dash) | 0.25 | ≈0.316 | -21% |
+| σ̅ (sigma_dash) | 0.75 | ≈0.949 | -21% |
+
+**影响**：DPO 训练中连续特征（原子坐标）的噪声水平也不正确。线性插值与实际 cosine-linear 混合调度的偏差随时间步变化，导致加噪分布与标准训练不一致。
+
+---
+
+## 十、DPO 在线采样 (`dpo_utils.py`) — 🔴 发现1个严重 BUG
+
+### BUG 6：OnlineSampler 传入 pharm_marginals 导致采样崩溃
+
+**位置**：`dpo_utils.py` line ~401（`_sample_one_molecule` 方法）
+
+```python
+result = inference_sample(
+    ...
+    inpaint_x4_type=True,           # x4 作为条件
+    pharm_marginals=self.pharm_marginals,  # ← 不应传入!
+    ...
+)
+```
+
+**已知影响**：当 `inpaint_x4_type=True` 且 `pharm_marginals is not None` 时：
+1. 初始化从连续高斯 → 离散 one-hot
+2. 去噪步骤从连续 DDPM → 离散后验采样（multinomial）
+3. 每步 inpainting 又用连续轨迹覆盖 → 连续值 ↔ one-hot 反复切换
+
+**实测数据**：有效样本从 1519 → 44（**-97%**），已在采样脚本中回滚（`sample_NP.py` 不传 `pharm_marginals`）。
+
+**但 OnlineSampler 中未修复**：DPO 在线采样仍然传入 `pharm_marginals`，导致每个 epoch 的在线采样生成极差，偏好对质量极低。
+
+---
+
+## 十一、参考模型更新 — ⚠️ 未实现 Doc 所述 EMA
+
+### Doc 描述 vs 实际实现
+
+**Doc (`02_DPO_Finetuning_Methodology.md`) 描述**：
+> 冻结参考模型 Reference Model EMA: ref_model = 0.99 * ref_model + 0.01 * model
+
+**`new_train.py` + `callbacks.py` (OnlineSamplingCallback) 实际行为**：
+- `ref_model` 在 `load_state_dict` 中初始化为预训练权重
+- **此后再无任何更新**
+- `callbacks.py` 中的 `OnlineSamplingCallback` **不包含 ref_model 更新逻辑**
+
+**`DPO1_0_triSim.py` (独立训练脚本) 行为**：
+- 使用 **hard-replace**（非 EMA）：`ref_model.load_state_dict(model.state_dict())`
+- 仅在当前模型分数超过历史最佳时更新
+- 或超过 N 轮未更新时强制更新
+
+**影响**：
+- `new_train.py` 路径：ref_model 永远冻结在预训练权重，随训练推进越来越过时，DPO 约束可能逐渐失效或过强
+- `DPO1_0_triSim.py` 路径：hard-replace 比 EMA 更激进，ref_model 可能跳变
+
+---
+
+## 十二、后验采样公式 — ✅ 正确
+
+`compute_batched_over0_posterior_distribution` 实现了标准 D3PM 后验采样：
+
+$$p(x_{t-1} | x_t, x_0) \propto p(x_t | x_{t-1}) \cdot p(x_{t-1} | x_0)$$
+
+代码实现：
+```python
+numerator = (X_t @ Qt.T) * Qsb       # likelihood × prior
+denominator = Qtb @ X_t.T             # evidence
+posterior = numerator / denominator
+```
+
+然后通过模型预测 $p(x_0|x_t)$ 加权并边际化：
+```python
+weighted = pred_x0.unsqueeze(-1) * posterior_prob
+prob = weighted.sum(dim=2)            # marginalize over x_0
+sample = prob.multinomial(1)          # sample x_{t-1}
+```
+
+**结论：数学正确，与 DiGress 论文一致。** ✅
+
+---
+
+## 十三、推理虚拟节点特征重置 — ⚠️ 轻微不一致
+
+**位置**：`inference.py` line 1696-1712
+
+去噪循环中虚拟节点重置覆盖范围：
+| 特征 | 重置 | 代码 |
+|------|------|------|
+| x1 位置 | ✅ | `x1_pos_t_1[vn_mask] = x1_pos_t[vn_mask]` |
+| x1 原子类型 | ❌ 未重置 | 无对应代码 |
+| x4 位置 | ✅ | `x4_pos_t_1[vn_mask] = x4_pos_t[vn_mask]` |
+| x4 方向 | ✅ | `x4_direction_t_1[vn_mask] = x4_direction_t[vn_mask]` |
+| x4 类型 | ✅ | `x4_x_t_1[vn_mask] = x4_x_t[vn_mask]` |
+
+**问题**：离散后验采样后 `x1_x_t` 对所有节点更新为纯 one-hot。虚拟节点的 scaled one-hot（如 `[0.25, 0, ...]`）被覆盖为 unscaled 随机 one-hot（如 `[0, 0, 1, ...]`），后续步骤的模型输入中虚拟节点特征与训练时不一致。
+
+**影响评估**：**较小**。虚拟节点输出已被 mask 置零（line 1403），不直接参与预测。但作为 GNN 输入节点，特征偏差可能通过消息传递间接影响其他节点。
+
+---
+
+## 十四、边际分布计算 (`new_train.py`) — ✅ 正确
+
+`compute_and_cache_marginals` 函数：
+- 并行遍历所有分子，统计原子/键/药效团类型频次
+- 归一化为概率分布
+- 结果缓存到磁盘，避免重复计算
+- 包含空分布保护（fallback 为均匀分布）
+
+**结论：实现正确，有缓存优化。** ✅
+
+---
+
+## 十五、混合 DataLoader (`mixed_dataloader.py`) — ✅ 逻辑正确
+
+- `MixedDataLoader` 根据 `dpo_ratio` 交替提供标准/DPO 批次
+- `update_dpo_dataset` 支持动态更新偏好对
+- 偏好对为空时自动降级为纯标准训练
+- 批次标记 `batch_type='dpo'/'standard'` 供 `training_step` 分派
+
+**结论：DataLoader 混合逻辑正确。** 但其提供的 DPO 数据本身有 BUG 3/4/5 的问题。
+
+---
+
+## 十六、汇总与优先级建议
 
 ### 需要修复的 BUG
 
-| # | 严重度 | 描述 | 当前影响 |
-|---|--------|------|----------|
-| 1 | 🔴 高 | `forward_jump` 对离散 one-hot 特征使用高斯噪声 | 仅 `harmonize=True` 时触发，当前采样脚本未触发 |
+| # | 严重度 | 文件 | 描述 | 当前影响 |
+|---|--------|------|------|----------|
+| 3 | 🔴🔴 致命 | `dpo_dataset.py` | DPO 时间步 float[0,1] 传入期望 int[1,T] 的接口，离散扩散始终 t≈0 | **DPO 离散通道完全失效** |
+| 4 | 🔴🔴 致命 | `new_datasets.py` | `torch.tensor([float], dtype=long)` 截断为 0，时间嵌入错误 | **DPO 模型时间感知完全错误** |
+| 5 | 🔴 严重 | `dpo_dataset.py` | `x1_pos_diffuser` 属性不存在，连续噪声回退为线性插值 | **DPO 连续噪声分布错误** |
+| 6 | 🔴 严重 | `dpo_utils.py` | OnlineSampler 传入 pharm_marginals 导致 x4 连续↔离散冲突 | **在线采样有效率 -97%** |
+| 1 | ⚠️ 中 | `inference.py` | `forward_jump` 对离散 one-hot 特征使用高斯噪声 | 仅 `harmonize=True` 时触发 |
+
+### 需要关注的设计问题
+
+| # | 级别 | 文件 | 描述 | 建议 |
+|---|------|------|------|------|
+| E | ⚠️ 中 | `callbacks.py` | `new_train.py` 路径无 ref_model 更新，与 Doc EMA 描述不符 | 实现 EMA 或 iterative hard-replace |
+| F | ⚠️ 低 | `inference.py` | x1 虚拟节点类型特征在离散采样后未重置为 scaled 值 | 添加 `x1_x_t[vn_mask] = x1_x_t_init[vn_mask]` |
 
 ### 设计备注（非 BUG，无需修改）
 
@@ -233,15 +451,42 @@ x1_x_t → input_dict['x1']['decoder']['x'] → model.x1_decoder_encoder_embeddi
 
 ### 已确认正确的部分
 
-- ✅ 训练前向加噪逻辑
+- ✅ 训练前向加噪逻辑（`new_datasets.py`）
 - ✅ CrossEntropy 损失函数（x1 atom/bond, x4 pharm）
 - ✅ MSE 位置损失函数
-- ✅ DPO 损失函数
-- ✅ 推理离散后验采样（D3PM 公式）
+- ✅ DPO 损失函数公式（`lightning_module.py compute_dpo_loss`）
+- ✅ 推理离散后验采样（D3PM 公式，`compute_batched_over0_posterior_distribution`）
 - ✅ scale_atom_features 全链路一致
-- ✅ 虚拟节点特征处理一致
-- ✅ 边际分布计算和使用
+- ✅ 边际分布计算和缓存（`compute_and_cache_marginals`）
+- ✅ 混合 DataLoader 交替逻辑（`mixed_dataloader.py`）
+- ✅ DPO batch 检测和分派（`training_step`）
 - ✅ sample_NP.py 不传 pharm_marginals（正确回避 x4 冲突）
+- ✅ OnlineSamplingCallback 偏好对构建逻辑
+- ✅ PreferencePairBuilder 分数差筛选
+- ✅ DPOSamplingScheduler 种子选择策略
+
+### BUG 3/4/5 联合影响分析
+
+**DPO 训练的一个 batch 中，偏好对数据存在三重错误叠加**：
+
+```
+正确状态（应该是）:
+  timestep = 300              # 中等噪声
+  alpha_dash_t = 0.316        # cosine-linear 调度
+  离散噪声 = t_float=0.75    # 中等转移概率
+
+DPO 实际状态（三重错误）:
+  timestep = 0                # BUG 4: 截断为 0
+  alpha_dash_t = 0.25         # BUG 5: 线性回退
+  离散噪声 = t_float=0.0025  # BUG 3: clamp 到最小值
+```
+
+**结果**：DPO 训练中模型看到的偏好对数据：
+1. 时间嵌入说"我在 t=0（最干净）"
+2. 连续噪声用了错误的 schedule（偏差 20%+）
+3. 离散特征几乎是干净的（噪声水平 0.025%）
+
+这导致 DPO 损失信号完全混乱 — 模型和 ref_model 在错误条件下比较 winner/loser 的预测能力，产生的梯度信号是无意义的。
 
 ---
 
